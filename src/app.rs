@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::{CornerRadius, FontId, Rect, RichText, Stroke, StrokeKind, Vec2};
 use egui_term::{
@@ -7,12 +8,13 @@ use egui_term::{
     TerminalTheme, TerminalView,
 };
 
+use crate::config;
 use crate::keys::{self, Action};
 use crate::layout::{self, Node, PaneId, Removal, SplitAxis};
 use crate::pane::Pane;
 use crate::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
-use crate::theme;
+use crate::theme::{self, UiTheme};
 use crate::tmux::TmuxCtl;
 
 const PANE_GAP: f32 = 4.0;
@@ -39,12 +41,18 @@ pub struct App {
     tmux: TmuxCtl,
     font: FontId,
     term_theme: TerminalTheme,
+    ui_theme: UiTheme,
     dirty: bool,
+    config_mtime: Option<SystemTime>,
+    last_config_check: Instant,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, tmux: TmuxCtl) -> Self {
-        theme::apply_visuals(&cc.egui_ctx);
+        config::ensure_default_file();
+        let (style, custom_font) = config::resolve(&config::load());
+        config::install_fonts(&cc.egui_ctx, custom_font);
+        theme::apply_visuals(&cc.egui_ctx, &style.ui);
         if let Err(e) = tmux.write_conf() {
             log::error!("failed to write tmux.conf: {e:#}");
         }
@@ -57,9 +65,12 @@ impl App {
             pty_tx,
             pty_rx,
             tmux,
-            font: theme::font(),
-            term_theme: theme::terminal_theme(),
+            font: style.font,
+            term_theme: style.term_theme,
+            ui_theme: style.ui,
             dirty: false,
+            config_mtime: config::mtime(),
+            last_config_check: Instant::now(),
         };
 
         match state::load() {
@@ -419,6 +430,24 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Live-reload config.toml so theme/font edits apply immediately.
+        // The idle repaint below keeps the mtime poll ticking without input.
+        ctx.request_repaint_after(Duration::from_secs(2));
+        if self.last_config_check.elapsed() > Duration::from_secs(1) {
+            self.last_config_check = Instant::now();
+            let mtime = config::mtime();
+            if mtime != self.config_mtime {
+                self.config_mtime = mtime;
+                let (style, custom_font) = config::resolve(&config::load());
+                config::install_fonts(ctx, custom_font);
+                theme::apply_visuals(ctx, &style.ui);
+                self.font = style.font;
+                self.term_theme = style.term_theme;
+                self.ui_theme = style.ui;
+                log::info!("config.toml reloaded");
+            }
+        }
+
         if log::log_enabled!(log::Level::Debug) {
             ctx.input(|i| {
                 for event in &i.events {
@@ -450,7 +479,7 @@ impl eframe::App for App {
                     .unwrap_or_else(|| "shell".into())
             })
             .collect();
-        for action in tabbar::show(ctx, &labels, self.active) {
+        for action in tabbar::show(ctx, &labels, self.active, &self.ui_theme) {
             match action {
                 TabBarAction::Select(i) => actions.push(Action::GotoTab(i)),
                 TabBarAction::NewTab => actions.push(Action::NewTab),
@@ -459,7 +488,7 @@ impl eframe::App for App {
 
         let mut ui_actions = Vec::new();
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::BG))
+            .frame(egui::Frame::new().fill(self.ui_theme.bg))
             .show(ctx, |ui| {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
@@ -473,6 +502,7 @@ impl eframe::App for App {
                         tab.focused,
                         &self.font,
                         &self.term_theme,
+                        &self.ui_theme,
                         &mut rects,
                         &mut ui_actions,
                     );
@@ -481,7 +511,7 @@ impl eframe::App for App {
                             ui.painter().rect_stroke(
                                 focused_rect.expand(1.0),
                                 CornerRadius::same(2),
-                                Stroke::new(1.0, theme::ACCENT),
+                                Stroke::new(1.0, self.ui_theme.accent),
                                 StrokeKind::Outside,
                             );
                         }
@@ -524,6 +554,7 @@ fn show_node(
     focused: PaneId,
     font: &FontId,
     term_theme: &TerminalTheme,
+    ui_theme: &UiTheme,
     rects: &mut HashMap<PaneId, Rect>,
     ui_actions: &mut Vec<UiAction>,
 ) {
@@ -589,11 +620,11 @@ fn show_node(
             ui.painter().rect_filled(
                 divider,
                 CornerRadius::ZERO,
-                theme::DIVIDER,
+                ui_theme.divider,
             );
             show_node(
                 ui, first, first_rect, path << 1, panes, focused, font,
-                term_theme, rects, ui_actions,
+                term_theme, ui_theme, rects, ui_actions,
             );
             show_node(
                 ui,
@@ -604,6 +635,7 @@ fn show_node(
                 focused,
                 font,
                 term_theme,
+                ui_theme,
                 rects,
                 ui_actions,
             );

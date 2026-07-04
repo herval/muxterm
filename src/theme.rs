@@ -1,47 +1,234 @@
-use egui::{Color32, FontId};
+use std::collections::HashMap;
+
+use egui::Color32;
 use egui_term::{ColorPalette, TerminalTheme};
 
-pub const BG: Color32 = Color32::from_rgb(0x1d, 0x1e, 0x23);
-pub const TAB_BAR_BG: Color32 = Color32::from_rgb(0x15, 0x16, 0x1a);
-pub const TAB_ACTIVE_BG: Color32 = Color32::from_rgb(0x2c, 0x2d, 0x33);
-pub const TAB_HOVER_BG: Color32 = Color32::from_rgb(0x24, 0x25, 0x2b);
-pub const ACCENT: Color32 = Color32::from_rgb(0x4a, 0x90, 0xd9);
-pub const DIVIDER: Color32 = Color32::from_rgb(0x2e, 0x2f, 0x36);
-pub const TEXT: Color32 = Color32::from_rgb(0xe6, 0xe6, 0xe6);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(0x8a, 0x8b, 0x92);
-
-pub fn font() -> FontId {
-    FontId::monospace(14.0)
+/// Chrome colors derived from the terminal palette (plus overrides).
+#[derive(Clone, Debug)]
+pub struct UiTheme {
+    pub bg: Color32,
+    pub tab_bar_bg: Color32,
+    pub tab_active_bg: Color32,
+    pub tab_hover_bg: Color32,
+    pub divider: Color32,
+    pub text: Color32,
+    pub text_dim: Color32,
+    pub accent: Color32,
 }
 
-/// iTerm2 default-dark-ish ANSI palette (blue nudged lighter for legibility).
-pub fn terminal_theme() -> TerminalTheme {
-    TerminalTheme::new(Box::new(ColorPalette {
-        background: "#1d1e23".into(),
-        foreground: "#c7c7c7".into(),
-        black: "#000000".into(),
-        red: "#c91b00".into(),
-        green: "#00c200".into(),
-        yellow: "#c7c400".into(),
-        blue: "#3b6fd4".into(),
-        magenta: "#ca30c7".into(),
-        cyan: "#00c5c7".into(),
-        white: "#c7c7c7".into(),
-        bright_black: "#686868".into(),
-        bright_red: "#ff6e67".into(),
-        bright_green: "#5ffa68".into(),
-        bright_yellow: "#fffc67".into(),
-        bright_blue: "#6871ff".into(),
-        bright_magenta: "#ff77ff".into(),
-        bright_cyan: "#60fdff".into(),
-        bright_white: "#ffffff".into(),
-        ..ColorPalette::default()
-    }))
+pub struct Preset {
+    pub bg: &'static str,
+    pub fg: &'static str,
+    pub accent: &'static str,
+    /// black, red, green, yellow, blue, magenta, cyan, white, then brights.
+    pub ansi: [&'static str; 16],
 }
 
-pub fn apply_visuals(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = TAB_BAR_BG;
-    visuals.window_fill = BG;
+pub const PRESET_NAMES: &[&str] =
+    &["iterm-dark", "dracula", "solarized-dark", "gruvbox-dark"];
+
+pub fn preset(name: &str) -> Option<&'static Preset> {
+    match name {
+        "iterm-dark" => Some(&Preset {
+            bg: "#1d1e23",
+            fg: "#c7c7c7",
+            accent: "#4a90d9",
+            ansi: [
+                "#000000", "#c91b00", "#00c200", "#c7c400", "#3b6fd4",
+                "#ca30c7", "#00c5c7", "#c7c7c7", "#686868", "#ff6e67",
+                "#5ffa68", "#fffc67", "#6871ff", "#ff77ff", "#60fdff",
+                "#ffffff",
+            ],
+        }),
+        "dracula" => Some(&Preset {
+            bg: "#282a36",
+            fg: "#f8f8f2",
+            accent: "#bd93f9",
+            ansi: [
+                "#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9",
+                "#ff79c6", "#8be9fd", "#f8f8f2", "#6272a4", "#ff6e6e",
+                "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff",
+                "#ffffff",
+            ],
+        }),
+        "solarized-dark" => Some(&Preset {
+            bg: "#002b36",
+            fg: "#839496",
+            accent: "#268bd2",
+            ansi: [
+                "#073642", "#dc322f", "#859900", "#b58900", "#268bd2",
+                "#d33682", "#2aa198", "#eee8d5", "#002b36", "#cb4b16",
+                "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1",
+                "#fdf6e3",
+            ],
+        }),
+        "gruvbox-dark" => Some(&Preset {
+            bg: "#282828",
+            fg: "#ebdbb2",
+            accent: "#83a598",
+            ansi: [
+                "#282828", "#cc241d", "#98971a", "#d79921", "#458588",
+                "#b16286", "#689d6a", "#a89984", "#928374", "#fb4934",
+                "#b8bb26", "#fabd2f", "#83a598", "#d3869b", "#8ec07c",
+                "#ebdbb2",
+            ],
+        }),
+        _ => None,
+    }
+}
+
+pub fn parse_hex(s: &str) -> Option<Color32> {
+    let s = s.strip_prefix('#')?;
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+fn to_hex(c: Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+fn dim_hex(s: &str) -> String {
+    let c = parse_hex(s).unwrap_or(Color32::GRAY);
+    to_hex(blend(c, Color32::BLACK, 0.3))
+}
+
+/// Build the terminal + chrome themes from a preset with hex-string
+/// overrides (invalid values are dropped with a warning).
+pub fn build(
+    preset: &Preset,
+    overrides: &HashMap<String, String>,
+) -> (TerminalTheme, UiTheme) {
+    let mut colors: HashMap<&str, String> = HashMap::new();
+    colors.insert("background", preset.bg.into());
+    colors.insert("foreground", preset.fg.into());
+    colors.insert("accent", preset.accent.into());
+    const ANSI_KEYS: [&str; 16] = [
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan",
+        "white", "bright_black", "bright_red", "bright_green",
+        "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan",
+        "bright_white",
+    ];
+    for (key, value) in ANSI_KEYS.iter().zip(preset.ansi) {
+        colors.insert(key, value.into());
+    }
+
+    for (key, value) in overrides {
+        let known = colors.contains_key(key.as_str());
+        if !known {
+            log::warn!("config: unknown color key {key:?}");
+            continue;
+        }
+        if parse_hex(value).is_none() {
+            log::warn!("config: invalid hex {value:?} for {key:?}");
+            continue;
+        }
+        // keys live as &'static str; re-insert via the matching constant
+        if let Some(k) = ANSI_KEYS
+            .iter()
+            .chain(["background", "foreground", "accent"].iter())
+            .find(|k| **k == key.as_str())
+        {
+            colors.insert(k, value.clone());
+        }
+    }
+
+    let get = |k: &str| colors[k].clone();
+    let palette = ColorPalette {
+        background: get("background"),
+        foreground: get("foreground"),
+        black: get("black"),
+        red: get("red"),
+        green: get("green"),
+        yellow: get("yellow"),
+        blue: get("blue"),
+        magenta: get("magenta"),
+        cyan: get("cyan"),
+        white: get("white"),
+        bright_black: get("bright_black"),
+        bright_red: get("bright_red"),
+        bright_green: get("bright_green"),
+        bright_yellow: get("bright_yellow"),
+        bright_blue: get("bright_blue"),
+        bright_magenta: get("bright_magenta"),
+        bright_cyan: get("bright_cyan"),
+        bright_white: get("bright_white"),
+        bright_foreground: None,
+        dim_foreground: dim_hex(&get("foreground")),
+        dim_black: dim_hex(&get("black")),
+        dim_red: dim_hex(&get("red")),
+        dim_green: dim_hex(&get("green")),
+        dim_yellow: dim_hex(&get("yellow")),
+        dim_blue: dim_hex(&get("blue")),
+        dim_magenta: dim_hex(&get("magenta")),
+        dim_cyan: dim_hex(&get("cyan")),
+        dim_white: dim_hex(&get("white")),
+    };
+
+    let bg = parse_hex(&get("background")).unwrap();
+    let fg = parse_hex(&get("foreground")).unwrap();
+    let accent = parse_hex(&get("accent")).unwrap();
+    let ui = UiTheme {
+        bg,
+        tab_bar_bg: blend(bg, Color32::BLACK, 0.35),
+        tab_active_bg: blend(bg, fg, 0.13),
+        tab_hover_bg: blend(bg, fg, 0.07),
+        divider: blend(bg, fg, 0.12),
+        text: blend(fg, Color32::WHITE, 0.2),
+        text_dim: blend(fg, bg, 0.45),
+        accent,
+    };
+
+    (TerminalTheme::new(Box::new(palette)), ui)
+}
+
+pub fn apply_visuals(ctx: &egui::Context, ui: &UiTheme) {
+    let luminance = 0.299 * ui.bg.r() as f32
+        + 0.587 * ui.bg.g() as f32
+        + 0.114 * ui.bg.b() as f32;
+    let mut visuals = if luminance < 128.0 {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.panel_fill = ui.tab_bar_bg;
+    visuals.window_fill = ui.bg;
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_are_valid_hex() {
+        for name in PRESET_NAMES {
+            let p = preset(name).unwrap();
+            assert!(parse_hex(p.bg).is_some(), "{name} bg");
+            assert!(parse_hex(p.fg).is_some(), "{name} fg");
+            assert!(parse_hex(p.accent).is_some(), "{name} accent");
+            for c in p.ansi {
+                assert!(parse_hex(c).is_some(), "{name} ansi {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn overrides_apply_and_invalid_are_dropped() {
+        let mut overrides = HashMap::new();
+        overrides.insert("background".to_string(), "#101010".to_string());
+        overrides.insert("red".to_string(), "not-a-color".to_string());
+        overrides.insert("bogus_key".to_string(), "#ffffff".to_string());
+        let (_, ui) = build(preset("iterm-dark").unwrap(), &overrides);
+        assert_eq!(ui.bg, Color32::from_rgb(0x10, 0x10, 0x10));
+    }
 }

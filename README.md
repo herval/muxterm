@@ -31,6 +31,27 @@ Requires `tmux` (`brew install tmux`).
 ¹ Window managers like Rectangle bind cmd+opt+arrows globally; free those
 hotkeys or use cmd+[ / cmd+].
 
+## Theming
+
+`~/Library/Application Support/muxterm/config.toml` (created on first run,
+**edits apply live** while the app is running):
+
+```toml
+theme = "iterm-dark"   # or dracula | solarized-dark | gruvbox-dark
+
+[font]
+family = "Menlo"       # font name in the macOS font folders, or a file path
+size = 14.0
+
+[colors]               # override any color of the chosen theme
+background = "#1d1e23"
+accent = "#4a90d9"     # focused-pane border + active-tab underline
+bright_green = "#5ffa68"
+```
+
+Tab bar, dividers, and pane-border chrome are derived from the palette
+automatically, so a theme change restyles the whole window.
+
 ## How persistence works
 
 - Panes run `tmux new-session -A -D -s mux-<id>` on a dedicated socket
