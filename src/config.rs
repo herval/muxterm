@@ -203,6 +203,15 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
     )
 }
 
+/// System fonts appended after the primary font as glyph fallbacks. egui has
+/// no OS font cascade, so anything the primary font lacks renders as a box
+/// unless a registered font covers it: Menlo supplies the dingbat stars CLI
+/// spinners use (✻ ✳ ✽), Apple Symbols the braille spinners and misc symbols.
+const FALLBACK_FONTS: &[(&str, &str)] = &[
+    ("fallback-menlo", "/System/Library/Fonts/Menlo.ttc"),
+    ("fallback-apple-symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
+];
+
 /// Install the custom monospace font (or reset to egui's default fonts when
 /// `custom` is None).
 pub fn install_fonts(ctx: &egui::Context, custom: Option<FontData>) {
@@ -212,6 +221,19 @@ pub fn install_fonts(ctx: &egui::Context, custom: Option<FontData>) {
         defs.font_data.insert(name.clone(), Arc::new(data));
         if let Some(mono) = defs.families.get_mut(&FontFamily::Monospace) {
             mono.insert(0, name);
+        }
+    }
+    for (name, path) in FALLBACK_FONTS {
+        let Ok(bytes) = fs::read(path) else {
+            log::warn!("fallback font {path} not readable, skipping");
+            continue;
+        };
+        defs.font_data
+            .insert((*name).to_string(), Arc::new(FontData::from_owned(bytes)));
+        for family in [FontFamily::Monospace, FontFamily::Proportional] {
+            if let Some(list) = defs.families.get_mut(&family) {
+                list.push((*name).to_string());
+            }
         }
     }
     ctx.set_fonts(defs);
@@ -383,6 +405,21 @@ mod tests {
 
     fn replace_theme_line(text: &str, name: &str) -> String {
         replace_top_level_line(text, "theme", &format!("theme = \"{name}\""))
+    }
+
+    #[test]
+    fn fallback_fonts_cover_cli_spinner_glyphs() {
+        // Claude Code's dingbat spinner (✻ ✳ ✽ ✢) and braille spinners (⠋)
+        // are outside egui's built-in fonts; without the system fallbacks
+        // they render as boxes.
+        let ctx = egui::Context::default();
+        install_fonts(&ctx, None);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let font = FontId::monospace(14.0);
+        ctx.fonts(|f| {
+            assert!(f.has_glyphs(&font, "✻✳✽✢✶✦★"), "dingbats missing");
+            assert!(f.has_glyphs(&font, "⠋⠙⠹"), "braille missing");
+        });
     }
 
     #[test]
