@@ -22,6 +22,11 @@ pub struct WindowState {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TabState {
+    /// Stable tab identity (`mux-tab-<8hex>`), used to scope the agent
+    /// mesh's per-tab context. Empty in pre-mesh state files; backfilled
+    /// on load.
+    #[serde(default)]
+    pub id: String,
     pub tree: NodeState,
     pub focused_session: String,
 }
@@ -51,6 +56,17 @@ impl NodeState {
             },
         }
     }
+
+    /// In-order session names (pane order within the tab).
+    pub fn session_list(&self, out: &mut Vec<String>) {
+        match self {
+            NodeState::Leaf { session } => out.push(session.clone()),
+            NodeState::Split { first, second, .. } => {
+                first.session_list(out);
+                second.session_list(out);
+            },
+        }
+    }
 }
 
 pub fn config_dir() -> PathBuf {
@@ -68,6 +84,15 @@ pub enum LoadResult {
     FirstRun,
     /// Present but unreadable. The caller must skip session GC in this case.
     Corrupt,
+}
+
+/// Read-only load for external tools (the `mux` CLI): no `.bak` renaming,
+/// no side effects. Returns None when missing or unreadable.
+pub fn peek() -> Option<StateFile> {
+    let text = fs::read_to_string(state_path()).ok()?;
+    serde_json::from_str::<StateFile>(&text)
+        .ok()
+        .filter(|s| s.version == VERSION)
 }
 
 pub fn load() -> LoadResult {
@@ -108,12 +133,14 @@ mod tests {
                 active_tab: 1,
                 tabs: vec![
                     TabState {
+                        id: "mux-tab-1111".into(),
                         tree: NodeState::Leaf {
                             session: "mux-aaaa".into(),
                         },
                         focused_session: "mux-aaaa".into(),
                     },
                     TabState {
+                        id: "mux-tab-2222".into(),
                         tree: NodeState::Split {
                             axis: SplitAxis::SideBySide,
                             ratio: 0.3,

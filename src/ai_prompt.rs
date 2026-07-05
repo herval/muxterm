@@ -1,6 +1,6 @@
 use egui::{Event, ImeEvent, Key, Modifiers};
 
-use crate::layout::PaneId;
+use muxterm::layout::PaneId;
 
 /// The "? " prompt line: a '?' typed as the first character at an idle shell
 /// prompt swallows subsequent keystrokes into an AI query instead of the PTY.

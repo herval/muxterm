@@ -5,12 +5,12 @@ mod ai_prompt;
 mod app;
 mod config;
 mod keys;
-mod layout;
 mod pane;
-mod state;
 mod tabbar;
 mod theme;
 mod tmux;
+
+use muxterm::state;
 
 fn main() -> eframe::Result {
     env_logger::init();

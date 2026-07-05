@@ -8,8 +8,9 @@ use egui::{FontData, FontFamily, FontId};
 use egui_term::TerminalTheme;
 use serde::Deserialize;
 
+use muxterm::state;
+
 use crate::agent::{self, Agent};
-use crate::state;
 use crate::theme::{self, UiTheme};
 
 const DEFAULT_CONFIG: &str = r##"# muxterm configuration - edits apply live while the app is running.
