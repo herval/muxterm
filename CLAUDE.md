@@ -15,7 +15,10 @@ cargo test                   # all tests (root crate; unit tests live in #[cfg(t
 cargo test layout            # tests in one module
 cargo test split_and_leaves  # single test by name
 cargo run --bin mux -- peers # the mux CLI (second binary; default-run is the GUI)
+make install                 # bundle muxterm.app (make app) + ship to /Applications + refresh ~/.cargo/bin/mux
 ```
+
+The bundle recipe lives in the Makefile and `packaging/` (Info.plist template, icon generator); `assets/muxterm.icns` is checked in — regenerate with `make icon` only when the icon design changes.
 
 There is no test binary/harness beyond inline unit tests, and no rustfmt/clippy config — match the existing hand-formatted style (notably `},` closing match arms).
 

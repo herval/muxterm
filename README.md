@@ -52,6 +52,21 @@ cargo run --release
 
 Requires `tmux` (`brew install tmux`).
 
+## Install as a Mac app
+
+```sh
+make install   # builds muxterm.app and ships it to /Applications
+```
+
+`make app` assembles an ad-hoc-signed `target/release/muxterm.app` (plist
+template and icon live in `packaging/`; regenerate the icon with
+`make icon`); `make install` copies it to `/Applications` and refreshes
+`~/.cargo/bin/mux` so the CLI in your panes matches the app. Quit muxterm
+first if it's running — sessions survive, the relaunch restores them.
+Launched from Finder/Dock everything works shell-less: `TERM` is set at
+startup, tmux is probed at fixed paths, and agent binaries are resolved
+through your login shell.
+
 ## Shortcuts
 
 | Chord | Action |
