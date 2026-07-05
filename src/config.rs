@@ -10,7 +10,8 @@ use serde::Deserialize;
 
 use muxterm::state;
 
-use crate::agent::{self, Agent};
+use muxterm::agent::{self, Agent};
+
 use crate::theme::{self, UiTheme};
 
 const DEFAULT_CONFIG: &str = r##"# muxterm configuration - edits apply live while the app is running.
@@ -22,6 +23,10 @@ theme = "iterm-dark"
 # Agent CLI behind the "? " prompt line (type "? " at an empty shell
 # prompt to ask): "claude" (Claude Code) or "codex".
 agent = "claude"
+
+# Model passed to the agent as --model. Empty picks a fast default
+# ("haiku" for claude); set e.g. "sonnet" to trade speed for depth.
+# agent_model = ""
 
 # Lines of pane scrollback sent to the agent as context (0 = none).
 # agent_context_lines = 200
@@ -52,6 +57,8 @@ size = 14.0
 pub struct ConfigFile {
     pub theme: String,
     /// Agent CLI behind the "? " prompt line: "claude" or "codex".
+    /// (`agent_model` also lives in the file but is read by `mux ask`,
+    /// not the GUI.)
     pub agent: String,
     /// Lines of pane scrollback sent to the agent as context; 0 disables.
     pub agent_context_lines: u32,

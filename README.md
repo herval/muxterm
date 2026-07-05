@@ -73,12 +73,15 @@ hotkeys or use cmd+[ / cmd+].
 ## AI prompt
 
 Type `? ` as the first characters at an idle shell prompt and the pane
-switches to an accent-colored compose line. Enter runs your question as a
-one-shot `claude -p '…'` (Claude Code, default) or `codex exec '…'` (pick in
-settings, cmd+,), typed into the pane like any command — output streams in
-the terminal and lands in scrollback. The last `agent_context_lines` of the
+switches to an accent-colored compose line. Enter types `mux ask '…'` into
+the pane like any command; `mux ask` runs your question as a one-shot
+Claude Code (default) or Codex query — pick the agent in settings (cmd+,) —
+and **streams the answer** as it's generated, with any tool calls the agent
+makes shown as dim `»` one-liners. The last `agent_context_lines` of the
 pane's scrollback are captured to a temp file and redirected to the agent's
-stdin, so it sees what you were just doing.
+stdin, so it sees what you were just doing. Questions default to a fast
+model (`haiku` for claude); set `agent_model` in config.toml to trade speed
+for depth. `mux ask` also works from any plain terminal.
 
 ## Theming
 
@@ -89,6 +92,8 @@ stdin, so it sees what you were just doing.
 theme = "iterm-dark"   # dracula | solarized-dark | gruvbox-dark |
                        # iterm-light | solarized-light | github-light
 agent = "claude"       # "? " prompt agent: claude | codex
+agent_model = ""       # --model for "? " answers; empty = fast default
+                       # ("haiku" for claude)
 agent_context_lines = 200   # pane scrollback sent as context (0 = none)
 dim_inactive_panes = 0.12   # unfocused-split fade toward bg (0.0 - 0.8)
 pane_titles = true          # per-pane title badge (top-right) on split tabs

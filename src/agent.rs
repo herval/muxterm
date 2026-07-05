@@ -1,3 +1,6 @@
+//! The AI agent CLIs behind the "? " prompt line, shared by the GUI
+//! (settings, probing, the typed command) and `mux ask` (the invocation).
+
 use std::path::Path;
 use std::process::Command;
 
@@ -9,11 +12,20 @@ pub struct Agent {
     pub label: &'static str,
     /// Executable probed before a submit.
     pub bin: &'static str,
+    /// Model passed as --model when config.toml doesn't name one. A quick
+    /// question about pane output doesn't need the CLI's default model,
+    /// which may be a slow flagship; None leaves the choice to the CLI.
+    pub fast_model: Option<&'static str>,
 }
 
 pub const AGENTS: &[Agent] = &[
-    Agent { id: "claude", label: "Claude Code", bin: "claude" },
-    Agent { id: "codex", label: "Codex", bin: "codex" },
+    Agent {
+        id: "claude",
+        label: "Claude Code",
+        bin: "claude",
+        fast_model: Some("haiku"),
+    },
+    Agent { id: "codex", label: "Codex", bin: "codex", fast_model: None },
 ];
 
 pub fn by_id(id: &str) -> Option<&'static Agent> {
@@ -24,23 +36,17 @@ pub fn default_agent() -> &'static Agent {
     &AGENTS[0]
 }
 
-impl Agent {
-    /// The shell command a submit types into the pane. Pane scrollback
-    /// travels via stdin redirection: both CLIs combine a prompt argument
-    /// with piped stdin (codex appends it as a `<stdin>` block), and the
-    /// shell doing the redirect keeps the visible command short.
-    pub fn command(&self, query: &str, ctx_file: Option<&Path>) -> String {
-        let quoted = shell_quote(query);
-        let mut cmd = match self.id {
-            "codex" => format!("codex exec {quoted}"),
-            _ => format!("claude -p {quoted}"),
-        };
-        if let Some(path) = ctx_file {
-            cmd.push_str(" < ");
-            cmd.push_str(&shell_quote(&path.display().to_string()));
-        }
-        cmd
+/// The shell command a "? " submit types into the pane. Everything else -
+/// agent choice, model, streaming flags, output formatting - lives behind
+/// `mux ask` (src/ask.rs), which reads the same config.toml: the visible
+/// command stays short, and pane scrollback travels via stdin redirection.
+pub fn ask_command(query: &str, ctx_file: Option<&Path>) -> String {
+    let mut cmd = format!("mux ask {}", shell_quote(query));
+    if let Some(path) = ctx_file {
+        cmd.push_str(" < ");
+        cmd.push_str(&shell_quote(&path.display().to_string()));
     }
+    cmd
 }
 
 /// POSIX single-quoting: wrap in '...', embedded ' becomes '\''.
@@ -73,17 +79,11 @@ mod tests {
     }
 
     #[test]
-    fn commands_compose_with_and_without_context() {
-        let claude = by_id("claude").unwrap();
-        assert_eq!(claude.command("fix it", None), "claude -p 'fix it'");
+    fn ask_commands_compose_with_and_without_context() {
+        assert_eq!(ask_command("fix it", None), "mux ask 'fix it'");
         assert_eq!(
-            claude.command("fix it", Some(Path::new("/tmp/x.txt"))),
-            "claude -p 'fix it' < '/tmp/x.txt'"
-        );
-        let codex = by_id("codex").unwrap();
-        assert_eq!(
-            codex.command("what's this", None),
-            "codex exec 'what'\\''s this'"
+            ask_command("what's this", Some(Path::new("/tmp/x.txt"))),
+            "mux ask 'what'\\''s this' < '/tmp/x.txt'"
         );
     }
 
@@ -91,5 +91,6 @@ mod tests {
     fn lookup_falls_back_to_claude() {
         assert!(by_id("gpt").is_none());
         assert_eq!(default_agent().id, "claude");
+        assert_eq!(default_agent().fast_model, Some("haiku"));
     }
 }

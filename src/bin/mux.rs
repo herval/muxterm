@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use muxterm::ask;
 use muxterm::mesh::{self, AgentInfo};
 use muxterm::state;
 
@@ -35,6 +36,10 @@ mux - agent mesh for muxterm panes (team = the panes of one tab)
 
 usage: mux [--as <session>] [--json] <command> [args]
 
+  ask [--agent <a>] [--model <m>] <question...>
+                               one-shot AI query (the \"? \" prompt backend);
+                               agent/model default to muxterm's config.toml,
+                               terminal context is read from stdin
   whoami                       your session, tab, and registered name
   join <name> [--role <r>] [--desc <t>]
                                register yourself in this tab's team
@@ -98,6 +103,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
             print!("{USAGE}");
             Ok(())
         },
+        "ask" => cmd_ask(rest),
         "whoami" => cmd_whoami(as_session, json),
         "join" => cmd_join(as_session, rest),
         "run" => cmd_run(as_session, rest),
@@ -496,6 +502,35 @@ impl Scope {
 }
 
 // ---------------------------------------------------------- subcommands
+
+/// One-shot AI query - what a "? " submit in the GUI actually runs. Needs
+/// no tmux identity, so it also works from any plain terminal.
+fn cmd_ask(mut args: Vec<String>) -> CmdResult {
+    let agent_flag = take_opt(&mut args, "--agent")?;
+    let model_flag = take_opt(&mut args, "--model")?;
+    if args.is_empty() {
+        return Err((
+            EXIT_USAGE,
+            "usage: mux ask [--agent claude|codex] [--model <m>] \
+             <question...>  (terminal context on stdin)"
+                .to_string(),
+        ));
+    }
+    let query = args.join(" ");
+
+    let (agent, model) = ask::configured();
+    let agent = match &agent_flag {
+        Some(id) => muxterm::agent::by_id(id).ok_or_else(|| {
+            (EXIT_USAGE, format!("unknown agent {id:?} (claude | codex)"))
+        })?,
+        None => agent,
+    };
+    let model = model_flag.or(model);
+
+    let code = ask::run(agent, model.as_deref(), &query)
+        .map_err(|e| (EXIT_NOT_FOUND, e))?;
+    std::process::exit(code);
+}
 
 fn cmd_whoami(as_session: Option<String>, json: bool) -> CmdResult {
     let tmux = Tmux::new()?;

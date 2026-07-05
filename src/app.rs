@@ -10,7 +10,8 @@ use egui_term::{
     TerminalTheme, TerminalView,
 };
 
-use crate::agent::{self, Agent};
+use muxterm::agent::{self, Agent};
+
 use crate::ai_prompt::{self, LineTracker, PromptMachine, Verdict};
 use crate::config;
 use crate::keys::{self, Action};
@@ -564,11 +565,23 @@ impl App {
         });
 
         if let Some(query) = submit {
-            let available = *self
-                .agent_ok
-                .entry(self.agent.id)
-                .or_insert_with(|| agent::binary_available(self.agent.bin));
-            if available {
+            // Both binaries must exist: mux runs the query (streaming the
+            // agent's output), the agent CLI answers it.
+            let mut missing: Option<&'static str> = None;
+            for bin in ["mux", self.agent.bin] {
+                let ok = *self
+                    .agent_ok
+                    .entry(bin)
+                    .or_insert_with(|| agent::binary_available(bin));
+                if !ok {
+                    missing = Some(bin);
+                    break;
+                }
+            }
+            if let Some(bin) = missing {
+                self.agent_ok.remove(bin);
+                machine.set_error(format!("{bin} not found in PATH"));
+            } else {
                 let ctx_file = (self.agent_context_lines > 0)
                     .then(|| {
                         self.tmux
@@ -576,18 +589,12 @@ impl App {
                     })
                     .flatten()
                     .and_then(|capture| write_context_file(focused, &capture));
-                let mut cmd = self
-                    .agent
-                    .command(&query, ctx_file.as_deref())
+                let mut cmd = agent::ask_command(&query, ctx_file.as_deref())
                     .into_bytes();
                 cmd.push(b'\r');
                 writes.push(cmd);
                 machine.cancel();
                 line = LineTracker::Known(0);
-            } else {
-                self.agent_ok.remove(self.agent.id);
-                machine
-                    .set_error(format!("{} not found in PATH", self.agent.bin));
             }
         }
 

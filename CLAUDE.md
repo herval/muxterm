@@ -23,7 +23,7 @@ There is no test binary/harness beyond inline unit tests, and no rustfmt/clippy 
 
 Cargo workspace: the root `muxterm` crate plus `crates/egui_term`, a **vendored** terminal widget (egui + alacritty_terminal) carrying local patches (input gating, SGR mouse-wheel under tmux mouse mode, bracketed paste, IME, OSC 52 copy). Any change under `crates/egui_term/` must be recorded as a patch entry in `crates/egui_term/VENDOR.md`.
 
-Two binaries share one library. `src/lib.rs` exposes only `layout`, `mesh`, and `state` — the modules used by both the GUI (`src/main.rs` + private modules) and the agent-mesh CLI (`src/bin/mux.rs`). Code needed by `mux` must live in one of those three modules.
+Two binaries share one library. `src/lib.rs` exposes only `agent`, `ask`, `layout`, `mesh`, and `state` — the modules used by both the GUI (`src/main.rs` + private modules) and the agent-mesh CLI (`src/bin/mux.rs`). Code needed by `mux` must live in one of those modules.
 
 ### The tmux trick (persistence)
 
@@ -39,7 +39,7 @@ Two binaries share one library. `src/lib.rs` exposes only `layout`, `mesh`, and 
 
 ### The "? " AI prompt
 
-`ai_prompt.rs` (`PromptMachine`, `LineTracker`) intercepts egui input events **before** `TerminalView` sees them: a `?` typed as the first char at an idle shell prompt opens a compose line. It's a deliberately egui-Context-free state machine so transitions unit-test with bare `Event` values. `LineTracker` heuristically models the shell's input line and must err toward `Dirty` — a missed trigger is harmless, a false one intercepts real typing. Submit runs a one-shot `claude -p` / `codex exec` (`agent.rs`) typed into the pane, with the last N scrollback lines captured to a temp file and piped to stdin.
+`ai_prompt.rs` (`PromptMachine`, `LineTracker`) intercepts egui input events **before** `TerminalView` sees them: a `?` typed as the first char at an idle shell prompt opens a compose line. It's a deliberately egui-Context-free state machine so transitions unit-test with bare `Event` values. `LineTracker` heuristically models the shell's input line and must err toward `Dirty` — a missed trigger is harmless, a false one intercepts real typing. Submit types `mux ask '<query>'` into the pane (`agent.rs` builds the command), with the last N scrollback lines captured to a temp file and piped to stdin. `ask.rs` (behind `mux ask`) resolves agent + `agent_model` from config.toml, spawns the CLI — `claude -p` with stream-json, or `codex exec` which streams natively — and renders answer text live with tool calls as dim `»` one-liners.
 
 ### Agent mesh
 
