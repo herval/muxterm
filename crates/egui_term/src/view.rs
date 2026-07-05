@@ -32,6 +32,11 @@ enum InputAction {
 #[derive(Clone, Default)]
 pub struct TerminalViewState {
     is_dragged: bool,
+    // muxterm patch P7: whether the in-progress drag is being forwarded to
+    // the application as mouse reports (vs. a local selection), decided at
+    // press time so the release is routed the same way even if modifiers
+    // changed mid-drag.
+    mouse_reporting_drag: bool,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
 }
@@ -604,16 +609,37 @@ fn process_left_button(
     modifiers: &Modifiers,
     pressed: bool,
 ) -> InputAction {
+    // muxterm patch P7: mouse selection was impossible. Under tmux (`mouse
+    // on` puts the terminal in MOUSE_MODE permanently) the press was
+    // forwarded here but is_dragged was never set, so process_mouse_move
+    // dropped every drag event: tmux saw press+release with no motion in
+    // between and never started a copy-mode selection, while the local
+    // selection path was unreachable. Track the drag, and let Shift bypass
+    // reporting for a local selection (standard terminal convention).
     let terminal_mode = backend.last_content().terminal_mode;
-    if terminal_mode.intersects(TermMode::MOUSE_MODE) {
+    if pressed {
+        if terminal_mode.intersects(TermMode::MOUSE_MODE) && !modifiers.shift {
+            state.is_dragged = true;
+            state.mouse_reporting_drag = true;
+            InputAction::BackendCall(BackendCommand::MouseReport(
+                MouseButton::LeftButton,
+                *modifiers,
+                state.current_mouse_position_on_grid,
+                true,
+            ))
+        } else {
+            state.mouse_reporting_drag = false;
+            process_left_button_pressed(state, layout, position)
+        }
+    } else if state.mouse_reporting_drag {
+        state.is_dragged = false;
+        state.mouse_reporting_drag = false;
         InputAction::BackendCall(BackendCommand::MouseReport(
             MouseButton::LeftButton,
             *modifiers,
             state.current_mouse_position_on_grid,
-            pressed,
+            false,
         ))
-    } else if pressed {
-        process_left_button_pressed(state, layout, position)
     } else {
         process_left_button_released(
             state,
@@ -702,11 +728,17 @@ fn process_mouse_move(
     );
 
     let mut actions = vec![];
-    // Handle command or selection update based on terminal mode and modifiers
+    // Handle command or selection update based on how the drag started
     if state.is_dragged {
         let terminal_mode = terminal_content.terminal_mode;
-        let cmd = if terminal_mode.contains(TermMode::MOUSE_MOTION)
-            && modifiers.is_none()
+        // muxterm patch P7: forward drag motion whenever the drag is a
+        // mouse-reporting drag and the application asked for drag events.
+        // Upstream required MOUSE_MOTION (mode 1003), but tmux `mouse on`
+        // enables button-event tracking (mode 1002, MOUSE_DRAG), so drags
+        // were never reported and tmux couldn't drag-select.
+        let cmd = if state.mouse_reporting_drag
+            && terminal_mode
+                .intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
         {
             InputAction::BackendCall(BackendCommand::MouseReport(
                 MouseButton::LeftMove,
@@ -714,10 +746,12 @@ fn process_mouse_move(
                 state.current_mouse_position_on_grid,
                 true,
             ))
-        } else {
+        } else if !state.mouse_reporting_drag {
             InputAction::BackendCall(BackendCommand::SelectUpdate(
                 cursor_x, cursor_y,
             ))
+        } else {
+            InputAction::Ignore
         };
 
         actions.push(cmd);
