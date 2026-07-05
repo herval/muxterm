@@ -10,6 +10,6 @@ pub struct Pane {
     pub session: String,
     pub backend: TerminalBackend,
     pub title: String,
-    /// Heuristic model of the shell's input line; gates the "? " prompt.
+    /// Heuristic model of the shell's input line; gates the "?" prompt.
     pub line: LineTracker,
 }

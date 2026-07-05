@@ -2,7 +2,7 @@ use egui::{Event, ImeEvent, Key, Modifiers};
 
 use muxterm::layout::PaneId;
 
-/// The "? " prompt line: a '?' typed as the first character at an idle shell
+/// The "?" prompt line: a '?' typed as the first character at an idle shell
 /// prompt swallows subsequent keystrokes into an AI query instead of the PTY.
 ///
 /// The machine is fed every input event before any TerminalView clones the
@@ -10,16 +10,13 @@ use muxterm::layout::PaneId;
 /// frame. It is deliberately egui-Context-free so transitions are unit-
 /// testable with bare Event values.
 ///
-/// Ordering constraint that shapes Pending: egui emits Key{pressed} before
-/// the companion Text in the same frame, so printable Key presses must never
-/// decide anything - only the Text/Paste/Ime event that follows them does.
+/// Ordering constraint: egui emits Key{pressed} before the companion Text
+/// in the same frame, so the trigger decision belongs to the Text event -
+/// the Slash press that produced the '?' must pass through undecided.
 #[derive(Debug, Default, PartialEq)]
 pub enum State {
     #[default]
     Inactive,
-    /// A '?' typed on an empty line was swallowed; the next content event
-    /// decides between Compose and replaying the '?' to the shell.
-    Pending,
     Compose {
         buffer: String,
         error: Option<String>,
@@ -29,7 +26,7 @@ pub enum State {
 #[derive(Default)]
 pub struct PromptMachine {
     pub state: State,
-    /// Pane the machine is bound to while Pending/Compose.
+    /// Pane the machine is bound to while composing.
     pub pane: Option<PaneId>,
 }
 
@@ -92,15 +89,13 @@ pub enum Verdict {
     Pass,
     /// Remove the event from the frame.
     Consume,
-    /// Write these bytes to the PTY first, then leave the event in the frame.
-    PassAndWrite(Vec<u8>),
     /// Enter pressed in Compose: run this query.
     Submit(String),
 }
 
 impl PromptMachine {
-    /// Cancel Pending/Compose when focus moved away from the bound pane or
-    /// that pane is gone. Called once per frame before events are fed.
+    /// Cancel Compose when focus moved away from the bound pane or that
+    /// pane is gone. Called once per frame before events are fed.
     pub fn sync(&mut self, focused: PaneId, pane_exists: bool) {
         if self.state != State::Inactive
             && (!pane_exists || self.pane != Some(focused))
@@ -141,56 +136,16 @@ impl PromptMachine {
             State::Inactive => {
                 if let Event::Text(t) = event {
                     if t == "?" && line.is_empty() && at_shell() {
-                        self.state = State::Pending;
+                        self.state = State::Compose {
+                            buffer: String::new(),
+                            error: None,
+                        };
                         self.pane = Some(focused);
                         return Verdict::Consume;
                     }
                 }
                 apply_line_effect(event, line);
                 Verdict::Pass
-            },
-            State::Pending => match event {
-                Event::Text(t) if t == " " => {
-                    self.state = State::Compose {
-                        buffer: String::new(),
-                        error: None,
-                    };
-                    Verdict::Consume
-                },
-                Event::Text(_)
-                | Event::Paste(_)
-                | Event::Ime(ImeEvent::Commit(_)) => {
-                    self.cancel();
-                    line.add(1); // the replayed '?'
-                    apply_line_effect(event, line);
-                    Verdict::PassAndWrite(b"?".to_vec())
-                },
-                Event::Key {
-                    key: Key::Escape | Key::Backspace,
-                    pressed: true,
-                    ..
-                } => {
-                    // The shell never saw the '?', so cancel silently. Esc
-                    // must not leak: it could flip zsh's vi-mode.
-                    self.cancel();
-                    Verdict::Consume
-                },
-                Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } if is_control_key(*key) || chorded(modifiers) => {
-                    // Keys that hit the shell without a companion Text
-                    // event: replay the '?' then let the key through.
-                    self.cancel();
-                    line.add(1); // the replayed '?'
-                    apply_line_effect(event, line);
-                    Verdict::PassAndWrite(b"?".to_vec())
-                },
-                // Printable presses (their Text follows this frame) and all
-                // releases - e.g. the shift release from typing '?' - wait.
-                _ => Verdict::Pass,
             },
             State::Compose { buffer, error } => match event {
                 Event::Text(t) | Event::Ime(ImeEvent::Commit(t)) => {
@@ -213,7 +168,8 @@ impl PromptMachine {
                     pressed: true,
                     ..
                 } => {
-                    // Erasing past "? " leaves compose entirely.
+                    // Erasing past the '?' leaves compose entirely; the
+                    // shell never saw the '?', so nothing to clean up.
                     if buffer.pop().is_none() {
                         self.cancel();
                     }
@@ -257,46 +213,6 @@ fn chorded(m: &Modifiers) -> bool {
     // Shift is deliberately not a chord: typing capitals must stay a plain
     // content decision for the Text event that follows.
     m.ctrl || m.alt || m.command || m.mac_cmd
-}
-
-/// Keys that act on the shell without a companion Text event.
-fn is_control_key(key: Key) -> bool {
-    use Key::*;
-    matches!(
-        key,
-        Enter
-            | Tab
-            | Delete
-            | Insert
-            | Home
-            | End
-            | PageUp
-            | PageDown
-            | ArrowUp
-            | ArrowDown
-            | ArrowLeft
-            | ArrowRight
-            | F1
-            | F2
-            | F3
-            | F4
-            | F5
-            | F6
-            | F7
-            | F8
-            | F9
-            | F10
-            | F11
-            | F12
-            | F13
-            | F14
-            | F15
-            | F16
-            | F17
-            | F18
-            | F19
-            | F20
-    )
 }
 
 /// Fold one event into the tracked line model (see [`LineTracker`]).
@@ -398,12 +314,11 @@ mod tests {
         m.on_event(e, PANE, line, &mut || shell)
     }
 
-    /// A machine driven through "? " into Compose.
+    /// A machine driven through '?' into Compose.
     fn compose() -> PromptMachine {
         let mut m = PromptMachine::default();
         let mut line = empty_line();
         assert_eq!(feed(&mut m, &text("?"), &mut line, true), Verdict::Consume);
-        assert_eq!(feed(&mut m, &text(" "), &mut line, true), Verdict::Consume);
         assert!(m.composing());
         m
     }
@@ -435,7 +350,7 @@ mod tests {
         feed(&mut m, &key(Key::Backspace), &mut line, true);
         assert!(line.is_empty());
         assert_eq!(feed(&mut m, &text("?"), &mut line, true), Verdict::Consume);
-        assert_eq!(m.state, State::Pending);
+        assert!(m.composing());
     }
 
     #[test]
@@ -479,67 +394,35 @@ mod tests {
 
         let mut line = empty_line();
         assert_eq!(feed(&mut m, &text("?"), &mut line, true), Verdict::Consume);
-        assert_eq!(m.state, State::Pending);
-    }
-
-    /// egui delivers Key{Space, pressed} before Text(" ") in the same
-    /// frame; the press must not decide Pending.
-    #[test]
-    fn pending_ignores_space_key_press_and_waits_for_its_text() {
-        let mut m = PromptMachine::default();
-        let mut line = empty_line();
-        feed(&mut m, &text("?"), &mut line, true);
-        assert_eq!(
-            feed(&mut m, &key(Key::Space), &mut line, true),
-            Verdict::Pass
-        );
-        assert_eq!(m.state, State::Pending);
-        assert_eq!(feed(&mut m, &text(" "), &mut line, true), Verdict::Consume);
         assert!(m.composing());
     }
 
+    /// The shift/slash release from typing '?' itself lands in Compose and
+    /// must not disturb the empty buffer.
     #[test]
-    fn pending_replays_question_mark_when_not_followed_by_space() {
-        let mut m = PromptMachine::default();
+    fn trigger_keys_own_release_is_harmless() {
+        let mut m = compose();
         let mut line = empty_line();
-        feed(&mut m, &text("?"), &mut line, true);
-        // The release of shift/slash from typing '?' itself keeps waiting.
-        assert_eq!(
-            feed(&mut m, &release(Key::Slash), &mut line, true),
-            Verdict::Pass
-        );
-        assert_eq!(
-            feed(&mut m, &text("x"), &mut line, true),
-            Verdict::PassAndWrite(b"?".to_vec())
-        );
-        assert_eq!(m.state, State::Inactive);
-        // The line now holds "?x"; two Backspaces re-arm the trigger.
-        assert_eq!(line, LineTracker::Known(2));
-    }
-
-    #[test]
-    fn pending_enter_replays_and_leaves_line_empty() {
-        let mut m = PromptMachine::default();
-        let mut line = empty_line();
-        feed(&mut m, &text("?"), &mut line, true);
+        feed(&mut m, &release(Key::Slash), &mut line, true);
+        feed(&mut m, &text("hi"), &mut line, true);
         assert_eq!(
             feed(&mut m, &key(Key::Enter), &mut line, true),
-            Verdict::PassAndWrite(b"?".to_vec())
+            Verdict::Submit("hi".into())
         );
-        assert_eq!(m.state, State::Inactive);
-        assert!(line.is_empty());
     }
 
+    /// Muscle memory from the old "? " trigger: a space typed after the
+    /// '?' is just leading whitespace, trimmed away on submit.
     #[test]
-    fn pending_escape_and_backspace_cancel_silently() {
-        for k in [Key::Escape, Key::Backspace] {
-            let mut m = PromptMachine::default();
-            let mut line = empty_line();
-            feed(&mut m, &text("?"), &mut line, true);
-            assert_eq!(feed(&mut m, &key(k), &mut line, true), Verdict::Consume);
-            assert_eq!(m.state, State::Inactive);
-            assert!(line.is_empty()); // the shell never saw anything
-        }
+    fn space_after_question_mark_still_composes() {
+        let mut m = compose();
+        let mut line = empty_line();
+        feed(&mut m, &text(" "), &mut line, true);
+        feed(&mut m, &text("hi"), &mut line, true);
+        assert_eq!(
+            feed(&mut m, &key(Key::Enter), &mut line, true),
+            Verdict::Submit("hi".into())
+        );
     }
 
     #[test]
@@ -580,7 +463,7 @@ mod tests {
         );
         assert_eq!(m.state, State::Inactive);
         // Compose consumed everything, so the shell line is still empty
-        // and "? " can trigger again immediately.
+        // and '?' can trigger again immediately.
         assert!(line.is_empty());
     }
 

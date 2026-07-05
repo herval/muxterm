@@ -20,7 +20,7 @@ const DEFAULT_CONFIG: &str = r##"# muxterm configuration - edits apply live whil
 #                  "iterm-light", "solarized-light", "github-light"
 theme = "iterm-dark"
 
-# Agent CLI behind the "? " prompt line (type "? " at an empty shell
+# Agent CLI behind the "?" prompt line (type "?" at an empty shell
 # prompt to ask): "claude" (Claude Code) or "codex".
 agent = "claude"
 
@@ -60,7 +60,7 @@ size = 14.0
 #[serde(default)]
 pub struct ConfigFile {
     pub theme: String,
-    /// Agent CLI behind the "? " prompt line: "claude" or "codex".
+    /// Agent CLI behind the "?" prompt line: "claude" or "codex".
     /// (`agent_model` also lives in the file but is read by `mux ask`,
     /// not the GUI.)
     pub agent: String,
@@ -251,7 +251,7 @@ pub fn set_theme(name: &str) {
     }
 }
 
-/// Same surgical rewrite for the "? " prompt's agent choice.
+/// Same surgical rewrite for the "?" prompt's agent choice.
 pub fn set_agent(id: &str) {
     let text = fs::read_to_string(path()).unwrap_or_default();
     let line = format!("agent = \"{id}\"");

@@ -1,4 +1,4 @@
-//! `mux ask` - the one-shot AI query behind the "? " prompt line.
+//! `mux ask` - the one-shot AI query behind the "?" prompt line.
 //!
 //! The pane types only `mux ask '<question>' < <ctx-file>`; this module
 //! resolves agent + model from config.toml, spawns the agent CLI, and for
@@ -38,7 +38,7 @@ struct AskConfig {
 }
 
 /// Agent + model override from the same config.toml the GUI writes, so a
-/// settings change applies to the next "? " submit with no restart.
+/// settings change applies to the next "?" submit with no restart.
 pub fn configured() -> (&'static Agent, Option<String>) {
     let text = fs::read_to_string(state::config_dir().join("config.toml"))
         .unwrap_or_default();

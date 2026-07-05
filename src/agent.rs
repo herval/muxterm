@@ -1,10 +1,10 @@
-//! The AI agent CLIs behind the "? " prompt line, shared by the GUI
+//! The AI agent CLIs behind the "?" prompt line, shared by the GUI
 //! (settings, probing, the typed command) and `mux ask` (the invocation).
 
 use std::path::Path;
 use std::process::Command;
 
-/// A one-shot AI agent CLI that the "? " prompt line can drive.
+/// A one-shot AI agent CLI that the "?" prompt line can drive.
 pub struct Agent {
     /// Value stored in config.toml.
     pub id: &'static str,
@@ -36,7 +36,7 @@ pub fn default_agent() -> &'static Agent {
     &AGENTS[0]
 }
 
-/// The shell command a "? " submit types into the pane. Everything else -
+/// The shell command a "?" submit types into the pane. Everything else -
 /// agent choice, model, streaming flags, output formatting - lives behind
 /// `mux ask` (src/ask.rs), which reads the same config.toml: the visible
 /// command stays short, and pane scrollback travels via stdin redirection.

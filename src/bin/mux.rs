@@ -509,7 +509,7 @@ impl Scope {
 
 // ---------------------------------------------------------- subcommands
 
-/// One-shot AI query - what a "? " submit in the GUI actually runs. Needs
+/// One-shot AI query - what a "?" submit in the GUI actually runs. Needs
 /// no tmux identity, so it also works from any plain terminal.
 fn cmd_ask(mut args: Vec<String>) -> CmdResult {
     let agent_flag = take_opt(&mut args, "--agent")?;

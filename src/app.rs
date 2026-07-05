@@ -65,7 +65,7 @@ pub struct App {
     dirty: bool,
     config_mtime: Option<SystemTime>,
     last_config_check: Instant,
-    /// The "? " prompt line.
+    /// The "?" prompt line.
     ai: PromptMachine,
     agent: &'static Agent,
     agent_context_lines: u32,
@@ -168,7 +168,7 @@ impl App {
         let id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
         // Restored sessions may hold half-typed input from the previous
-        // run, so the "? " prompt stays inert there until the first Enter.
+        // run, so the "?" prompt stays inert there until the first Enter.
         let restored = session.is_some();
         let session = session.unwrap_or_else(TmuxCtl::new_session_name);
         let backend = TerminalBackend::new(
@@ -597,7 +597,7 @@ impl App {
         }
     }
 
-    /// Route keyboard events through the "? " prompt machine before any
+    /// Route keyboard events through the "?" prompt machine before any
     /// TerminalView clones the frame's input. Events it consumes never
     /// reach the PTY; a submit types the composed agent command into the
     /// focused pane, with recent scrollback redirected to its stdin.
@@ -642,10 +642,6 @@ impl App {
                 ) {
                     Verdict::Pass => kept.push(event),
                     Verdict::Consume => {},
-                    Verdict::PassAndWrite(bytes) => {
-                        writes.push(bytes);
-                        kept.push(event);
-                    },
                     Verdict::Submit(query) => submit = Some(query),
                 }
             }
@@ -796,7 +792,7 @@ impl eframe::App for App {
             });
         }
 
-        // Order is load-bearing: shortcuts and the "? " prompt machine must
+        // Order is load-bearing: shortcuts and the "?" prompt machine must
         // both run before any TerminalView clones the frame's input events,
         // and shortcuts first so chords never reach the machine.
         let mut actions = keys::drain_shortcuts(ctx);
@@ -847,7 +843,7 @@ impl eframe::App for App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
                     let mut rects = HashMap::new();
-                    // While settings or the "? " compose line own the
+                    // While settings or the "?" compose line own the
                     // keyboard, the sentinel matches no pane, so the
                     // terminal stops re-grabbing focus every frame.
                     let focused = if self.settings_open || self.ai.composing()
@@ -984,7 +980,7 @@ fn write_context_file(pane: PaneId, capture: &str) -> Option<PathBuf> {
     }
 }
 
-/// The "? " compose line, drawn inline over the caret's row so the query
+/// The "?" compose line, drawn inline over the caret's row so the query
 /// reads as if typed at the shell prompt. `caret` is the terminal cursor
 /// cell in screen coordinates.
 fn draw_ai_overlay(

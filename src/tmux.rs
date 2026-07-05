@@ -143,7 +143,7 @@ impl TmuxCtl {
     }
 
     /// Foreground process of the session's active pane ("zsh", "vim", ...),
-    /// so the "? " prompt only ever triggers at a shell.
+    /// so the "?" prompt only ever triggers at a shell.
     pub fn pane_current_command(&self, session: &str) -> Option<String> {
         let out = Command::new(&self.bin)
             .args([

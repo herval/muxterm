@@ -16,7 +16,7 @@ use crate::config;
 use crate::theme::{self, UiTheme};
 
 /// Row width in character cells, borders included. Sized so the longest
-/// fixed line (the "? " hint row) fits with a little air; shorter rows
+/// fixed line (the "?" hint row) fits with a little air; shorter rows
 /// pad out to meet the right border.
 const COLS: usize = 48;
 
@@ -124,7 +124,7 @@ pub fn show(
                     out.agent = Some(a.id);
                 }
             }
-            grid.hint(ui, "type \"? \" at an empty shell prompt to ask");
+            grid.hint(ui, "type \"?\" at an empty shell prompt to ask");
 
             grid.border(ui, "├─", "", "┤", th.accent);
             grid.config_row(ui);

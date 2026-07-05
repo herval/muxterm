@@ -40,7 +40,7 @@ Two binaries share one library. `src/lib.rs` exposes only `agent`, `ask`, `layou
 - `layout.rs` — binary split tree per tab (`Node`, leaves are `PaneId`s), rect splitting, and directional focus (`neighbor`) computed from last-frame screen rects.
 - `theme.rs` / `tabbar.rs` — chrome colors are *derived* from the terminal palette; themes are curated presets with a small `[colors]` override surface.
 
-### The "? " AI prompt
+### The "?" AI prompt
 
 `ai_prompt.rs` (`PromptMachine`, `LineTracker`) intercepts egui input events **before** `TerminalView` sees them: a `?` typed as the first char at an idle shell prompt opens a compose line. It's a deliberately egui-Context-free state machine so transitions unit-test with bare `Event` values. `LineTracker` heuristically models the shell's input line and must err toward `Dirty` — a missed trigger is harmless, a false one intercepts real typing. Submit types `mux ask '<query>'` into the pane (`agent.rs` builds the command), with the last N scrollback lines captured to a temp file and piped to stdin. `ask.rs` (behind `mux ask`) resolves agent + `agent_model` from config.toml, spawns the CLI — `claude -p` with stream-json, or `codex exec` which streams natively — and renders answer text live with tool calls as dim `»` one-liners.
 

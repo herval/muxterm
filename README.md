@@ -36,7 +36,7 @@ defaults rather than exposing every choice as configuration:
   the `mux` CLI gives them shared context — they read each other's
   terminals, message each other, and share a scratchpad (see
   [agent mesh](#agent-mesh)). And AI is one keystroke from any shell: type
-  `? ` at an idle prompt and the line becomes a compose box — enter runs
+  `?` at an idle prompt and the line becomes a compose box — enter runs
   your question through Claude Code or Codex right in the pane, with your
   recent scrollback piped in as context, so `? why did this build fail`
   just works.
@@ -82,14 +82,14 @@ through your login shell.
 | mouse select | copies to the clipboard automatically (`copy_on_select`, toggle in settings) |
 | shift+PageUp or mouse wheel | tmux copy-mode scrollback |
 | cmd+, | settings (esc closes) |
-| `?` then space (at an empty shell prompt) | ask the AI agent — enter runs it in the pane, esc cancels |
+| `?` (at an empty shell prompt) | ask the AI agent — enter runs it in the pane, esc cancels |
 
 ¹ Window managers like Rectangle bind cmd+opt+arrows globally; free those
 hotkeys or use cmd+[ / cmd+].
 
 ## AI prompt
 
-Type `? ` as the first characters at an idle shell prompt and the pane
+Type `?` as the first character at an idle shell prompt and the pane
 switches to an accent-colored compose line. Enter types `mux ask '…'` into
 the pane like any command; `mux ask` runs your question as a one-shot
 Claude Code (default) or Codex query — pick the agent in settings (cmd+,) —
@@ -108,8 +108,8 @@ for depth. `mux ask` also works from any plain terminal.
 ```toml
 theme = "iterm-dark"   # dracula | solarized-dark | gruvbox-dark |
                        # iterm-light | solarized-light | github-light
-agent = "claude"       # "? " prompt agent: claude | codex
-agent_model = ""       # --model for "? " answers; empty = fast default
+agent = "claude"       # "?" prompt agent: claude | codex
+agent_model = ""       # --model for "?" answers; empty = fast default
                        # ("haiku" for claude)
 agent_context_lines = 200   # pane scrollback sent as context (0 = none)
 dim_inactive_panes = 0.12   # unfocused-split fade toward bg (0.0 - 0.8)
@@ -213,7 +213,7 @@ but anything with socket access can drive tmux directly.
 
 - `src/` — the app: split tree (`layout.rs`), tmux lifecycle (`tmux.rs`),
   persistence (`state.rs`), shortcuts (`keys.rs`), agent-mesh state
-  (`mesh.rs`), the "? " prompt (`ai_prompt.rs`, `ask.rs`), the settings
+  (`mesh.rs`), the "?" prompt (`ai_prompt.rs`, `ask.rs`), the settings
   panel (`settings.rs`), render loop (`app.rs`).
 - `src/bin/mux.rs` — the `mux` CLI (agent mesh, `mux ask`).
 - `crates/egui_term/` — vendored [egui_term](https://github.com/Harzu/egui_term)
