@@ -1,6 +1,6 @@
 use egui_term::TerminalBackend;
 
-use crate::layout::PaneId;
+use muxterm::layout::PaneId;
 
 /// One terminal pane. Dropping it shuts the PTY down, which only detaches
 /// the tmux client - killing the session is an explicit, separate step.

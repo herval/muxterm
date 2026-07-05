@@ -54,6 +54,37 @@ bright_green = "#5ffa68"
 Tab bar, dividers, and pane-border chrome are derived from the palette
 automatically, so a theme change restyles the whole window.
 
+## Agent mesh
+
+Run AI agents (claude, aider, any interactive CLI) in panes and let them
+coordinate through the bundled `mux` CLI — **scoped per tab**: the panes of
+one tab form a team; agents cannot see or message other tabs. Because every
+pane is a tmux session, agents can read each other's terminals with zero
+cooperation from the program running there (works for `top`, vim, anything).
+
+```sh
+mux join reviewer --role code-review   # register this pane (tab relabels)
+mux peers                              # who's on the team
+mux read writer -n 300                 # snapshot a teammate's terminal
+mux post writer "left comments in review.md"   # inbox + one [mux] nudge
+mux inbox --consume                    # read messages sent to you
+mux tell writer "run the tests again"  # type into their terminal directly
+mux ctx set build.status green         # shared per-tab scratchpad
+mux brief                              # paste-ready team briefing for a prompt
+```
+
+Typical setup: split a tab, run an agent per pane, have each run
+`mux join <name> --role <role>` (or paste `mux brief` output into their
+system prompt). Agents shell out to `mux` like any other command. Prefer
+`post` for anything a teammate should act on (it queues durably and injects
+a single `[mux] new message from …` nudge no matter how many messages pile
+up); `tell` types straight into their input — immediate, but it can
+interleave with whatever they're doing. Messages up to 16 KiB (`post`) /
+64 KiB (`tell`); registry, inboxes, and per-tab context live under
+`~/Library/Application Support/muxterm/`, cleaned automatically when panes
+close. Isolation is cooperative — `mux` enforces the tab boundary, but
+anything with socket access can drive tmux directly.
+
 ## How persistence works
 
 - Panes run `tmux new-session -A -D -s mux-<id>` on a dedicated socket

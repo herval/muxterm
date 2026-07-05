@@ -3,13 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use egui_term::BackendSettings;
-
-/// Dedicated tmux server socket: muxterm sessions never touch the user's
-/// default tmux server, which also makes the startup GC safe.
-pub const SOCKET: &str = "muxterm";
-const SESSION_PREFIX: &str = "mux-";
+// Dedicated tmux server socket: muxterm sessions never touch the user's
+// default tmux server, which also makes the startup GC safe. Constants and
+// binary discovery are shared with the `mux` agent-mesh CLI.
+use muxterm::mesh::{find_tmux, SESSION_PREFIX, SOCKET};
 
 /// Regenerated on every launch (it only applies when the server starts).
 /// `status off` makes sessions look like a plain terminal; the `Ms` override
@@ -35,28 +34,9 @@ pub struct TmuxCtl {
 }
 
 impl TmuxCtl {
-    /// PATH is not guaranteed when launched outside a shell, so probe the
-    /// usual install locations before falling back to `which`.
     pub fn discover(config_dir: &Path) -> Result<Self> {
-        let candidates =
-            ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"];
-        let bin = candidates
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.is_file())
-            .or_else(|| {
-                let out = Command::new("which").arg("tmux").output().ok()?;
-                if !out.status.success() {
-                    return None;
-                }
-                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                (!path.is_empty()).then(|| PathBuf::from(path))
-            })
-            .context(
-                "tmux not found - install it with `brew install tmux` and relaunch muxterm",
-            )?;
         Ok(Self {
-            bin,
+            bin: find_tmux()?,
             conf: config_dir.join("tmux.conf"),
         })
     }

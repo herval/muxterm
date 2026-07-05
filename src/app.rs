@@ -10,9 +10,10 @@ use egui_term::{
 
 use crate::config;
 use crate::keys::{self, Action};
-use crate::layout::{self, Node, PaneId, Removal, SplitAxis};
+use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
+use muxterm::mesh;
 use crate::pane::Pane;
-use crate::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
+use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
 use crate::tmux::TmuxCtl;
@@ -20,6 +21,8 @@ use crate::tmux::TmuxCtl;
 const PANE_GAP: f32 = 4.0;
 
 pub struct Tab {
+    /// Stable id (`mux-tab-<8hex>`) scoping the agent mesh to this tab.
+    pub tab_id: String,
     pub tree: Node,
     pub panes: HashMap<PaneId, Pane>,
     pub focused: PaneId,
@@ -47,6 +50,9 @@ pub struct App {
     dirty: bool,
     config_mtime: Option<SystemTime>,
     last_config_check: Instant,
+    /// session -> registered agent (mesh registry, polled like the config).
+    agents: HashMap<String, mesh::AgentInfo>,
+    agents_mtime: Option<SystemTime>,
 }
 
 impl App {
@@ -75,6 +81,8 @@ impl App {
             dirty: false,
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
+            agents: mesh::load_registry().agents.into_iter().collect(),
+            agents_mtime: mesh::registry_mtime(),
         };
 
         match state::load() {
@@ -108,6 +116,16 @@ impl App {
         if app.tabs.is_empty() {
             app.new_tab(&cc.egui_ctx, None);
         }
+
+        // Mesh housekeeping keyed strictly off live sessions/tabs, so it
+        // can never remove a live agent (and is safe even when the state
+        // file was corrupt).
+        let live_sessions: HashSet<String> =
+            app.tmux.list_sessions().into_iter().collect();
+        let live_tabs: HashSet<String> =
+            app.tabs.iter().map(|t| t.tab_id.clone()).collect();
+        mesh::prune(&live_sessions, &live_tabs);
+
         app
     }
 
@@ -149,6 +167,7 @@ impl App {
                 let mut panes = HashMap::new();
                 panes.insert(id, pane);
                 self.tabs.push(Tab {
+                    tab_id: mesh::new_tab_id(),
                     tree: Node::Leaf(id),
                     panes,
                     focused: id,
@@ -200,7 +219,15 @@ impl App {
             .find(|p| p.session == saved.focused_session)
             .map(|p| p.id)
             .unwrap_or_else(|| tree.first_leaf());
+        // Backfill ids for pre-mesh state files; the dirty flag persists it.
+        let tab_id = if saved.id.is_empty() {
+            self.dirty = true;
+            mesh::new_tab_id()
+        } else {
+            saved.id
+        };
         self.tabs.push(Tab {
+            tab_id,
             tree,
             panes,
             focused,
@@ -252,6 +279,7 @@ impl App {
         };
         if kill {
             self.tmux.kill_session(&pane.session);
+            mesh::remove_session(&pane.session);
         }
         drop(pane);
         tab.last_rects.remove(&pane_id);
@@ -416,6 +444,7 @@ impl App {
                     .tabs
                     .iter()
                     .map(|tab| TabState {
+                        id: tab.tab_id.clone(),
                         tree: node_state(&tab.tree, &tab.panes),
                         focused_session: tab
                             .panes
@@ -560,6 +589,12 @@ impl eframe::App for App {
                 self.reload_config(ctx);
                 log::info!("config.toml reloaded");
             }
+            let agents_mtime = mesh::registry_mtime();
+            if agents_mtime != self.agents_mtime {
+                self.agents_mtime = agents_mtime;
+                self.agents =
+                    mesh::load_registry().agents.into_iter().collect();
+            }
         }
 
         if log::log_enabled!(log::Level::Debug) {
@@ -594,10 +629,11 @@ impl eframe::App for App {
             .tabs
             .iter()
             .map(|tab| {
-                tab.panes
-                    .get(&tab.focused)
-                    .map(|p| p.title.clone())
-                    .unwrap_or_else(|| "shell".into())
+                let pane = tab.panes.get(&tab.focused);
+                tab_label(
+                    pane.and_then(|p| self.agents.get(&p.session)),
+                    pane.map(|p| p.title.as_str()).unwrap_or("shell"),
+                )
             })
             .collect();
         for action in tabbar::show(ctx, &labels, self.active, &self.ui_theme) {
@@ -791,6 +827,18 @@ fn show_node(
     }
 }
 
+/// Tab label: registered agents show as `● name · role`, everything else
+/// falls back to the pane's OSC title.
+fn tab_label(agent: Option<&mesh::AgentInfo>, title: &str) -> String {
+    match agent {
+        Some(info) => match &info.role {
+            Some(role) => format!("● {} · {}", info.name, role),
+            None => format!("● {}", info.name),
+        },
+        None => title.to_string(),
+    }
+}
+
 /// Shown instead of the real app when tmux can't be found.
 pub struct ErrorApp(pub String);
 
@@ -801,5 +849,26 @@ impl eframe::App for ErrorApp {
                 ui.label(RichText::new(&self.0).size(15.0));
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_labels() {
+        let agent = |role: Option<&str>| mesh::AgentInfo {
+            name: "alice".into(),
+            role: role.map(str::to_string),
+            desc: None,
+            joined_at: 0,
+        };
+        assert_eq!(tab_label(None, "zsh"), "zsh");
+        assert_eq!(tab_label(Some(&agent(None)), "zsh"), "● alice");
+        assert_eq!(
+            tab_label(Some(&agent(Some("reviewer"))), "zsh"),
+            "● alice · reviewer"
+        );
     }
 }

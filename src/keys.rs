@@ -1,6 +1,6 @@
 use egui::{Key, KeyboardShortcut, Modifiers};
 
-use crate::layout::{Dir, SplitAxis};
+use muxterm::layout::{Dir, SplitAxis};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
