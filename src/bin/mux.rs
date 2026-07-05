@@ -12,11 +12,12 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use muxterm::ask;
+use muxterm::layout::SplitAxis;
 use muxterm::mesh::{self, AgentInfo};
 use muxterm::state;
 
@@ -27,6 +28,7 @@ const EXIT_NO_IDENTITY: i32 = 4;
 const EXIT_CONFLICT: i32 = 5;
 const EXIT_BUSY: i32 = 6;
 const EXIT_NOT_IN_TAB: i32 = 7;
+const EXIT_REFUSED: i32 = 8;
 
 const TELL_MAX: usize = 64 * 1024;
 const POST_MAX: usize = 16 * 1024;
@@ -46,6 +48,9 @@ usage: mux [--as <session>] [--json] <command> [args]
   run <name> [--role <r>] [--quiet] -- <command> [args...]
                                join, print the team brief, run an agent,
                                deregister when it exits
+  split [right|down] [--cwd <dir>] [--run <command>]
+                               grow the team: ask the GUI to split your
+                               pane; prints the new pane's session name
   leave [--name <n>|--session <s>]
                                deregister (default: yourself)
   peers [--all]                list teammates (--all: unregistered panes too)
@@ -107,6 +112,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "whoami" => cmd_whoami(as_session, json),
         "join" => cmd_join(as_session, rest),
         "run" => cmd_run(as_session, rest),
+        "split" => cmd_split(as_session, rest),
         "leave" => cmd_leave(as_session, rest),
         "peers" => cmd_peers(as_session, rest, json),
         "tree" => cmd_tree(as_session, json),
@@ -675,6 +681,83 @@ fn cmd_run(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
             format!("failed to launch {:?}: {e}", command[0]),
         )),
     }
+}
+
+/// Ask the GUI to split this pane, growing the tab's team by one slot.
+/// This can't be done from here directly: the GUI owns the layout, and a
+/// session created behind its back would never render and would be GC'd at
+/// the next launch. So the CLI picks the new session's name, spools a
+/// request for the App's poll loop, and learns the outcome by watching the
+/// tmux socket for that session (or the spool for a refusal).
+fn cmd_split(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
+    let usage = || {
+        (
+            EXIT_USAGE,
+            "usage: mux split [right|down] [--cwd <dir>] [--run <command>]"
+                .to_string(),
+        )
+    };
+    let cwd_flag = take_opt(&mut args, "--cwd")?;
+    let run = take_opt(&mut args, "--run")?;
+    let axis = match args.first().map(String::as_str) {
+        Some("right") => {
+            args.remove(0);
+            SplitAxis::SideBySide
+        },
+        Some("down") => {
+            args.remove(0);
+            SplitAxis::Stacked
+        },
+        _ => SplitAxis::SideBySide,
+    };
+    if !args.is_empty() {
+        return Err(usage());
+    }
+
+    let tmux = Tmux::new()?;
+    let sc = scope(&tmux, as_session)?;
+    let session = mesh::new_session_name();
+    // The new shell starts where the caller is, like a user split.
+    let cwd = cwd_flag
+        .or_else(|| env::current_dir().ok().map(|p| p.display().to_string()));
+    mesh::write_split_request(&mesh::SplitRequest {
+        v: 1,
+        from: sc.session.clone(),
+        session: session.clone(),
+        axis,
+        cwd,
+        ts: mesh::now(),
+    })
+    .map_err(|e| (EXIT_TMUX, format!("spooling request: {e:#}")))?;
+
+    // The GUI drains the spool on a ~1s tick (a bit slower when idle).
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(reason) = mesh::take_split_refusal(&session) {
+            return Err((EXIT_REFUSED, format!("muxterm refused: {reason}")));
+        }
+        if tmux.has_session(&session) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            // Withdraw, so a late GUI doesn't create an orphaned split.
+            let _ = fs::remove_file(mesh::request_path(&session));
+            return Err((
+                EXIT_REFUSED,
+                "timed out waiting for muxterm to create the split (is the app running?)"
+                    .to_string(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some(cmd) = run {
+        // Same delivery as `mux tell`: the text queues in the pane's pty
+        // and the shell reads it as soon as it is up.
+        tmux.paste_text(&session, &cmd, true)?;
+    }
+    println!("{session}");
+    Ok(())
 }
 
 fn cmd_leave(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
@@ -1370,6 +1453,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux inbox --consume` - read messages sent to you (do this when you see a `[mux]` line)");
     let _ = writeln!(out, "- `mux tell <name> <text>` - type directly into their terminal (immediate but can interleave)");
     let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
+    let _ = writeln!(out, "- `mux split [right|down] [--run <cmd>]` - add a pane beside yours for a new teammate; prints its session name");
     let _ = writeln!(out);
     let _ = write!(
         out,

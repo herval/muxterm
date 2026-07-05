@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::layout::SplitAxis;
 use crate::state::StateFile;
 
 pub const SOCKET: &str = "muxterm";
@@ -45,9 +46,14 @@ pub fn ctx_path(tab_id: &str) -> PathBuf {
     ctx_dir().join(format!("{tab_id}.json"))
 }
 
+pub fn requests_dir() -> PathBuf {
+    config_dir().join("requests")
+}
+
 pub fn ensure_dirs() {
     let _ = fs::create_dir_all(inbox_dir());
     let _ = fs::create_dir_all(ctx_dir());
+    let _ = fs::create_dir_all(requests_dir());
 }
 
 pub fn now() -> u64 {
@@ -60,6 +66,14 @@ pub fn now() -> u64 {
 pub fn new_tab_id() -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
     format!("{TAB_ID_PREFIX}{}", &id[..8])
+}
+
+/// Session names are minted here (not in the GUI's tmux layer) because
+/// `mux split` pre-agrees the name with the GUI: the CLI picks it, the GUI
+/// creates it, and the CLI learns the outcome by polling tmux for it.
+pub fn new_session_name() -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    format!("{SESSION_PREFIX}{}", &id[..8])
 }
 
 /// PATH is not guaranteed when launched outside a shell, so probe the usual
@@ -158,6 +172,87 @@ pub fn tab_of_session(
         }
     }
     None
+}
+
+/// A pane asking the GUI to split it (written by `mux split`, drained by
+/// the App's poll loop). Splits must go through the GUI - a session created
+/// behind its back would never appear in the layout and the startup GC
+/// would kill it. One file per request, named after the session-to-be.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SplitRequest {
+    pub v: u32,
+    /// Session of the pane asking to be split.
+    pub from: String,
+    /// Pre-agreed name for the new pane's session.
+    pub session: String,
+    pub axis: SplitAxis,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub ts: u64,
+}
+
+pub fn request_path(session: &str) -> PathBuf {
+    requests_dir().join(format!("{session}.json"))
+}
+
+pub fn refusal_path(session: &str) -> PathBuf {
+    requests_dir().join(format!("{session}.err"))
+}
+
+pub fn write_split_request(req: &SplitRequest) -> anyhow::Result<()> {
+    fs::create_dir_all(requests_dir())?;
+    let path = request_path(&req.session);
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(req)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Drain pending split requests; each file is removed as it is read.
+/// (`.json.tmp` staging files have extension "tmp" and are skipped, so a
+/// half-written request is never consumed.)
+pub fn take_split_requests() -> Vec<SplitRequest> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(requests_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let _ = fs::remove_file(&path);
+        if let Ok(req) = serde_json::from_str::<SplitRequest>(&text) {
+            out.push(req);
+        }
+    }
+    out
+}
+
+/// The GUI's "no": the requester polls for this alongside the session.
+pub fn write_split_refusal(session: &str, reason: &str) {
+    let _ = fs::create_dir_all(requests_dir());
+    let _ = fs::write(refusal_path(session), reason);
+}
+
+pub fn take_split_refusal(session: &str) -> Option<String> {
+    let path = refusal_path(session);
+    let reason = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    Some(reason)
+}
+
+/// Requests are ephemeral - the writer polls for a few seconds and gives
+/// up. Anything still spooled when the GUI starts is from a dead writer.
+pub fn clear_split_requests() {
+    if let Ok(entries) = fs::read_dir(requests_dir()) {
+        for entry in entries.flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Deregister a session and drop its inbox artifacts (pane closed).
@@ -307,5 +402,38 @@ mod tests {
         let id = new_tab_id();
         assert!(id.starts_with(TAB_ID_PREFIX));
         assert_eq!(id.len(), TAB_ID_PREFIX.len() + 8);
+    }
+
+    #[test]
+    fn session_names_have_expected_shape() {
+        let name = new_session_name();
+        assert!(name.starts_with(SESSION_PREFIX));
+        assert_eq!(name.len(), SESSION_PREFIX.len() + 8);
+        assert!(!name.starts_with(TAB_ID_PREFIX));
+    }
+
+    #[test]
+    fn split_request_round_trip() {
+        let req = SplitRequest {
+            v: 1,
+            from: "mux-aaaa".into(),
+            session: "mux-bbbb".into(),
+            axis: SplitAxis::Stacked,
+            cwd: Some("/tmp".into()),
+            ts: 42,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: SplitRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.from, "mux-aaaa");
+        assert_eq!(back.session, "mux-bbbb");
+        assert_eq!(back.axis, SplitAxis::Stacked);
+        assert_eq!(back.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(back.ts, 42);
+        // cwd is optional on the wire.
+        let bare: SplitRequest = serde_json::from_str(
+            r#"{"v":1,"from":"mux-a","session":"mux-b","axis":"SideBySide","ts":1}"#,
+        )
+        .unwrap();
+        assert!(bare.cwd.is_none());
     }
 }

@@ -26,6 +26,10 @@ use crate::tmux::{self, TmuxCtl};
 
 const PANE_GAP: f32 = 4.0;
 
+/// Ceiling on `mux split` requests per tab (the user's own splits are
+/// ungated); a confused agent must not be able to shred the layout.
+const AGENT_SPLIT_MAX_PANES: usize = 8;
+
 pub struct Tab {
     /// Stable id (`mux-tab-<8hex>`) scoping the agent mesh to this tab.
     pub tab_id: String,
@@ -149,6 +153,8 @@ impl App {
         let live_tabs: HashSet<String> =
             app.tabs.iter().map(|t| t.tab_id.clone()).collect();
         mesh::prune(&live_sessions, &live_tabs);
+        // Spooled split requests are from writers that gave up long ago.
+        mesh::clear_split_requests();
 
         app
     }
@@ -289,6 +295,73 @@ impl App {
                 }
             },
             Err(e) => log::error!("failed to split: {e:#}"),
+        }
+    }
+
+    /// Agent-requested splits (`mux split`): the CLI spools a request file,
+    /// we split the requester's pane with the pre-agreed session name, and
+    /// the CLI sees the session appear on the tmux socket (or a refusal
+    /// file) on its side.
+    fn drain_split_requests(&mut self, ctx: &egui::Context) {
+        for req in mesh::take_split_requests() {
+            if let Err(reason) = self.apply_split_request(ctx, &req) {
+                log::warn!("refused split from {}: {reason}", req.from);
+                mesh::write_split_refusal(&req.session, &reason);
+            }
+        }
+    }
+
+    /// Unlike a user split this targets the *requester's* pane, not the
+    /// focused one, and steals no focus - the user may be typing elsewhere.
+    fn apply_split_request(
+        &mut self,
+        ctx: &egui::Context,
+        req: &mesh::SplitRequest,
+    ) -> Result<(), String> {
+        if req.v != 1 {
+            return Err(format!("unsupported split request version {}", req.v));
+        }
+        if mesh::now().saturating_sub(req.ts) > 30 {
+            return Err("request expired before muxterm saw it".to_string());
+        }
+        // The name must be fresh: `new-session -A` on an existing session
+        // would attach it here, hijacking it into this tab's layout.
+        if !req.session.starts_with(mesh::SESSION_PREFIX)
+            || self.tmux.list_sessions().contains(&req.session)
+            || self
+                .tabs
+                .iter()
+                .any(|t| t.panes.values().any(|p| p.session == req.session))
+        {
+            return Err(format!("session name {:?} is not usable", req.session));
+        }
+        let found = self.tabs.iter().enumerate().find_map(|(i, tab)| {
+            tab.panes
+                .iter()
+                .find(|(_, p)| p.session == req.from)
+                .map(|(id, _)| (i, *id))
+        });
+        let Some((tab_idx, target)) = found else {
+            return Err(format!("session {} is not a muxterm pane", req.from));
+        };
+        if self.tabs[tab_idx].panes.len() >= AGENT_SPLIT_MAX_PANES {
+            return Err(format!(
+                "tab already has {AGENT_SPLIT_MAX_PANES} panes; close one first"
+            ));
+        }
+        let pane = self
+            .create_pane(ctx, Some(req.session.clone()), req.cwd.clone())
+            .map_err(|e| format!("failed to create pane: {e:#}"))?;
+        let id = pane.id;
+        let session = pane.session.clone();
+        let tab = &mut self.tabs[tab_idx];
+        if tab.tree.split(target, req.axis, id) {
+            tab.panes.insert(id, pane);
+            self.dirty = true;
+            Ok(())
+        } else {
+            self.tmux.kill_session(&session);
+            Err("requesting pane vanished mid-split".to_string())
         }
     }
 
@@ -712,6 +785,7 @@ impl eframe::App for App {
                 self.agents =
                     mesh::load_registry().agents.into_iter().collect();
             }
+            self.drain_split_requests(ctx);
         }
 
         if log::log_enabled!(log::Level::Debug) {

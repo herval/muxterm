@@ -78,8 +78,7 @@ impl TmuxCtl {
     }
 
     pub fn new_session_name() -> String {
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        format!("{SESSION_PREFIX}{}", &id[..8])
+        muxterm::mesh::new_session_name()
     }
 
     /// The whole trick of muxterm: the pane's PTY runs a tmux client.

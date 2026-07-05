@@ -133,6 +133,7 @@ mux post writer "left comments in review.md"   # inbox + one [mux] nudge
 mux inbox --consume                    # read messages sent to you
 mux tell writer "run the tests again"  # type into their terminal directly
 mux ctx set build.status green         # shared per-tab scratchpad
+mux split --run 'mux run w2 -- claude' # grow the team: split your own pane
 mux brief                              # paste-ready team briefing for a prompt
 ```
 
@@ -142,6 +143,15 @@ prints the team briefing so it lands in the agent's first screenful, execs
 the command, and deregisters when it exits. (Or register manually with
 `mux join` and paste `mux brief` output into the agent's prompt.) Agents
 shell out to `mux` like any other command.
+
+Agents can also grow the team themselves: `mux split [right|down]
+[--run <command>]` asks the GUI to split the calling pane and prints the
+new pane's session name — an orchestrator can fan work out to parallel
+subagents (`mux split --run 'mux run helper -- claude …'`) and coordinate
+them with `read`/`post`/`tell`. Splits stay GUI-owned (a session created
+behind the app's back would never render and would be GC'd), so the CLI
+spools a request that the app's poll loop applies: the new pane lands next
+to the requester without stealing focus, capped at 8 panes per tab.
 
 Prefer `post` for anything a teammate should act on (it queues durably and
 injects a single `[mux] new message from …` nudge no matter how many
