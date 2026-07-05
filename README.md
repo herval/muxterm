@@ -27,9 +27,20 @@ Requires `tmux` (`brew install tmux`).
 | cmd+[ / cmd+] | cycle focus through panes |
 | cmd+c / cmd+v | copy / paste |
 | shift+PageUp or mouse wheel | tmux copy-mode scrollback |
+| `?` then space (at an empty shell prompt) | ask the AI agent — enter runs it in the pane, esc cancels |
 
 ¹ Window managers like Rectangle bind cmd+opt+arrows globally; free those
 hotkeys or use cmd+[ / cmd+].
+
+## AI prompt
+
+Type `? ` as the first characters at an idle shell prompt and the pane
+switches to an accent-colored compose line. Enter runs your question as a
+one-shot `claude -p '…'` (Claude Code, default) or `codex exec '…'` (pick in
+settings, cmd+,), typed into the pane like any command — output streams in
+the terminal and lands in scrollback. The last `agent_context_lines` of the
+pane's scrollback are captured to a temp file and redirected to the agent's
+stdin, so it sees what you were just doing.
 
 ## Theming
 
@@ -39,6 +50,8 @@ hotkeys or use cmd+[ / cmd+].
 ```toml
 theme = "iterm-dark"   # dracula | solarized-dark | gruvbox-dark |
                        # iterm-light | solarized-light | github-light
+agent = "claude"       # "? " prompt agent: claude | codex
+agent_context_lines = 200   # pane scrollback sent as context (0 = none)
 dim_inactive_panes = 0.12   # unfocused-split fade toward bg (0.0 - 0.8)
 
 [font]

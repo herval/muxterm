@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -8,6 +10,8 @@ use egui_term::{
     TerminalTheme, TerminalView,
 };
 
+use crate::agent::{self, Agent};
+use crate::ai_prompt::{self, PromptMachine, Verdict};
 use crate::config;
 use crate::keys::{self, Action};
 use crate::layout::{self, Node, PaneId, Removal, SplitAxis};
@@ -15,7 +19,7 @@ use crate::pane::Pane;
 use crate::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
-use crate::tmux::TmuxCtl;
+use crate::tmux::{self, TmuxCtl};
 
 const PANE_GAP: f32 = 4.0;
 
@@ -47,6 +51,13 @@ pub struct App {
     dirty: bool,
     config_mtime: Option<SystemTime>,
     last_config_check: Instant,
+    /// The "? " prompt line.
+    ai: PromptMachine,
+    agent: &'static Agent,
+    agent_context_lines: u32,
+    /// Cache of `binary_available` probes; misses are evicted on failed
+    /// submits so an install-then-retry works without a restart.
+    agent_ok: HashMap<&'static str, bool>,
 }
 
 impl App {
@@ -75,6 +86,10 @@ impl App {
             dirty: false,
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
+            ai: PromptMachine::default(),
+            agent: style.agent,
+            agent_context_lines: style.agent_context_lines,
+            agent_ok: HashMap::new(),
         };
 
         match state::load() {
@@ -119,6 +134,9 @@ impl App {
     ) -> anyhow::Result<Pane> {
         let id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
+        // Restored sessions may hold half-typed input from the previous
+        // run, so the "? " prompt stays inert there until the first Enter.
+        let restored = session.is_some();
         let session = session.unwrap_or_else(TmuxCtl::new_session_name);
         let backend = TerminalBackend::new(
             id.0,
@@ -131,6 +149,7 @@ impl App {
             session,
             backend,
             title: "shell".into(),
+            line_empty: !restored,
         })
     }
 
@@ -443,11 +462,110 @@ impl App {
         self.term_theme = style.term_theme;
         self.ui_theme = style.ui;
         self.theme_name = style.name;
+        self.agent = style.agent;
+        self.agent_context_lines = style.agent_context_lines;
+    }
+
+    /// Route keyboard events through the "? " prompt machine before any
+    /// TerminalView clones the frame's input. Events it consumes never
+    /// reach the PTY; a submit types the composed agent command into the
+    /// focused pane, with recent scrollback redirected to its stdin.
+    fn ai_intercept(&mut self, ctx: &egui::Context) {
+        if self.settings_open {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let focused = tab.focused;
+        self.ai.sync(focused, tab.panes.contains_key(&focused));
+        let Some(pane) = tab.panes.get(&focused) else {
+            return;
+        };
+        let mut line_empty = pane.line_empty;
+        let session = pane.session.clone();
+
+        // The machine is moved out so the event loop below doesn't have to
+        // borrow self while at_shell holds &self.tmux.
+        let mut machine = std::mem::take(&mut self.ai);
+        let tmux = &self.tmux;
+        let mut shell_state: Option<bool> = None;
+        let mut at_shell = || {
+            *shell_state.get_or_insert_with(|| {
+                tmux.pane_current_command(&session)
+                    .is_some_and(|c| tmux::is_shell(&c))
+            })
+        };
+
+        let mut writes: Vec<Vec<u8>> = Vec::new();
+        let mut submit: Option<String> = None;
+        ctx.input_mut(|i| {
+            let events = std::mem::take(&mut i.events);
+            let mut kept = Vec::with_capacity(events.len());
+            for event in events {
+                match machine.on_event(
+                    &event,
+                    focused,
+                    &mut line_empty,
+                    &mut at_shell,
+                ) {
+                    Verdict::Pass => kept.push(event),
+                    Verdict::Consume => {},
+                    Verdict::PassAndWrite(bytes) => {
+                        writes.push(bytes);
+                        kept.push(event);
+                    },
+                    Verdict::Submit(query) => submit = Some(query),
+                }
+            }
+            i.events = kept;
+        });
+
+        if let Some(query) = submit {
+            let available = *self
+                .agent_ok
+                .entry(self.agent.id)
+                .or_insert_with(|| agent::binary_available(self.agent.bin));
+            if available {
+                let ctx_file = (self.agent_context_lines > 0)
+                    .then(|| {
+                        self.tmux
+                            .capture_pane(&session, self.agent_context_lines)
+                    })
+                    .flatten()
+                    .and_then(|capture| write_context_file(focused, &capture));
+                let mut cmd = self
+                    .agent
+                    .command(&query, ctx_file.as_deref())
+                    .into_bytes();
+                cmd.push(b'\r');
+                writes.push(cmd);
+                machine.cancel();
+                line_empty = true;
+            } else {
+                self.agent_ok.remove(self.agent.id);
+                machine
+                    .set_error(format!("{} not found in PATH", self.agent.bin));
+            }
+        }
+
+        self.ai = machine;
+        if let Some(pane) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|tab| tab.panes.get_mut(&focused))
+        {
+            pane.line_empty = line_empty;
+            for bytes in writes {
+                pane.backend.process_command(BackendCommand::Write(bytes));
+            }
+        }
     }
 
     fn show_settings(&mut self, ctx: &egui::Context) {
         let mut open = self.settings_open;
         let mut chosen: Option<&'static str> = None;
+        let mut chosen_agent: Option<&'static str> = None;
         let mut commit_size: Option<f32> = None;
 
         egui::Window::new("Settings")
@@ -520,6 +638,23 @@ impl App {
                 }
 
                 ui.add_space(10.0);
+                ui.label(RichText::new("AI agent").strong());
+                ui.add_space(4.0);
+                for a in agent::AGENTS {
+                    let selected = self.agent.id == a.id;
+                    if ui.selectable_label(selected, a.label).clicked()
+                        && !selected
+                    {
+                        chosen_agent = Some(a.id);
+                    }
+                }
+                ui.label(
+                    RichText::new("type \"? \" at an empty shell prompt to ask")
+                        .color(self.ui_theme.text_dim)
+                        .size(11.0),
+                );
+
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("Edit config file…").clicked() {
                         let _ = std::process::Command::new("/usr/bin/open")
@@ -538,6 +673,10 @@ impl App {
         self.settings_open = open;
         if let Some(name) = chosen {
             config::set_theme(name);
+            self.reload_config(ctx);
+        }
+        if let Some(id) = chosen_agent {
+            config::set_agent(id);
             self.reload_config(ctx);
         }
         if let Some(size) = commit_size {
@@ -570,8 +709,9 @@ impl eframe::App for App {
             });
         }
 
-        // Order is load-bearing: shortcuts must be consumed before any
-        // TerminalView clones the frame's input events.
+        // Order is load-bearing: shortcuts and the "? " prompt machine must
+        // both run before any TerminalView clones the frame's input events,
+        // and shortcuts first so chords never reach the machine.
         let mut actions = keys::drain_shortcuts(ctx);
         if self.settings_open
             && ctx.input_mut(|i| {
@@ -580,6 +720,7 @@ impl eframe::App for App {
         {
             self.settings_open = false;
         }
+        self.ai_intercept(ctx);
 
         self.drain_pty_events(ctx);
 
@@ -617,10 +758,11 @@ impl eframe::App for App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
                     let mut rects = HashMap::new();
-                    // While settings is open it owns keyboard focus; the
-                    // sentinel matches no pane, so the terminal stops
-                    // re-grabbing focus every frame.
-                    let focused = if self.settings_open {
+                    // While settings or the "? " compose line own the
+                    // keyboard, the sentinel matches no pane, so the
+                    // terminal stops re-grabbing focus every frame.
+                    let focused = if self.settings_open || self.ai.composing()
+                    {
                         PaneId(u64::MAX)
                     } else {
                         tab.focused
@@ -645,6 +787,23 @@ impl eframe::App for App {
                                 CornerRadius::same(2),
                                 Stroke::new(1.0, self.ui_theme.accent),
                                 StrokeKind::Outside,
+                            );
+                        }
+                    }
+                    if let ai_prompt::State::Compose { buffer, error } =
+                        &self.ai.state
+                    {
+                        if let Some(rect) =
+                            self.ai.pane.and_then(|p| rects.get(&p))
+                        {
+                            draw_ai_overlay(
+                                ui,
+                                *rect,
+                                buffer,
+                                error.as_deref(),
+                                self.agent,
+                                &self.font,
+                                &self.ui_theme,
                             );
                         }
                     }
@@ -678,6 +837,110 @@ impl eframe::App for App {
             self.dirty = false;
         }
     }
+}
+
+/// Write the captured scrollback where the agent command's stdin
+/// redirection can read it. $TMPDIR is per-user private on macOS; the file
+/// is overwritten by the pane's next submit and never removed eagerly - the
+/// agent reads it while running.
+fn write_context_file(pane: PaneId, capture: &str) -> Option<PathBuf> {
+    let path =
+        std::env::temp_dir().join(format!("muxterm-ctx-{}.txt", pane.0));
+    let content = format!(
+        "Recent output of this terminal pane (oldest first):\n{capture}\n"
+    );
+    match fs::write(&path, content) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            log::warn!("could not write agent context file: {e:#}");
+            None
+        },
+    }
+}
+
+/// The "? " compose line: an accent strip pinned to the bottom of the pane
+/// that owns the pending AI query.
+fn draw_ai_overlay(
+    ui: &egui::Ui,
+    pane_rect: Rect,
+    buffer: &str,
+    error: Option<&str>,
+    agent: &Agent,
+    font: &FontId,
+    theme: &UiTheme,
+) {
+    let row_h = ui.fonts(|f| f.row_height(font));
+    let char_w = ui.fonts(|f| f.glyph_width(font, 'M'));
+    let rect = Rect::from_min_max(
+        egui::pos2(pane_rect.min.x, pane_rect.max.y - (row_h + 12.0)),
+        pane_rect.max,
+    );
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::ZERO,
+        theme::blend(theme.bg, theme.accent, 0.18),
+    );
+    painter.line_segment(
+        [rect.left_top(), rect.right_top()],
+        Stroke::new(1.0, theme.accent),
+    );
+
+    let y = rect.center().y;
+    let (hint_text, hint_color) = match error {
+        Some(e) => (e.to_string(), egui::Color32::from_rgb(224, 82, 82)),
+        None => (
+            format!("enter run · esc cancel · {}", agent.label),
+            theme.text_dim,
+        ),
+    };
+    let hint = painter.layout_no_wrap(
+        hint_text,
+        FontId::proportional(11.0),
+        hint_color,
+    );
+    let hint_pos = egui::pos2(
+        rect.max.x - 10.0 - hint.size().x,
+        y - hint.size().y / 2.0,
+    );
+
+    let prefix =
+        painter.layout_no_wrap("? ".into(), font.clone(), theme.accent);
+    let text_left = rect.min.x + 10.0 + prefix.size().x;
+    painter.galley(
+        egui::pos2(rect.min.x + 10.0, y - prefix.size().y / 2.0),
+        prefix,
+        theme.accent,
+    );
+
+    // Tail-truncate against the hint; the buffer's cursor is always at the
+    // end, so the newest text is the part that must stay visible. One cell
+    // is reserved for the block cursor (monospace makes this exact).
+    let avail = (hint_pos.x - 16.0 - text_left).max(0.0);
+    let budget = ((avail / char_w) as usize).saturating_sub(1);
+    let count = buffer.chars().count();
+    let visible: String = if count > budget {
+        buffer.chars().skip(count - budget).collect()
+    } else {
+        buffer.to_string()
+    };
+    let text =
+        painter.layout_no_wrap(visible, font.clone(), theme.text);
+    let cursor_x = text_left + text.size().x;
+    painter.galley(
+        egui::pos2(text_left, y - text.size().y / 2.0),
+        text,
+        theme.text,
+    );
+    painter.rect_filled(
+        Rect::from_min_size(
+            egui::pos2(cursor_x + 1.0, y - row_h / 2.0),
+            Vec2::new(char_w, row_h),
+        ),
+        CornerRadius::ZERO,
+        theme.accent,
+    );
+    painter.galley(hint_pos, hint, hint_color);
 }
 
 #[allow(clippy::too_many_arguments)]

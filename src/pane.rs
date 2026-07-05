@@ -9,4 +9,6 @@ pub struct Pane {
     pub session: String,
     pub backend: TerminalBackend,
     pub title: String,
+    /// Heuristic: is the shell's input line empty? Gates the "? " prompt.
+    pub line_empty: bool,
 }

@@ -8,6 +8,7 @@ use egui::{FontData, FontFamily, FontId};
 use egui_term::TerminalTheme;
 use serde::Deserialize;
 
+use crate::agent::{self, Agent};
 use crate::state;
 use crate::theme::{self, UiTheme};
 
@@ -16,6 +17,13 @@ const DEFAULT_CONFIG: &str = r##"# muxterm configuration - edits apply live whil
 # Built-in themes: "iterm-dark", "dracula", "solarized-dark", "gruvbox-dark",
 #                  "iterm-light", "solarized-light", "github-light"
 theme = "iterm-dark"
+
+# Agent CLI behind the "? " prompt line (type "? " at an empty shell
+# prompt to ask): "claude" (Claude Code) or "codex".
+agent = "claude"
+
+# Lines of pane scrollback sent to the agent as context (0 = none).
+# agent_context_lines = 200
 
 # How much unfocused split panes fade toward the background (0.0 - 0.8).
 # dim_inactive_panes = 0.12
@@ -39,6 +47,10 @@ size = 14.0
 #[serde(default)]
 pub struct ConfigFile {
     pub theme: String,
+    /// Agent CLI behind the "? " prompt line: "claude" or "codex".
+    pub agent: String,
+    /// Lines of pane scrollback sent to the agent as context; 0 disables.
+    pub agent_context_lines: u32,
     /// 0.0 disables dimming of unfocused panes; 0.12 is the default wash.
     pub dim_inactive_panes: f32,
     pub font: FontConfig,
@@ -49,6 +61,8 @@ impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             theme: "iterm-dark".into(),
+            agent: "claude".into(),
+            agent_context_lines: 200,
             dim_inactive_panes: 0.12,
             font: FontConfig::default(),
             colors: HashMap::new(),
@@ -77,6 +91,8 @@ pub struct Style {
     pub term_theme: TerminalTheme,
     pub ui: UiTheme,
     pub font: FontId,
+    pub agent: &'static Agent,
+    pub agent_context_lines: u32,
 }
 
 pub fn path() -> PathBuf {
@@ -132,6 +148,20 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
     let (term_theme, ui) =
         theme::build(preset, &cfg.colors, cfg.dim_inactive_panes);
 
+    let agent = agent::by_id(&cfg.agent).unwrap_or_else(|| {
+        log::warn!(
+            "unknown agent {:?} (available: {}), using {}",
+            cfg.agent,
+            agent::AGENTS
+                .iter()
+                .map(|a| a.id)
+                .collect::<Vec<_>>()
+                .join(", "),
+            agent::default_agent().id
+        );
+        agent::default_agent()
+    });
+
     let size = cfg.font.size.clamp(6.0, 40.0);
     let font_data = cfg.font.family.as_deref().and_then(load_font_data);
 
@@ -141,6 +171,8 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             term_theme,
             ui,
             font: FontId::monospace(size),
+            agent,
+            agent_context_lines: cfg.agent_context_lines,
         },
         font_data,
     )
@@ -164,8 +196,22 @@ pub fn install_fonts(ctx: &egui::Context, custom: Option<FontData>) {
 /// preserving comments and every other setting in the file.
 pub fn set_theme(name: &str) {
     let text = fs::read_to_string(path()).unwrap_or_default();
-    if let Err(e) = fs::write(path(), replace_theme_line(&text, name)) {
+    let line = format!("theme = \"{name}\"");
+    if let Err(e) =
+        fs::write(path(), replace_top_level_line(&text, "theme", &line))
+    {
         log::warn!("could not save theme choice: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the "? " prompt's agent choice.
+pub fn set_agent(id: &str) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("agent = \"{id}\"");
+    if let Err(e) =
+        fs::write(path(), replace_top_level_line(&text, "agent", &line))
+    {
+        log::warn!("could not save agent choice: {e:#}");
     }
 }
 
@@ -176,14 +222,24 @@ pub fn set_font_size(size: f32) {
     }
 }
 
-fn replace_theme_line(text: &str, name: &str) -> String {
-    let line = format!("theme = \"{name}\"");
+fn replace_top_level_line(text: &str, key: &str, line: &str) -> String {
+    let prefix_spaced = format!("{key} =");
+    let prefix_tight = format!("{key}=");
     let mut out: Vec<String> = Vec::new();
+    let mut in_table = false;
     let mut replaced = false;
     for l in text.lines() {
         let t = l.trim_start();
-        if !replaced && (t.starts_with("theme =") || t.starts_with("theme=")) {
-            out.push(line.clone());
+        // Only top-level keys count: an identically named key inside a
+        // [table] (e.g. a future [agent] section) must be left alone.
+        if t.starts_with('[') {
+            in_table = true;
+        }
+        if !replaced
+            && !in_table
+            && (t.starts_with(&prefix_spaced) || t.starts_with(&prefix_tight))
+        {
+            out.push(line.to_string());
             replaced = true;
         } else {
             out.push(l.to_string());
@@ -191,7 +247,7 @@ fn replace_theme_line(text: &str, name: &str) -> String {
     }
     if !replaced {
         // Top-level keys must precede any [table] in TOML.
-        out.insert(0, line);
+        out.insert(0, line.to_string());
     }
     out.join("\n") + "\n"
 }
@@ -276,6 +332,10 @@ fn load_font_data(family: &str) -> Option<FontData> {
 mod tests {
     use super::*;
 
+    fn replace_theme_line(text: &str, name: &str) -> String {
+        replace_top_level_line(text, "theme", &format!("theme = \"{name}\""))
+    }
+
     #[test]
     fn theme_line_is_replaced_in_place() {
         let text = "# comment\ntheme = \"iterm-dark\"\n\n[font]\nsize = 14.0\n";
@@ -290,6 +350,36 @@ mod tests {
     fn theme_line_is_prepended_when_missing() {
         let out = replace_theme_line("[font]\nsize = 14.0\n", "gruvbox-dark");
         assert!(out.starts_with("theme = \"gruvbox-dark\""));
+    }
+
+    #[test]
+    fn agent_line_is_replaced_in_place() {
+        let text = "theme = \"dracula\"\nagent = \"claude\"\n\n[font]\n";
+        let out =
+            replace_top_level_line(text, "agent", "agent = \"codex\"");
+        assert!(out.contains("agent = \"codex\""));
+        assert!(!out.contains("claude"));
+        assert!(out.contains("theme = \"dracula\""));
+    }
+
+    #[test]
+    fn agent_line_is_prepended_when_missing_and_tables_are_skipped() {
+        let text = "[font]\nagent = \"inside-a-table\"\n";
+        let out =
+            replace_top_level_line(text, "agent", "agent = \"codex\"");
+        assert!(out.starts_with("agent = \"codex\""));
+        // The identically named key inside [font] is untouched.
+        assert!(out.contains("agent = \"inside-a-table\""));
+    }
+
+    #[test]
+    fn unknown_agent_falls_back_to_claude() {
+        let cfg = ConfigFile {
+            agent: "gpt".into(),
+            ..ConfigFile::default()
+        };
+        let (style, _) = resolve(&cfg);
+        assert_eq!(style.agent.id, "claude");
     }
 
     #[test]

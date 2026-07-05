@@ -129,6 +129,55 @@ impl TmuxCtl {
         (!path.is_empty()).then_some(path)
     }
 
+    /// Foreground process of the session's active pane ("zsh", "vim", ...),
+    /// so the "? " prompt only ever triggers at a shell.
+    pub fn pane_current_command(&self, session: &str) -> Option<String> {
+        let out = Command::new(&self.bin)
+            .args([
+                "-L",
+                SOCKET,
+                "list-panes",
+                "-t",
+                &format!("={session}"),
+                "-F",
+                "#{pane_current_command}",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let cmd = stdout.lines().next().unwrap_or("").trim().to_string();
+        (!cmd.is_empty()).then_some(cmd)
+    }
+
+    /// Last `lines` of the pane's content including scrollback, as plain
+    /// text (`-J` rejoins wrapped lines), for the AI agent's context.
+    /// Pane-scoped commands need the `=name:` target form (tmux >= 3.7
+    /// rejects a bare `=name` here, unlike list-panes).
+    pub fn capture_pane(&self, session: &str, lines: u32) -> Option<String> {
+        let out = Command::new(&self.bin)
+            .args([
+                "-L",
+                SOCKET,
+                "capture-pane",
+                "-p",
+                "-J",
+                "-S",
+                &format!("-{lines}"),
+                "-t",
+                &format!("={session}:"),
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = trim_capture(&String::from_utf8_lossy(&out.stdout));
+        (!text.is_empty()).then_some(text)
+    }
+
     /// `=` forces an exact match; `-t name` alone prefix-matches.
     pub fn kill_session(&self, session: &str) {
         let _ = Command::new(&self.bin)
@@ -164,5 +213,50 @@ impl TmuxCtl {
                 self.kill_session(&session);
             }
         }
+    }
+}
+
+/// Is this pane_current_command a shell sitting at a prompt? Login shells
+/// report themselves with a leading dash ("-zsh").
+pub fn is_shell(cmd: &str) -> bool {
+    matches!(
+        cmd.trim_start_matches('-'),
+        "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "nu"
+    )
+}
+
+/// capture-pane pads the visible region with blank lines; strip them (and
+/// per-line trailing whitespace) so the context file ends at real content.
+fn trim_capture(text: &str) -> String {
+    let mut lines: Vec<&str> =
+        text.lines().map(|l| l.trim_end()).collect();
+    while lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shells_are_recognized() {
+        for cmd in ["zsh", "-zsh", "bash", "fish", "-bash"] {
+            assert!(is_shell(cmd), "{cmd} should count as a shell");
+        }
+        for cmd in ["vim", "node", "claude", "ssh", ""] {
+            assert!(!is_shell(cmd), "{cmd} should not count as a shell");
+        }
+    }
+
+    #[test]
+    fn capture_trimming_strips_trailing_blanks_only() {
+        assert_eq!(
+            trim_capture("$ ls  \nfoo bar\n\n\n\n"),
+            "$ ls\nfoo bar"
+        );
+        assert_eq!(trim_capture("\n\n"), "");
+        assert_eq!(trim_capture("a\n\nb\n"), "a\n\nb");
     }
 }
