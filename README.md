@@ -100,6 +100,18 @@ stdin, so it sees what you were just doing. Questions default to a fast
 model (`haiku` for claude); set `agent_model` in config.toml to trade speed
 for depth. `mux ask` also works from any plain terminal.
 
+## PR status
+
+Every tab whose focused pane sits in a git checkout shows that branch's
+GitHub PR next to the tab title (on by default; `pr_status` in settings or
+config.toml turns it off): a status dot — green (checks passing / approved), yellow (running),
+red (failing or changes requested), magenta (merged) — plus the PR number.
+Hover for the rollup, click to open the PR page; split tabs get the same
+chip per pane next to the pane-title badges. Needs an authenticated
+[gh](https://cli.github.com). Local state (pane cwds, branches) is scanned
+every few seconds; GitHub itself is asked at most once per minute per
+(repo, branch), no matter how many panes share a checkout.
+
 ## Theming
 
 `~/Library/Application Support/muxterm/config.toml` (created on first run,
@@ -117,6 +129,8 @@ pane_titles = true          # per-pane title badge (top-right) on split tabs;
                             # also a checkbox in settings (cmd+,)
 copy_on_select = true       # mouse selections copy to the clipboard as
                             # they finish; off = select, then cmd+c
+pr_status = true            # the branch's GitHub PR beside the tab title
+                            # (status dot + number, click opens); needs gh
 
 [font]
 family = "Menlo"       # font name in the macOS font folders, or a file path

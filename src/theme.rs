@@ -16,6 +16,12 @@ pub struct UiTheme {
     pub accent: Color32,
     /// Translucent wash painted over unfocused panes (bg at some alpha).
     pub dim_overlay: Color32,
+    /// PR-status chip colors, straight from the palette's ANSI slots so
+    /// they follow the theme like the rest of the chrome.
+    pub status_ok: Color32,
+    pub status_warn: Color32,
+    pub status_err: Color32,
+    pub status_merged: Color32,
 }
 
 pub struct Preset {
@@ -242,6 +248,10 @@ pub fn build(
             bg.b(),
             (dim_inactive.clamp(0.0, 0.8) * 255.0) as u8,
         ),
+        status_ok: parse_hex(&get("green")).unwrap(),
+        status_warn: parse_hex(&get("yellow")).unwrap(),
+        status_err: parse_hex(&get("red")).unwrap(),
+        status_merged: parse_hex(&get("magenta")).unwrap(),
     };
 
     (TerminalTheme::new(Box::new(palette)), ui)

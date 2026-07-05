@@ -27,6 +27,7 @@ pub struct Outcome {
     pub agent: Option<&'static str>,
     pub copy_on_select: Option<bool>,
     pub pane_titles: Option<bool>,
+    pub pr_status: Option<bool>,
     pub font_size: Option<f32>,
 }
 
@@ -39,6 +40,7 @@ pub fn show(
     agent: &'static Agent,
     copy_on_select: bool,
     pane_titles: bool,
+    pr_status: bool,
 ) -> Outcome {
     let mut out = Outcome::default();
     let grid = Grid {
@@ -105,6 +107,22 @@ pub fn show(
                 out.pane_titles = Some(!pane_titles);
             }
             grid.hint(ui, "name chip in each pane's corner");
+
+            grid.border(ui, "├─", "GitHub", "┤", th.accent);
+            let mark = if pr_status { "[x]" } else { "[ ]" };
+            let row = grid.body(
+                ui,
+                vec![
+                    (mark.to_string(), th.accent),
+                    (" PR status on tabs".to_string(), th.text),
+                ],
+                true,
+                false,
+            );
+            if row.clicked() {
+                out.pr_status = Some(!pr_status);
+            }
+            grid.hint(ui, "branch's PR beside the title; needs gh");
 
             grid.border(ui, "├─", "AI agent", "┤", th.accent);
             for a in agent::AGENTS {
@@ -415,6 +433,7 @@ mod tests {
                 agent::default_agent(),
                 true,
                 true,
+                false,
             );
         };
         // A window's first frame is an invisible sizing pass; the second
@@ -458,6 +477,7 @@ mod tests {
                 agent::default_agent(),
                 true,
                 true,
+                false,
             );
         };
         let _ = ctx.run(input.clone(), frame);

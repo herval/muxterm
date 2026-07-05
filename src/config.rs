@@ -41,6 +41,10 @@ agent = "claude"
 # select"). When off, select then copy explicitly with cmd+c.
 copy_on_select = true
 
+# Show the current branch's GitHub PR beside the tab title (status dot +
+# number; click opens the PR page). Needs the gh CLI, authenticated.
+# pr_status = true
+
 [font]
 # Monospace font: a name searched in the macOS font folders, or a path to a
 # .ttf/.otf/.ttc file. Comment out for the built-in font (Hack).
@@ -72,6 +76,8 @@ pub struct ConfigFile {
     pub pane_titles: bool,
     /// Mouse selections copy to the clipboard as soon as they finish.
     pub copy_on_select: bool,
+    /// Poll `gh` for the current branch's PR and badge it on the tab.
+    pub pr_status: bool,
     pub font: FontConfig,
     pub colors: HashMap<String, String>,
 }
@@ -85,6 +91,7 @@ impl Default for ConfigFile {
             dim_inactive_panes: 0.12,
             pane_titles: true,
             copy_on_select: true,
+            pr_status: true,
             font: FontConfig::default(),
             colors: HashMap::new(),
         }
@@ -116,6 +123,7 @@ pub struct Style {
     pub agent_context_lines: u32,
     pub pane_titles: bool,
     pub copy_on_select: bool,
+    pub pr_status: bool,
 }
 
 pub fn path() -> PathBuf {
@@ -198,6 +206,7 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             agent_context_lines: cfg.agent_context_lines,
             pane_titles: cfg.pane_titles,
             copy_on_select: cfg.copy_on_select,
+            pr_status: cfg.pr_status,
         },
         font_data,
     )
@@ -283,6 +292,18 @@ pub fn set_pane_titles(on: bool) {
         replace_top_level_line(&text, "pane_titles", &line),
     ) {
         log::warn!("could not save pane_titles: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's PR-status checkbox.
+pub fn set_pr_status(on: bool) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("pr_status = {on}");
+    if let Err(e) = fs::write(
+        path(),
+        replace_top_level_line(&text, "pr_status", &line),
+    ) {
+        log::warn!("could not save pr_status: {e:#}");
     }
 }
 
@@ -483,6 +504,15 @@ mod tests {
         // The default config file documents the real default.
         let cfg: ConfigFile = toml::from_str(DEFAULT_CONFIG).unwrap();
         assert!(cfg.copy_on_select);
+    }
+
+    #[test]
+    fn pr_status_defaults_on_and_parses() {
+        assert!(ConfigFile::default().pr_status);
+        let cfg: ConfigFile = toml::from_str("pr_status = false").unwrap();
+        assert!(!cfg.pr_status);
+        let (style, _) = resolve(&cfg);
+        assert!(!style.pr_status);
     }
 
     #[test]

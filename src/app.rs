@@ -1,10 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use egui::{CornerRadius, FontId, Rect, RichText, Stroke, StrokeKind, Vec2};
+use egui::text::LayoutJob;
+use egui::{
+    CornerRadius, CursorIcon, FontId, Rect, RichText, Sense, Stroke,
+    StrokeKind, TextFormat, Vec2,
+};
 use egui_term::{
     BackendCommand, FontSettings, PtyEvent, TerminalBackend, TerminalFont,
     TerminalTheme, TerminalView,
@@ -18,6 +24,7 @@ use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
 use muxterm::mesh;
 use crate::pane::Pane;
+use crate::pr_status;
 use crate::settings;
 use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
@@ -75,6 +82,12 @@ pub struct App {
     /// session -> registered agent (mesh registry, polled like the config).
     agents: HashMap<String, mesh::AgentInfo>,
     agents_mtime: Option<SystemTime>,
+    /// session -> GitHub PR badge (config `pr_status`), streamed in by the
+    /// pr_status poller thread; the atomic gates that thread live.
+    pr: HashMap<String, pr_status::Badge>,
+    pr_rx: Receiver<HashMap<String, pr_status::Badge>>,
+    pr_enabled: Arc<AtomicBool>,
+    pr_status: bool,
 }
 
 impl App {
@@ -88,6 +101,9 @@ impl App {
         }
 
         let (pty_tx, pty_rx) = mpsc::channel();
+        let (pr_tx, pr_rx) = mpsc::channel();
+        let pr_enabled = Arc::new(AtomicBool::new(style.pr_status));
+        pr_status::spawn(cc.egui_ctx.clone(), pr_tx, pr_enabled.clone());
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -111,6 +127,10 @@ impl App {
             agent_ok: HashMap::new(),
             agents: mesh::load_registry().agents.into_iter().collect(),
             agents_mtime: mesh::registry_mtime(),
+            pr: HashMap::new(),
+            pr_rx,
+            pr_enabled,
+            pr_status: style.pr_status,
         };
 
         match state::load() {
@@ -585,6 +605,13 @@ impl App {
         self.pane_titles = style.pane_titles;
         self.agent = style.agent;
         self.agent_context_lines = style.agent_context_lines;
+        self.pr_status = style.pr_status;
+        self.pr_enabled.store(style.pr_status, Ordering::Relaxed);
+        if !style.pr_status {
+            // The poller also sends a clearing snapshot, but drop the
+            // badges now so the toggle feels instant.
+            self.pr.clear();
+        }
         if self.copy_on_select != style.copy_on_select {
             self.copy_on_select = style.copy_on_select;
             // The drag-end side of copy-on-select is a tmux binding;
@@ -736,6 +763,7 @@ impl App {
             self.agent,
             self.copy_on_select,
             self.pane_titles,
+            self.pr_status,
         );
         if let Some(name) = out.theme {
             config::set_theme(name);
@@ -752,6 +780,10 @@ impl App {
         }
         if let Some(on) = out.pane_titles {
             config::set_pane_titles(on);
+            self.reload_config(ctx);
+        }
+        if let Some(on) = out.pr_status {
+            config::set_pr_status(on);
             self.reload_config(ctx);
         }
         if let Some(size) = out.font_size {
@@ -807,6 +839,9 @@ impl eframe::App for App {
         self.copy_intercept(ctx);
 
         self.drain_pty_events(ctx);
+        while let Ok(snapshot) = self.pr_rx.try_recv() {
+            self.pr = snapshot;
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Sessions deliberately survive: dropping the app only detaches
@@ -815,15 +850,18 @@ impl eframe::App for App {
             return;
         }
 
-        let labels: Vec<String> = self
+        let labels: Vec<(String, Option<pr_status::Badge>)> = self
             .tabs
             .iter()
             .map(|tab| {
                 let pane = tab.panes.get(&tab.focused);
-                tab_label(
+                let label = tab_label(
                     pane.and_then(|p| self.agents.get(&p.session)),
                     pane.map(|p| p.title.as_str()).unwrap_or("shell"),
-                )
+                );
+                let badge =
+                    pane.and_then(|p| self.pr.get(&p.session)).cloned();
+                (label, badge)
             })
             .collect();
         for action in tabbar::show(ctx, &labels, self.active, &self.ui_theme) {
@@ -888,6 +926,8 @@ impl eframe::App for App {
                                     ui,
                                     *rect,
                                     &label,
+                                    self.pr.get(&pane.session),
+                                    *id,
                                     *id == tab.focused,
                                     &self.ui_theme,
                                 );
@@ -1088,13 +1128,15 @@ fn draw_ai_overlay(
     }
 }
 
-/// Small badge naming what a pane runs, drawn over its top-right corner.
-/// Only split tabs get badges; a lone pane's title is already in the
-/// tab bar.
+/// Small badge naming what a pane runs, drawn over its top-right corner,
+/// plus the pane's PR chip to its left when pr_status is on. Only split
+/// tabs get badges; a lone pane's title is already in the tab bar.
 fn draw_pane_title(
     ui: &egui::Ui,
     pane_rect: Rect,
     label: &str,
+    pr: Option<&pr_status::Badge>,
+    pane: PaneId,
     focused: bool,
     theme: &UiTheme,
 ) {
@@ -1116,7 +1158,8 @@ fn draw_pane_title(
         if budget < 3 {
             return;
         }
-        galley = painter.layout_no_wrap(elide(label, budget), font, color);
+        galley =
+            painter.layout_no_wrap(elide(label, budget), font.clone(), color);
     }
     let pad = Vec2::new(6.0, 2.0);
     let size = galley.size() + pad * 2.0;
@@ -1132,6 +1175,43 @@ fn draw_pane_title(
         theme.bg.gamma_multiply(0.8),
     );
     painter.galley(rect.min + pad, galley, color);
+
+    let Some(b) = pr else {
+        return;
+    };
+    let mut job = LayoutJob::default();
+    job.append(
+        "\u{25CF} ",
+        0.0,
+        TextFormat::simple(font.clone(), b.kind.color(theme)),
+    );
+    job.append(
+        &format!("#{}", b.number),
+        0.0,
+        TextFormat::simple(font, color),
+    );
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let size = galley.size() + pad * 2.0;
+    let chip = Rect::from_min_size(
+        egui::pos2(rect.min.x - size.x - 4.0, pane_rect.min.y + 4.0),
+        size,
+    );
+    if chip.min.x < pane_rect.min.x + 4.0 {
+        return; // pane too narrow for a second chip
+    }
+    painter.rect_filled(
+        chip,
+        CornerRadius::same(3),
+        theme.bg.gamma_multiply(0.8),
+    );
+    painter.galley(chip.min + pad, galley, color);
+    let resp = ui
+        .interact(chip, ui.id().with(("pr-chip", pane)), Sense::click())
+        .on_hover_text(&b.detail)
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if resp.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(&b.url));
+    }
 }
 
 /// Head-preserving elision: the interesting part of a badge (agent name,
