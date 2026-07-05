@@ -17,6 +17,30 @@ Because each pane is a real tmux session, panes are also *inspectable and
 scriptable from outside* — which is what powers the built-in
 [agent mesh](#agent-mesh) for running teams of AI agents.
 
+## Philosophy
+
+muxterm is an **opinionated terminal**. It ships a point of view as
+defaults rather than exposing every choice as configuration:
+
+- **Your muscle memory already works.** Keybindings are iTerm's — cmd+t,
+  cmd+d, cmd+1…9 — with no prefix chords or modes to learn. tmux is the
+  engine under every pane, never something you drive by hand.
+- **Nothing is ever lost.** Every pane outlives the app: quit, crash, or
+  relaunch, and your shells, processes, layout, and scrollback are still
+  there. The end state of this opinion is *forever memory* — terminal
+  output as a permanent, searchable log instead of a ring buffer (today:
+  100k lines of tmux history per pane; on the roadmap: a durable on-disk
+  archive).
+- **AI is a first-class tenant, not a bolt-on.** Coding agents run in
+  panes as peers: tabs are teams, panes are teammates, and the `mux` CLI
+  gives them shared context — they read each other's terminals, message
+  each other, and share a scratchpad (see [agent mesh](#agent-mesh)).
+  Planned on top: `? `-prefixed commands, so typing `? why did this build
+  fail` asks an AI that already sees your terminal.
+- **Themed, not themeable-to-death.** A curated set of themes plus a small
+  override surface (`config.toml`, edits apply live). Tab bar, dividers,
+  and borders derive from the palette, so the whole window always matches.
+
 ## Run
 
 ```sh
