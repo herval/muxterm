@@ -44,6 +44,8 @@ usage: mux [--as <session>] [--json] <command> [args]
   leave [--name <n>|--session <s>]
                                deregister (default: yourself)
   peers [--all]                list teammates (--all: unregistered panes too)
+  tree                         every window, tab, and pane at a glance
+                               (read-only; the one command that sees all tabs)
   read <peer> [-n <lines>] [--ansi]
                                snapshot of a teammate's terminal
   tell <peer> [msg...] [--no-enter] [--force]
@@ -101,6 +103,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "run" => cmd_run(as_session, rest),
         "leave" => cmd_leave(as_session, rest),
         "peers" => cmd_peers(as_session, rest, json),
+        "tree" => cmd_tree(as_session, json),
         "read" => cmd_read(as_session, rest),
         "tell" => cmd_tell(as_session, rest),
         "post" => cmd_post(as_session, rest),
@@ -186,6 +189,13 @@ struct Tmux {
     bin: PathBuf,
 }
 
+struct PaneInfo {
+    cmd: String,
+    cwd: String,
+    active: String,
+    title: String,
+}
+
 impl Tmux {
     fn new() -> Result<Self, Fail> {
         mesh::find_tmux()
@@ -238,27 +248,33 @@ impl Tmux {
         }
     }
 
-    /// session -> (current command, cwd, last activity) for every pane.
-    fn pane_info(&self) -> HashMap<String, (String, String, String)> {
+    /// Live pane facts for every session, keyed by session name. The title
+    /// goes last in the format string so tabs inside it survive the split.
+    fn pane_info(&self) -> HashMap<String, PaneInfo> {
         let out = self
             .output(&[
                 "list-panes",
                 "-a",
                 "-F",
-                "#{session_name}\t#{pane_current_command}\t#{pane_current_path}\t#{t:session_activity}",
+                "#{session_name}\t#{pane_current_command}\t#{pane_current_path}\t#{t:session_activity}\t#{pane_title}",
             ])
             .unwrap_or_default();
         let mut map = HashMap::new();
         for line in out.lines() {
-            let mut parts = line.splitn(4, '\t');
-            if let (Some(s), Some(cmd), Some(cwd), Some(act)) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            {
-                map.entry(s.to_string()).or_insert((
-                    cmd.to_string(),
-                    cwd.to_string(),
-                    act.to_string(),
-                ));
+            let mut parts = line.splitn(5, '\t');
+            if let (Some(s), Some(cmd), Some(cwd), Some(act), Some(title)) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) {
+                map.entry(s.to_string()).or_insert(PaneInfo {
+                    cmd: cmd.to_string(),
+                    cwd: cwd.to_string(),
+                    active: act.to_string(),
+                    title: title.to_string(),
+                });
             }
         }
         map
@@ -691,7 +707,7 @@ fn cmd_peers(
         }
         let (cmd, cwd, active) = panes
             .get(member)
-            .cloned()
+            .map(|p| (p.cmd.clone(), p.cwd.clone(), p.active.clone()))
             .unwrap_or_else(|| ("-".into(), "-".into(), "-".into()));
         let star = if *member == sc.session { "*" } else { "" };
         rows.push(Row {
@@ -742,6 +758,162 @@ fn cmd_peers(
             r.name, r.role, r.session, r.cmd, r.cwd,
         );
     }
+    Ok(())
+}
+
+/// Cross-tab overview: every window, tab, and pane with its registration,
+/// command, title, and cwd. Read-only, so unlike the peer commands it is
+/// allowed to see past the tab boundary — it answers "what exists here?"
+/// in one call instead of a spelunk through state.json and tmux.
+fn cmd_tree(as_session: Option<String>, json: bool) -> CmdResult {
+    let tmux = Tmux::new()?;
+    let st = state::peek().ok_or_else(|| {
+        (
+            EXIT_NO_IDENTITY,
+            "no readable muxterm state.json (has muxterm run yet?)"
+                .to_string(),
+        )
+    })?;
+    // Identity only decorates the output; the overview is just as useful
+    // from outside a muxterm pane.
+    let me = resolve_identity(&tmux, as_session).ok();
+    let registry = mesh::load_registry();
+    let live = tmux.live_sessions();
+    let panes = tmux.pane_info();
+
+    struct Row {
+        flags: String,
+        session: String,
+        name: String,
+        role: String,
+        cmd: String,
+        title: String,
+        cwd: String,
+    }
+    // (tab header, panes) groups, in window/tab order.
+    let mut groups: Vec<(String, Vec<Row>)> = Vec::new();
+    let mut json_windows = Vec::new();
+    for (wi, window) in st.windows.iter().enumerate() {
+        let mut json_tabs = Vec::new();
+        for (ti, tab) in window.tabs.iter().enumerate() {
+            let tab_active = ti == window.active_tab;
+            let mut members = Vec::new();
+            tab.tree.session_list(&mut members);
+
+            let mut header = String::new();
+            if st.windows.len() > 1 {
+                header.push_str(&format!("window {}  ", wi + 1));
+            }
+            header.push_str(&format!("tab {}", tab.id));
+            if tab_active {
+                header.push_str("  (active)");
+            }
+
+            let mut rows = Vec::new();
+            let mut json_panes = Vec::new();
+            for session in &members {
+                let is_self = me.as_deref() == Some(session.as_str());
+                let focused = *session == tab.focused_session;
+                let is_live = live.contains(session);
+                let info = registry.agents.get(session);
+                let pane = panes.get(session);
+
+                let mut flags = String::new();
+                if is_self {
+                    flags.push('*');
+                }
+                if focused {
+                    flags.push('>');
+                }
+                if !is_live {
+                    flags.push('!');
+                }
+
+                if json {
+                    json_panes.push(serde_json::json!({
+                        "session": session,
+                        "self": is_self,
+                        "focused": focused,
+                        "live": is_live,
+                        "name": info.map(|i| i.name.clone()),
+                        "role": info.and_then(|i| i.role.clone()),
+                        "command": pane.map(|p| p.cmd.clone()),
+                        "title": pane.map(|p| p.title.clone()),
+                        "cwd": pane.map(|p| p.cwd.clone()),
+                        "active": pane.map(|p| p.active.clone()),
+                    }));
+                } else {
+                    let dash = || "-".to_string();
+                    rows.push(Row {
+                        flags,
+                        session: session.clone(),
+                        name: info.map(|i| i.name.clone()).unwrap_or_else(dash),
+                        role: info
+                            .and_then(|i| i.role.clone())
+                            .unwrap_or_else(dash),
+                        cmd: pane.map(|p| p.cmd.clone()).unwrap_or_else(dash),
+                        title: pane
+                            .map(|p| p.title.clone())
+                            .unwrap_or_else(dash),
+                        cwd: pane.map(|p| p.cwd.clone()).unwrap_or_else(dash),
+                    });
+                }
+            }
+            if json {
+                json_tabs.push(serde_json::json!({
+                    "id": tab.id,
+                    "active": tab_active,
+                    "focused_session": tab.focused_session,
+                    "panes": json_panes,
+                }));
+            } else {
+                groups.push((header, rows));
+            }
+        }
+        if json {
+            json_windows.push(serde_json::json!({
+                "active_tab": window.active_tab,
+                "tabs": json_tabs,
+            }));
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "self": me, "windows": json_windows })
+        );
+        return Ok(());
+    }
+
+    // `{:<w$}` pads by char count, so measure chars (titles carry braille
+    // spinners and other multi-byte glyphs).
+    let width = |s: &str| s.chars().count();
+    let all = || groups.iter().flat_map(|(_, rows)| rows.iter());
+    let w_flag = all().map(|r| width(&r.flags)).max().unwrap_or(0).max(1);
+    let w_sess = all().map(|r| width(&r.session)).max().unwrap_or(0).max(7);
+    let w_name = all().map(|r| width(&r.name)).max().unwrap_or(0).max(4);
+    let w_role = all().map(|r| width(&r.role)).max().unwrap_or(0).max(4);
+    let w_cmd = all().map(|r| width(&r.cmd)).max().unwrap_or(0).max(3);
+    let w_title = all().map(|r| width(&r.title)).max().unwrap_or(0).max(5);
+    for (i, (header, rows)) in groups.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("{header}");
+        println!(
+            "  {:<w_flag$} {:<w_sess$}  {:<w_name$}  {:<w_role$}  {:<w_cmd$}  {:<w_title$}  CWD",
+            "", "SESSION", "NAME", "ROLE", "CMD", "TITLE",
+        );
+        for r in rows {
+            println!(
+                "  {:<w_flag$} {:<w_sess$}  {:<w_name$}  {:<w_role$}  {:<w_cmd$}  {:<w_title$}  {}",
+                r.flags, r.session, r.name, r.role, r.cmd, r.title, r.cwd,
+            );
+        }
+    }
+    println!();
+    println!("flags: * = you, > = tab focus, ! = dead session");
     Ok(())
 }
 
@@ -1157,6 +1329,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "Coordinate through the `mux` CLI (run via your shell):");
     let _ = writeln!(out, "- `mux peers` - who is on the team");
+    let _ = writeln!(out, "- `mux tree` - every window, tab, and pane at a glance (read-only; start here for \"what exists?\" questions)");
     let _ = writeln!(out, "- `mux read <name> -n 200` - snapshot of a teammate's terminal (works for any program they run)");
     let _ = writeln!(out, "- `mux post <name> <text>` - queue a message in their inbox; they get one `[mux]` nudge");
     let _ = writeln!(out, "- `mux inbox --consume` - read messages sent to you (do this when you see a `[mux]` line)");
@@ -1166,8 +1339,9 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = write!(
         out,
         "Etiquette: prefer `post` for anything a teammate should act on; \
-         `tell` only when they expect immediate input. You cannot reach \
-         panes in other tabs. Sign your work as **{me}**."
+         `tell` only when they expect immediate input. You cannot message \
+         panes in other tabs (`mux tree` can still see them). Sign your \
+         work as **{me}**."
     );
     out
 }
