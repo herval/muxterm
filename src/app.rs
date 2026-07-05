@@ -829,12 +829,30 @@ impl eframe::App for App {
                     if let ai_prompt::State::Compose { buffer, error } =
                         &self.ai.state
                     {
-                        if let Some(rect) =
-                            self.ai.pane.and_then(|p| rects.get(&p))
-                        {
+                        if let Some((rect, pane)) = self.ai.pane.and_then(|p| {
+                            Some((*rects.get(&p)?, tab.panes.get(&p)?))
+                        }) {
+                            let content = pane.backend.last_content();
+                            let size = &content.terminal_size;
+                            let point = content.grid.cursor.point;
+                            let row = point.line.0
+                                + content.grid.display_offset() as i32;
+                            let caret = Rect::from_min_size(
+                                rect.min
+                                    + Vec2::new(
+                                        size.cell_width as f32
+                                            * point.column.0 as f32,
+                                        size.cell_height as f32 * row as f32,
+                                    ),
+                                Vec2::new(
+                                    size.cell_width as f32,
+                                    size.cell_height as f32,
+                                ),
+                            );
                             draw_ai_overlay(
                                 ui,
-                                *rect,
+                                rect,
+                                caret,
                                 buffer,
                                 error.as_deref(),
                                 self.agent,
@@ -894,35 +912,55 @@ fn write_context_file(pane: PaneId, capture: &str) -> Option<PathBuf> {
     }
 }
 
-/// The "? " compose line: an accent strip pinned to the bottom of the pane
-/// that owns the pending AI query.
+/// The "? " compose line, drawn inline over the caret's row so the query
+/// reads as if typed at the shell prompt. `caret` is the terminal cursor
+/// cell in screen coordinates.
 fn draw_ai_overlay(
     ui: &egui::Ui,
     pane_rect: Rect,
+    caret: Rect,
     buffer: &str,
     error: Option<&str>,
     agent: &Agent,
     font: &FontId,
     theme: &UiTheme,
 ) {
-    let row_h = ui.fonts(|f| f.row_height(font));
-    let char_w = ui.fonts(|f| f.glyph_width(font, 'M'));
+    let char_w = caret.width().max(1.0);
+    let row_h = caret.height().max(1.0);
+    // Scrollback can move the caret's row out of view, and a deep prompt
+    // can leave it hugging the right edge; pin the strip to the pane and
+    // keep at least a dozen cells of entry room.
+    let x = caret.min.x.clamp(
+        pane_rect.min.x,
+        (pane_rect.max.x - 12.0 * char_w).max(pane_rect.min.x),
+    );
+    let y = caret.min.y.clamp(
+        pane_rect.min.y,
+        (pane_rect.max.y - row_h).max(pane_rect.min.y),
+    );
     let rect = Rect::from_min_max(
-        egui::pos2(pane_rect.min.x, pane_rect.max.y - (row_h + 12.0)),
-        pane_rect.max,
+        egui::pos2(x, y),
+        egui::pos2(pane_rect.max.x, y + row_h),
     );
     let painter = ui.painter();
     painter.rect_filled(
-        rect,
-        CornerRadius::ZERO,
+        rect.expand2(Vec2::new(3.0, 2.0)).intersect(pane_rect),
+        CornerRadius::same(3),
         theme::blend(theme.bg, theme.accent, 0.18),
     );
-    painter.line_segment(
-        [rect.left_top(), rect.right_top()],
-        Stroke::new(1.0, theme.accent),
+
+    let mid = rect.center().y;
+    let prefix =
+        painter.layout_no_wrap("? ".into(), font.clone(), theme.accent);
+    let text_left = rect.min.x + prefix.size().x;
+    painter.galley(
+        egui::pos2(rect.min.x, mid - prefix.size().y / 2.0),
+        prefix,
+        theme.accent,
     );
 
-    let y = rect.center().y;
+    // The hint yields when the row runs out of room, but an error always
+    // shows - it is the only feedback that a submit was rejected.
     let (hint_text, hint_color) = match error {
         Some(e) => (e.to_string(), egui::Color32::from_rgb(224, 82, 82)),
         None => (
@@ -935,24 +973,18 @@ fn draw_ai_overlay(
         FontId::proportional(11.0),
         hint_color,
     );
-    let hint_pos = egui::pos2(
-        rect.max.x - 10.0 - hint.size().x,
-        y - hint.size().y / 2.0,
-    );
-
-    let prefix =
-        painter.layout_no_wrap("? ".into(), font.clone(), theme.accent);
-    let text_left = rect.min.x + 10.0 + prefix.size().x;
-    painter.galley(
-        egui::pos2(rect.min.x + 10.0, y - prefix.size().y / 2.0),
-        prefix,
-        theme.accent,
-    );
+    let show_hint = error.is_some()
+        || rect.max.x - 10.0 - hint.size().x - text_left >= 12.0 * char_w;
+    let right_limit = if show_hint {
+        rect.max.x - 10.0 - hint.size().x - char_w
+    } else {
+        rect.max.x - 4.0
+    };
 
     // Tail-truncate against the hint; the buffer's cursor is always at the
     // end, so the newest text is the part that must stay visible. One cell
     // is reserved for the block cursor (monospace makes this exact).
-    let avail = (hint_pos.x - 16.0 - text_left).max(0.0);
+    let avail = (right_limit - text_left).max(0.0);
     let budget = ((avail / char_w) as usize).saturating_sub(1);
     let count = buffer.chars().count();
     let visible: String = if count > budget {
@@ -964,19 +996,28 @@ fn draw_ai_overlay(
         painter.layout_no_wrap(visible, font.clone(), theme.text);
     let cursor_x = text_left + text.size().x;
     painter.galley(
-        egui::pos2(text_left, y - text.size().y / 2.0),
+        egui::pos2(text_left, mid - text.size().y / 2.0),
         text,
         theme.text,
     );
     painter.rect_filled(
         Rect::from_min_size(
-            egui::pos2(cursor_x + 1.0, y - row_h / 2.0),
+            egui::pos2(cursor_x + 1.0, y),
             Vec2::new(char_w, row_h),
         ),
         CornerRadius::ZERO,
         theme.accent,
     );
-    painter.galley(hint_pos, hint, hint_color);
+    if show_hint {
+        painter.galley(
+            egui::pos2(
+                rect.max.x - 10.0 - hint.size().x,
+                mid - hint.size().y / 2.0,
+            ),
+            hint,
+            hint_color,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
