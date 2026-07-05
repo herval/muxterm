@@ -66,6 +66,7 @@ Requires `tmux` (`brew install tmux`).
 | cmd+c / cmd+v | copy / paste |
 | mouse select | copies to the clipboard automatically (`copy_on_select`, toggle in settings) |
 | shift+PageUp or mouse wheel | tmux copy-mode scrollback |
+| cmd+, | settings (esc closes) |
 | `?` then space (at an empty shell prompt) | ask the AI agent — enter runs it in the pane, esc cancels |
 
 ¹ Window managers like Rectangle bind cmd+opt+arrows globally; free those
@@ -187,8 +188,10 @@ but anything with socket access can drive tmux directly.
 
 - `src/` — the app: split tree (`layout.rs`), tmux lifecycle (`tmux.rs`),
   persistence (`state.rs`), shortcuts (`keys.rs`), agent-mesh state
-  (`mesh.rs`), render loop (`app.rs`).
-- `src/bin/mux.rs` — the `mux` CLI (agent mesh).
+  (`mesh.rs`), the "? " prompt (`ai_prompt.rs`, `ask.rs`), the settings
+  panel (`settings.rs`), render loop (`app.rs`).
+- `src/bin/mux.rs` — the `mux` CLI (agent mesh, `mux ask`).
 - `crates/egui_term/` — vendored [egui_term](https://github.com/Harzu/egui_term)
-  0.1.0 (terminal widget on alacritty_terminal) with five local patches;
-  see `crates/egui_term/VENDOR.md`.
+  0.1.0 (terminal widget on alacritty_terminal) with local patches (input
+  gating, tmux mouse reporting, copy-on-select, IME, bracketed paste,
+  render batching); see `crates/egui_term/VENDOR.md`.

@@ -49,3 +49,11 @@ tmux-backed design. Local patches:
   a bare click never touches the clipboard. The macOS `Event::Copy` arm now
   reads the same live selection instead of the flattened render-grid walk,
   so cmd+c copies preserve newlines too.
+- **P9** (`src/view.rs`, `src/backend/mod.rs`): render performance. Local
+  scrollback is capped at 200 lines (tmux owns real history) and `sync()`
+  skips the whole-grid clone on clean frames via a dirty flag set by the
+  PTY event thread and grid-mutating commands. `show()` merges contiguous
+  same-bg cells into single rects and contiguous same-fg ASCII into single
+  galleys (painted bg → decorations → text) instead of one shape per cell,
+  and cell metrics are exact f32 rather than truncated u16 so batched runs
+  align with the grid to the sub-pixel.
