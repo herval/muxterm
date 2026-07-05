@@ -1,10 +1,21 @@
-# muxterm
+```
+███╗   ███╗ ██╗   ██╗ ██╗  ██╗ ████████╗ ███████╗ ██████╗  ███╗   ███╗
+████╗ ████║ ██║   ██║ ╚██╗██╔╝ ╚══██╔══╝ ██╔════╝ ██╔══██╗ ████╗ ████║
+██╔████╔██║ ██║   ██║  ╚███╔╝     ██║    █████╗   ██████╔╝ ██╔████╔██║
+██║╚██╔╝██║ ██║   ██║  ██╔██╗     ██║    ██╔══╝   ██╔══██╗ ██║╚██╔╝██║
+██║ ╚═╝ ██║ ╚██████╔╝ ██╔╝ ██╗    ██║    ███████╗ ██║  ██║ ██║ ╚═╝ ██║
+╚═╝     ╚═╝  ╚═════╝  ╚═╝  ╚═╝    ╚═╝    ╚══════╝ ╚═╝  ╚═╝ ╚═╝     ╚═╝
+```
 
 An iTerm-style terminal emulator for macOS, written in Rust — with one twist:
 **every pane is backed by its own tmux session**. Quit the app and your
 shells, running processes, and scrollback stay alive; relaunch and the exact
 tab/split layout reattaches to them. Closing a pane (cmd+w, or the shell
 exiting) is what kills its session.
+
+Because each pane is a real tmux session, panes are also *inspectable and
+scriptable from outside* — which is what powers the built-in
+[agent mesh](#agent-mesh) for running teams of AI agents.
 
 ## Run
 
@@ -64,6 +75,7 @@ cooperation from the program running there (works for `top`, vim, anything).
 
 ```sh
 mux join reviewer --role code-review   # register this pane (tab relabels)
+mux run writer --role impl -- claude   # join + brief + launch + auto-leave
 mux peers                              # who's on the team
 mux read writer -n 300                 # snapshot a teammate's terminal
 mux post writer "left comments in review.md"   # inbox + one [mux] nudge
@@ -73,17 +85,38 @@ mux ctx set build.status green         # shared per-tab scratchpad
 mux brief                              # paste-ready team briefing for a prompt
 ```
 
-Typical setup: split a tab, run an agent per pane, have each run
-`mux join <name> --role <role>` (or paste `mux brief` output into their
-system prompt). Agents shell out to `mux` like any other command. Prefer
-`post` for anything a teammate should act on (it queues durably and injects
-a single `[mux] new message from …` nudge no matter how many messages pile
-up); `tell` types straight into their input — immediate, but it can
-interleave with whatever they're doing. Messages up to 16 KiB (`post`) /
-64 KiB (`tell`); registry, inboxes, and per-tab context live under
-`~/Library/Application Support/muxterm/`, cleaned automatically when panes
-close. Isolation is cooperative — `mux` enforces the tab boundary, but
-anything with socket access can drive tmux directly.
+Typical setup: split a tab, then launch each agent with
+`mux run <name> --role <role> -- <agent-command>` — it registers the pane,
+prints the team briefing so it lands in the agent's first screenful, execs
+the command, and deregisters when it exits. (Or register manually with
+`mux join` and paste `mux brief` output into the agent's prompt.) Agents
+shell out to `mux` like any other command.
+
+Prefer `post` for anything a teammate should act on (it queues durably and
+injects a single `[mux] new message from …` nudge no matter how many
+messages pile up); `tell` types straight into their input — immediate, but
+it can interleave with whatever they're doing. Messages up to 16 KiB
+(`post`) / 64 KiB (`tell`); registry, inboxes, and per-tab context live
+under `~/Library/Application Support/muxterm/`, cleaned automatically when
+panes close. Isolation is cooperative — `mux` enforces the tab boundary,
+but anything with socket access can drive tmux directly.
+
+### Automatic onboarding
+
+- Panes spawned by muxterm export `MUXTERM=1` and `MUXTERM_SESSION=<name>`,
+  so scripts and hooks can detect the mesh without probing tmux (panes
+  created before this feature keep their old environment until recreated).
+- **Claude Code** becomes fully self-configuring with two hooks in
+  `~/.claude/settings.json`: a `SessionStart` hook running
+  `mux brief 2>/dev/null || true` (the briefing lands in context the moment
+  a session starts inside a muxterm pane; silent no-op elsewhere) and a
+  `UserPromptSubmit` hook that drains `mux inbox --consume` into context —
+  teammate messages arrive mid-conversation without the agent having to
+  fetch. Combined with `mux run reviewer -- claude`, a pane is a named,
+  briefed, reachable agent with zero manual prompting.
+- Other agents: `mux run` prints the briefing above them at launch, or wire
+  `mux brief` into whatever startup-context mechanism they have (aider
+  conventions file, custom system prompts).
 
 ## How persistence works
 
@@ -103,7 +136,9 @@ anything with socket access can drive tmux directly.
 ## Code layout
 
 - `src/` — the app: split tree (`layout.rs`), tmux lifecycle (`tmux.rs`),
-  persistence (`state.rs`), shortcuts (`keys.rs`), render loop (`app.rs`).
+  persistence (`state.rs`), shortcuts (`keys.rs`), agent-mesh state
+  (`mesh.rs`), render loop (`app.rs`).
+- `src/bin/mux.rs` — the `mux` CLI (agent mesh).
 - `crates/egui_term/` — vendored [egui_term](https://github.com/Harzu/egui_term)
   0.1.0 (terminal widget on alacritty_terminal) with five local patches;
   see `crates/egui_term/VENDOR.md`.

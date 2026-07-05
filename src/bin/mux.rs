@@ -38,6 +38,9 @@ usage: mux [--as <session>] [--json] <command> [args]
   whoami                       your session, tab, and registered name
   join <name> [--role <r>] [--desc <t>]
                                register yourself in this tab's team
+  run <name> [--role <r>] [--quiet] -- <command> [args...]
+                               join, print the team brief, run an agent,
+                               deregister when it exits
   leave [--name <n>|--session <s>]
                                deregister (default: yourself)
   peers [--all]                list teammates (--all: unregistered panes too)
@@ -95,6 +98,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         },
         "whoami" => cmd_whoami(as_session, json),
         "join" => cmd_join(as_session, rest),
+        "run" => cmd_run(as_session, rest),
         "leave" => cmd_leave(as_session, rest),
         "peers" => cmd_peers(as_session, rest, json),
         "read" => cmd_read(as_session, rest),
@@ -367,6 +371,13 @@ fn resolve_identity(
             ),
         ));
     }
+    // Panes spawned by muxterm carry their session name in the
+    // environment; older sessions fall back to asking tmux.
+    if let Ok(session) = env::var("MUXTERM_SESSION") {
+        if !session.is_empty() {
+            return Ok(session);
+        }
+    }
     let pane = env::var("TMUX_PANE").map_err(|_| {
         (EXIT_NO_IDENTITY, "TMUX_PANE unset; use --as <session>".to_string())
     })?;
@@ -502,13 +513,16 @@ fn cmd_whoami(as_session: Option<String>, json: bool) -> CmdResult {
     Ok(())
 }
 
-fn cmd_join(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
-    let role = take_opt(&mut args, "--role")?;
-    let desc = take_opt(&mut args, "--desc")?;
-    let name = args.first().cloned().ok_or_else(|| {
-        (EXIT_USAGE, "usage: mux join <name> [--role <r>] [--desc <t>]".to_string())
-    })?;
-    if !mesh::valid_name(&name) {
+/// Register `name` for the scoped session. Names are unique within the
+/// tab; a dead holder is silently replaced.
+fn join_core(
+    tmux: &Tmux,
+    sc: &Scope,
+    name: &str,
+    role: Option<String>,
+    desc: Option<String>,
+) -> CmdResult {
+    if !mesh::valid_name(name) {
         return Err((
             EXIT_USAGE,
             "invalid name: lowercase letters/digits then letters, digits, \
@@ -516,13 +530,9 @@ fn cmd_join(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
                 .to_string(),
         ));
     }
-
-    let tmux = Tmux::new()?;
-    let sc = scope(&tmux, as_session)?;
     let live = tmux.live_sessions();
     let mut registry = mesh::load_registry();
 
-    // Names are unique within the tab; a dead holder is silently replaced.
     let holder = registry
         .agents
         .iter()
@@ -545,16 +555,75 @@ fn cmd_join(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
     registry.agents.insert(
         sc.session.clone(),
         AgentInfo {
-            name: name.clone(),
+            name: name.to_string(),
             role,
             desc,
             joined_at: mesh::now(),
         },
     );
     mesh::save_registry(&registry)
-        .map_err(|e| (EXIT_TMUX, format!("saving registry: {e:#}")))?;
+        .map_err(|e| (EXIT_TMUX, format!("saving registry: {e:#}")))
+}
+
+fn cmd_join(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
+    let role = take_opt(&mut args, "--role")?;
+    let desc = take_opt(&mut args, "--desc")?;
+    let name = args.first().cloned().ok_or_else(|| {
+        (EXIT_USAGE, "usage: mux join <name> [--role <r>] [--desc <t>]".to_string())
+    })?;
+
+    let tmux = Tmux::new()?;
+    let sc = scope(&tmux, as_session)?;
+    join_core(&tmux, &sc, &name, role, desc)?;
     println!("joined as {name} ({})", sc.session);
     Ok(())
+}
+
+/// join + launch an agent + deregister when it exits. The team brief is
+/// printed above the agent so it lands in the first screenful (Claude
+/// Code additionally gets it injected via the SessionStart hook).
+fn cmd_run(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
+    let usage = || {
+        (
+            EXIT_USAGE,
+            "usage: mux run <name> [--role <r>] [--desc <t>] [--quiet] -- <command> [args...]"
+                .to_string(),
+        )
+    };
+    let sep = args.iter().position(|a| a == "--").ok_or_else(usage)?;
+    let command: Vec<String> = args.split_off(sep + 1);
+    args.pop(); // the "--"
+    if command.is_empty() {
+        return Err(usage());
+    }
+    let role = take_opt(&mut args, "--role")?;
+    let desc = take_opt(&mut args, "--desc")?;
+    let quiet = take_flag(&mut args, "--quiet");
+    let name = args.first().cloned().ok_or_else(usage)?;
+
+    let tmux = Tmux::new()?;
+    let sc = scope(&tmux, as_session)?;
+    join_core(&tmux, &sc, &name, role, desc)?;
+
+    if !quiet {
+        // Rebuild the scope so the brief reflects the fresh registration.
+        let sc = scope(&tmux, Some(sc.session.clone()))?;
+        println!("{}", build_brief(&tmux, &sc));
+        println!("--- launching {} as {name} ---", command[0]);
+    }
+
+    let status = Command::new(&command[0]).args(&command[1..]).status();
+    // Deregister regardless of how the agent exited.
+    mesh::remove_session(&sc.session);
+    match status {
+        Ok(status) => {
+            std::process::exit(status.code().unwrap_or(1));
+        },
+        Err(e) => Err((
+            EXIT_USAGE,
+            format!("failed to launch {:?}: {e}", command[0]),
+        )),
+    }
 }
 
 fn cmd_leave(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
@@ -1040,28 +1109,33 @@ fn cmd_ctx(
     }
 }
 
-fn cmd_brief(as_session: Option<String>) -> CmdResult {
-    let tmux = Tmux::new()?;
-    let sc = scope(&tmux, as_session)?;
+fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
+    use std::fmt::Write as _;
     let live = tmux.live_sessions();
     let me = sc.my_display();
+    let mut out = String::new();
 
-    println!("## muxterm agent mesh");
-    println!();
+    let _ = writeln!(out, "## muxterm agent mesh");
+    let _ = writeln!(out);
     if let Some(info) = sc.registry.agents.get(&sc.session) {
         match &info.role {
-            Some(role) => println!("You are **{}** (role: {role}) in a shared muxterm tab.", info.name),
-            None => println!("You are **{}** in a shared muxterm tab.", info.name),
+            Some(role) => {
+                let _ = writeln!(out, "You are **{}** (role: {role}) in a shared muxterm tab.", info.name);
+            },
+            None => {
+                let _ = writeln!(out, "You are **{}** in a shared muxterm tab.", info.name);
+            },
         }
     } else {
-        println!(
+        let _ = writeln!(
+            out,
             "You are an unregistered pane ({}) in a shared muxterm tab. \
              Register first: `mux join <name> --role <role>`",
             sc.session
         );
     }
-    println!();
-    println!("Teammates in this tab:");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Teammates in this tab:");
     let mut any = false;
     for member in &sc.members {
         if member == &sc.session || !live.contains(member) {
@@ -1069,31 +1143,39 @@ fn cmd_brief(as_session: Option<String>) -> CmdResult {
         }
         if let Some(info) = sc.registry.agents.get(member) {
             any = true;
-            match (&info.role, &info.desc) {
-                (Some(r), Some(d)) => println!("- **{}** ({r}): {d}", info.name),
-                (Some(r), None) => println!("- **{}** ({r})", info.name),
-                (None, Some(d)) => println!("- **{}**: {d}", info.name),
-                (None, None) => println!("- **{}**", info.name),
-            }
+            let _ = match (&info.role, &info.desc) {
+                (Some(r), Some(d)) => writeln!(out, "- **{}** ({r}): {d}", info.name),
+                (Some(r), None) => writeln!(out, "- **{}** ({r})", info.name),
+                (None, Some(d)) => writeln!(out, "- **{}**: {d}", info.name),
+                (None, None) => writeln!(out, "- **{}**", info.name),
+            };
         }
     }
     if !any {
-        println!("- (none registered yet)");
+        let _ = writeln!(out, "- (none registered yet)");
     }
-    println!();
-    println!("Coordinate through the `mux` CLI (run via your shell):");
-    println!("- `mux peers` - who is on the team");
-    println!("- `mux read <name> -n 200` - snapshot of a teammate's terminal (works for any program they run)");
-    println!("- `mux post <name> <text>` - queue a message in their inbox; they get one `[mux]` nudge");
-    println!("- `mux inbox --consume` - read messages sent to you (do this when you see a `[mux]` line)");
-    println!("- `mux tell <name> <text>` - type directly into their terminal (immediate but can interleave)");
-    println!("- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
-    println!();
-    println!(
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Coordinate through the `mux` CLI (run via your shell):");
+    let _ = writeln!(out, "- `mux peers` - who is on the team");
+    let _ = writeln!(out, "- `mux read <name> -n 200` - snapshot of a teammate's terminal (works for any program they run)");
+    let _ = writeln!(out, "- `mux post <name> <text>` - queue a message in their inbox; they get one `[mux]` nudge");
+    let _ = writeln!(out, "- `mux inbox --consume` - read messages sent to you (do this when you see a `[mux]` line)");
+    let _ = writeln!(out, "- `mux tell <name> <text>` - type directly into their terminal (immediate but can interleave)");
+    let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
+    let _ = writeln!(out);
+    let _ = write!(
+        out,
         "Etiquette: prefer `post` for anything a teammate should act on; \
          `tell` only when they expect immediate input. You cannot reach \
          panes in other tabs. Sign your work as **{me}**."
     );
+    out
+}
+
+fn cmd_brief(as_session: Option<String>) -> CmdResult {
+    let tmux = Tmux::new()?;
+    let sc = scope(&tmux, as_session)?;
+    println!("{}", build_brief(&tmux, &sc));
     Ok(())
 }
 

@@ -59,6 +59,8 @@ impl TmuxCtl {
     /// restore-after-relaunch and fresh spawn are the same code path.
     /// `-D` kicks any stale client so pane sizing is never fought over.
     /// `-c` sets the new shell's start directory (ignored on attach).
+    /// `-e` marks the pane environment for agent-mesh detection (also
+    /// ignored on attach - pre-existing sessions keep their environment).
     pub fn spawn_settings(
         &self,
         session: &str,
@@ -72,6 +74,10 @@ impl TmuxCtl {
             "new-session".into(),
             "-A".into(),
             "-D".into(),
+            "-e".into(),
+            "MUXTERM=1".into(),
+            "-e".into(),
+            format!("MUXTERM_SESSION={session}"),
             "-s".into(),
             session.into(),
         ];
