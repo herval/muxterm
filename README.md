@@ -91,6 +91,7 @@ theme = "iterm-dark"   # dracula | solarized-dark | gruvbox-dark |
 agent = "claude"       # "? " prompt agent: claude | codex
 agent_context_lines = 200   # pane scrollback sent as context (0 = none)
 dim_inactive_panes = 0.12   # unfocused-split fade toward bg (0.0 - 0.8)
+pane_titles = true          # per-pane title badge (top-right) on split tabs
 
 [font]
 family = "Menlo"       # font name in the macOS font folders, or a file path

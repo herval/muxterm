@@ -50,6 +50,8 @@ pub struct App {
     term_theme: TerminalTheme,
     ui_theme: UiTheme,
     theme_name: String,
+    /// Per-pane title badges on split tabs (config `pane_titles`).
+    pane_titles: bool,
     settings_open: bool,
     dirty: bool,
     config_mtime: Option<SystemTime>,
@@ -88,6 +90,7 @@ impl App {
             term_theme: style.term_theme,
             ui_theme: style.ui,
             theme_name: style.name,
+            pane_titles: style.pane_titles,
             settings_open: false,
             dirty: false,
             config_mtime: config::mtime(),
@@ -356,6 +359,11 @@ impl App {
                         pane.title = title;
                     }
                 },
+                PtyEvent::ResetTitle => {
+                    if let Some(pane) = self.pane_mut(backend_id) {
+                        pane.title = "shell".into();
+                    }
+                },
                 // tmux copy-mode copies arrive here as OSC 52.
                 PtyEvent::ClipboardStore(_, data) => ctx.copy_text(data),
                 // Terminal query responses (DA, DSR, ...) must be written
@@ -495,6 +503,7 @@ impl App {
         self.term_theme = style.term_theme;
         self.ui_theme = style.ui;
         self.theme_name = style.name;
+        self.pane_titles = style.pane_titles;
         self.agent = style.agent;
         self.agent_context_lines = style.agent_context_lines;
     }
@@ -829,6 +838,24 @@ impl eframe::App for App {
                                 StrokeKind::Outside,
                             );
                         }
+                        if self.pane_titles {
+                            for (id, rect) in &rects {
+                                let Some(pane) = tab.panes.get(id) else {
+                                    continue;
+                                };
+                                let label = tab_label(
+                                    self.agents.get(&pane.session),
+                                    &pane.title,
+                                );
+                                draw_pane_title(
+                                    ui,
+                                    *rect,
+                                    &label,
+                                    *id == tab.focused,
+                                    &self.ui_theme,
+                                );
+                            }
+                        }
                     }
                     if let ai_prompt::State::Compose { buffer, error } =
                         &self.ai.state
@@ -1024,6 +1051,66 @@ fn draw_ai_overlay(
     }
 }
 
+/// Small badge naming what a pane runs, drawn over its top-right corner.
+/// Only split tabs get badges; a lone pane's title is already in the
+/// tab bar.
+fn draw_pane_title(
+    ui: &egui::Ui,
+    pane_rect: Rect,
+    label: &str,
+    focused: bool,
+    theme: &UiTheme,
+) {
+    if label.is_empty() {
+        return;
+    }
+    let font = FontId::proportional(11.0);
+    let color = if focused { theme.text } else { theme.text_dim };
+    let painter = ui.painter();
+    let mut galley =
+        painter.layout_no_wrap(label.to_string(), font.clone(), color);
+    // Cap the badge at roughly half the pane so it never reads as
+    // terminal content; panes too narrow for even a few characters get
+    // no badge at all.
+    let max_w = pane_rect.width() * 0.5 - 12.0;
+    if galley.size().x > max_w {
+        let char_w = galley.size().x / label.chars().count().max(1) as f32;
+        let budget = (max_w / char_w) as usize;
+        if budget < 3 {
+            return;
+        }
+        galley = painter.layout_no_wrap(elide(label, budget), font, color);
+    }
+    let pad = Vec2::new(6.0, 2.0);
+    let size = galley.size() + pad * 2.0;
+    let rect = Rect::from_min_size(
+        egui::pos2(pane_rect.max.x - size.x - 4.0, pane_rect.min.y + 4.0),
+        size,
+    );
+    // Translucent theme background: readable over any terminal content
+    // without fully hiding what's underneath.
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(3),
+        theme.bg.gamma_multiply(0.8),
+    );
+    painter.galley(rect.min + pad, galley, color);
+}
+
+/// Head-preserving elision: the interesting part of a badge (agent name,
+/// command) comes first.
+fn elide(label: &str, budget: usize) -> String {
+    if label.chars().count() <= budget {
+        return label.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let mut out: String = label.chars().take(budget - 1).collect();
+    out.push('…');
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn show_node(
     ui: &mut egui::Ui,
@@ -1178,5 +1265,13 @@ mod tests {
             tab_label(Some(&agent(Some("reviewer"))), "zsh"),
             "● alice · reviewer"
         );
+    }
+
+    #[test]
+    fn elide_keeps_the_head() {
+        assert_eq!(elide("zsh", 10), "zsh");
+        assert_eq!(elide("● alice · reviewer", 8), "● alice…");
+        assert_eq!(elide("abcdef", 1), "…");
+        assert_eq!(elide("abcdef", 0), "");
     }
 }

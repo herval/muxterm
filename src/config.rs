@@ -29,6 +29,9 @@ agent = "claude"
 # How much unfocused split panes fade toward the background (0.0 - 0.8).
 # dim_inactive_panes = 0.12
 
+# Show each pane's title in its top-right corner when the tab is split.
+# pane_titles = true
+
 [font]
 # Monospace font: a name searched in the macOS font folders, or a path to a
 # .ttf/.otf/.ttc file. Comment out for the built-in font (Hack).
@@ -54,6 +57,8 @@ pub struct ConfigFile {
     pub agent_context_lines: u32,
     /// 0.0 disables dimming of unfocused panes; 0.12 is the default wash.
     pub dim_inactive_panes: f32,
+    /// Show each pane's title in its top-right corner when the tab is split.
+    pub pane_titles: bool,
     pub font: FontConfig,
     pub colors: HashMap<String, String>,
 }
@@ -65,6 +70,7 @@ impl Default for ConfigFile {
             agent: "claude".into(),
             agent_context_lines: 200,
             dim_inactive_panes: 0.12,
+            pane_titles: true,
             font: FontConfig::default(),
             colors: HashMap::new(),
         }
@@ -94,6 +100,7 @@ pub struct Style {
     pub font: FontId,
     pub agent: &'static Agent,
     pub agent_context_lines: u32,
+    pub pane_titles: bool,
 }
 
 pub fn path() -> PathBuf {
@@ -174,6 +181,7 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             font: FontId::monospace(size),
             agent,
             agent_context_lines: cfg.agent_context_lines,
+            pane_titles: cfg.pane_titles,
         },
         font_data,
     )
@@ -371,6 +379,20 @@ mod tests {
         assert!(out.starts_with("agent = \"codex\""));
         // The identically named key inside [font] is untouched.
         assert!(out.contains("agent = \"inside-a-table\""));
+    }
+
+    #[test]
+    fn pane_titles_default_on_and_resolved() {
+        assert!(ConfigFile::default().pane_titles);
+        let (style, _) = resolve(&ConfigFile::default());
+        assert!(style.pane_titles);
+
+        let cfg = ConfigFile {
+            pane_titles: false,
+            ..ConfigFile::default()
+        };
+        let (style, _) = resolve(&cfg);
+        assert!(!style.pane_titles);
     }
 
     #[test]
