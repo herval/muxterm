@@ -57,3 +57,22 @@ tmux-backed design. Local patches:
   galleys (painted bg → decorations → text) instead of one shape per cell,
   and cell metrics are exact f32 rather than truncated u16 so batched runs
   align with the grid to the sub-pixel.
+- **P10** (`src/view.rs`, `src/backend/mod.rs`): cmd+click opens links and
+  file paths. Upstream's LinkOpen release path was unreachable under tmux
+  (`mouse on` keeps `MOUSE_MODE` set, so every unshifted press became a
+  mouse report), only knew URL schemes, opened from possibly-stale hover
+  state, and panicked on a failed `open::that`. Now: a press whose binding
+  resolves to LinkOpen with a link-shaped token under the pointer
+  (`TerminalBackend::has_link_at`) bypasses mouse reporting so the release
+  can open it; a new `path_regex` matches absolute/`~/`/dot-relative/bare
+  relative paths with optional `:line[:col]` suffixes alongside the URL
+  regex (URLs win ties); Open re-resolves the match at the clicked point on
+  the live `Term` (`bounds_to_string`, so wrapped lines join) and hands the
+  text to an app-provided `set_link_opener` callback - the app resolves
+  relative paths against the pane's cwd and existence-checks before
+  opening; without a callback, `open::that` with errors ignored. Hover is
+  frame-synced while cmd is held (underline appears without mouse motion,
+  clears on cmd release or pointer exit, hand cursor over matches), a
+  link-opening release skips copy-on-select, and the match helpers are free
+  fns generic over `EventListener` so `term::test::mock_term` can drive
+  unit tests.

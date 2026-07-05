@@ -47,6 +47,8 @@ fn conf(copy_on_select: bool) -> String {
     format!("{CONF_BASE}{drag_end}")
 }
 
+/// Clone: pane link-openers each carry one onto their worker thread.
+#[derive(Clone)]
 pub struct TmuxCtl {
     bin: PathBuf,
     conf: PathBuf,

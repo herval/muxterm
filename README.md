@@ -80,6 +80,7 @@ through your login shell.
 | cmd+[ / cmd+] | cycle focus through panes |
 | cmd+c / cmd+v | copy / paste |
 | mouse select | copies to the clipboard automatically (`copy_on_select`, toggle in settings) |
+| cmd+click | open the URL or file path under the pointer (hold cmd to see links underlined; relative paths resolve against the pane's cwd and open only if they exist) |
 | shift+PageUp or mouse wheel | tmux copy-mode scrollback |
 | cmd+, | settings (esc closes) |
 | `?` (at an empty shell prompt) | ask the AI agent — enter runs it in the pane, esc cancels |
@@ -228,9 +229,10 @@ but anything with socket access can drive tmux directly.
 - `src/` — the app: split tree (`layout.rs`), tmux lifecycle (`tmux.rs`),
   persistence (`state.rs`), shortcuts (`keys.rs`), agent-mesh state
   (`mesh.rs`), the "?" prompt (`ai_prompt.rs`, `ask.rs`), the settings
-  panel (`settings.rs`), render loop (`app.rs`).
+  panel (`settings.rs`), cmd+click link opening (`links.rs`), render loop
+  (`app.rs`).
 - `src/bin/mux.rs` — the `mux` CLI (agent mesh, `mux ask`).
 - `crates/egui_term/` — vendored [egui_term](https://github.com/Harzu/egui_term)
   0.1.0 (terminal widget on alacritty_terminal) with local patches (input
   gating, tmux mouse reporting, copy-on-select, IME, bracketed paste,
-  render batching); see `crates/egui_term/VENDOR.md`.
+  render batching, cmd+click links); see `crates/egui_term/VENDOR.md`.

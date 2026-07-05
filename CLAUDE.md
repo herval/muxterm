@@ -39,6 +39,7 @@ Two binaries share one library. `src/lib.rs` exposes only `agent`, `ask`, `layou
 - `app.rs` — the eframe App: owns `Vec<Tab>`, routes PTY events from a shared mpsc channel keyed by pane id, applies keyboard `Action`s (`keys.rs`), persists state, and polls `config.toml` mtime for live reload (`config.rs`).
 - `layout.rs` — binary split tree per tab (`Node`, leaves are `PaneId`s), rect splitting, and directional focus (`neighbor`) computed from last-frame screen rects.
 - `theme.rs` / `tabbar.rs` — chrome colors are *derived* from the terminal palette; themes are curated presets with a small `[colors]` override surface.
+- `links.rs` — cmd+click opener (egui_term P10 detects URL/path tokens and calls the pane's `set_link_opener`): URLs open directly; paths get `:line:col`/punctuation stripped, `~` expanded, relative resolved against the pane's live cwd (tmux `pane_current_path`), and open only if they exist — the existence check is what filters regex false positives like `and/or`.
 - `pr_status.rs` — GitHub PR badges (config `pr_status`, default on): a poller thread maps pane cwds → (repo, branch) locally every few seconds, asks `gh pr view` per unique key at most once a minute, and streams `session -> Badge` snapshots to the App over an mpsc channel; the JSON→Badge rollup is a pure fixture-tested function. Chips render in `tabbar.rs` and next to pane-title badges; clicking opens the PR.
 
 ### The "?" AI prompt

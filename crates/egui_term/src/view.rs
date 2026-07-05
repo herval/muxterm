@@ -168,11 +168,43 @@ impl<'a> TerminalView<'a> {
         // events on hover (or an in-progress drag) independently instead.
         let accepts_keyboard = layout.has_focus();
         let accepts_pointer = layout.contains_pointer() || state.is_dragged;
+
+        // muxterm patch P10: cmd-held link hover, synced every frame rather
+        // than only on mouse-move events, so pressing cmd in place lights
+        // the link up, releasing cmd (or leaving the pane) clears it, and
+        // the hand cursor advertises the click. Runs before the early
+        // return so a pane the pointer just left still clears its
+        // underline.
+        let modifiers = layout.ctx.input(|i| i.modifiers);
+        if layout.contains_pointer() && modifiers.command_only() {
+            self.backend.process_command(BackendCommand::ProcessLink(
+                LinkAction::Hover,
+                state.current_mouse_position_on_grid,
+            ));
+            if self
+                .backend
+                .last_content()
+                .hovered_hyperlink
+                .as_ref()
+                .is_some_and(|r| {
+                    r.contains(&state.current_mouse_position_on_grid)
+                })
+            {
+                layout.ctx.output_mut(|o| {
+                    o.cursor_icon = egui::CursorIcon::PointingHand;
+                });
+            }
+        } else if self.backend.last_content().hovered_hyperlink.is_some() {
+            self.backend.process_command(BackendCommand::ProcessLink(
+                LinkAction::Clear,
+                state.current_mouse_position_on_grid,
+            ));
+        }
+
         if !accepts_keyboard && !accepts_pointer {
             return self;
         }
 
-        let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
         for event in events {
             let mut input_actions = vec![];
@@ -771,7 +803,26 @@ fn process_left_button(
     // reporting for a local selection (standard terminal convention).
     let terminal_mode = backend.last_content().terminal_mode;
     if pressed {
-        if terminal_mode.intersects(TermMode::MOUSE_MODE) && !modifiers.shift {
+        // muxterm patch P10: a cmd+click on a link is for us, not the
+        // application. Under tmux (`mouse on` keeps MOUSE_MODE set for the
+        // pane's whole life) every unshifted press used to be forwarded as
+        // a mouse report, so the LinkOpen release path below was
+        // unreachable. Only the press decides: if the LinkOpen binding
+        // matches and there is a link-shaped token under the pointer,
+        // swallow the press and let the release open it.
+        let link_click = bindings_layout.get_action(
+            InputKind::Mouse(PointerButton::Primary),
+            *modifiers,
+            terminal_mode,
+        ) == BindingAction::LinkOpen
+            && backend.has_link_at(state.current_mouse_position_on_grid);
+        if link_click {
+            state.is_dragged = false;
+            state.mouse_reporting_drag = false;
+            vec![]
+        } else if terminal_mode.intersects(TermMode::MOUSE_MODE)
+            && !modifiers.shift
+        {
             state.is_dragged = true;
             state.mouse_reporting_drag = true;
             vec![InputAction::BackendCall(BackendCommand::MouseReport(
@@ -829,6 +880,7 @@ fn process_left_button_released(
 ) -> Vec<InputAction> {
     state.is_dragged = false;
     let mut actions = vec![];
+    let mut opened_link = false;
     if layout.double_clicked() || layout.triple_clicked() {
         actions.push(InputAction::BackendCall(build_start_select_command(
             layout, position,
@@ -846,13 +898,17 @@ fn process_left_button_released(
                 LinkAction::Open,
                 state.current_mouse_position_on_grid,
             )));
+            opened_link = true;
         }
     }
     // muxterm patch P8: every way a local selection can finish ends here -
     // a drag release, or the double/triple-click SelectStart pushed just
     // above (CopySelection reads the live selection, so it sees it). A
     // plain click resolves to an empty selection and copies nothing.
-    if copy_on_select {
+    // muxterm patch P10: except a link-opening click, which never touched
+    // the selection - re-copying whatever older selection is still live
+    // would clobber the clipboard as a side effect of following a link.
+    if copy_on_select && !opened_link {
         actions.push(InputAction::CopySelection);
     }
     actions

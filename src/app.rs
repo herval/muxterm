@@ -191,12 +191,22 @@ impl App {
         // run, so the "?" prompt stays inert there until the first Enter.
         let restored = session.is_some();
         let session = session.unwrap_or_else(TmuxCtl::new_session_name);
-        let backend = TerminalBackend::new(
+        let mut backend = TerminalBackend::new(
             id.0,
             ctx.clone(),
             self.pty_tx.clone(),
             self.tmux.spawn_settings(&session, start_dir),
         )?;
+        // cmd+clicked URLs/paths: relative paths resolve against this
+        // pane's cwd, so the opener is tied to the session.
+        let (tmux, opener_session) = (self.tmux.clone(), session.clone());
+        backend.set_link_opener(move |text| {
+            crate::links::spawn_open(
+                tmux.clone(),
+                opener_session.clone(),
+                text.to_string(),
+            )
+        });
         Ok(Pane {
             id,
             session,

@@ -4,6 +4,7 @@ mod ai_prompt;
 mod app;
 mod config;
 mod keys;
+mod links;
 mod pane;
 mod pr_status;
 mod settings;

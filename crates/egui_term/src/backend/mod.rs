@@ -21,7 +21,7 @@ use settings::BackendSettings;
 use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
-use std::ops::{Index, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
@@ -140,6 +140,14 @@ impl From<TerminalSize> for WindowSize {
 pub struct TerminalBackend {
     pub id: u64,
     pub url_regex: RegexSearch,
+    // muxterm patch P10: file paths are links too (iTerm's semantic
+    // history). Kept separate from url_regex so URLs win when both match.
+    pub path_regex: RegexSearch,
+    /// muxterm patch P10: where a cmd+clicked link's text goes. The app
+    /// decides what "open" means (resolve relative paths against the pane's
+    /// cwd, existence-check, pick an opener); without one, URLs and absolute
+    /// paths fall back to `open::that`.
+    link_opener: Option<Box<dyn Fn(&str) + Send + Sync>>,
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
     notifier: Notifier,
@@ -190,7 +198,8 @@ impl TerminalBackend {
         let pty_event_loop =
             EventLoop::new(term.clone(), event_proxy, pty, false, false)?;
         let notifier = Notifier(pty_event_loop.channel());
-        let url_regex = RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap();
+        let url_regex = url_regex();
+        let path_regex = path_regex();
         let _pty_event_loop_thread = pty_event_loop.spawn();
         let dirty = Arc::new(AtomicBool::new(true));
         let thread_dirty = dirty.clone();
@@ -223,6 +232,8 @@ impl TerminalBackend {
         Ok(Self {
             id,
             url_regex,
+            path_regex,
+            link_opener: None,
             term: term.clone(),
             size: terminal_size,
             notifier,
@@ -330,6 +341,28 @@ impl TerminalBackend {
         &self.last_content
     }
 
+    /// muxterm patch P10: register the app's link opener (see the field).
+    pub fn set_link_opener(
+        &mut self,
+        opener: impl Fn(&str) + Send + Sync + 'static,
+    ) {
+        self.link_opener = Some(Box::new(opener));
+    }
+
+    /// muxterm patch P10: is there a URL or path-shaped token under this
+    /// grid point right now? The view asks at press time to decide whether
+    /// a cmd+click bypasses tmux mouse reporting.
+    pub fn has_link_at(&self, point: Point) -> bool {
+        let terminal = self.term.lock();
+        link_text_at(
+            &terminal,
+            point,
+            &mut self.url_regex.clone(),
+            &mut self.path_regex.clone(),
+        )
+        .is_some()
+    }
+
     fn process_link_action(
         &mut self,
         terminal: &Term<EventProxy>,
@@ -338,38 +371,41 @@ impl TerminalBackend {
     ) {
         match link_action {
             LinkAction::Hover => {
-                self.last_content.hovered_hyperlink = self.regex_match_at(
-                    terminal,
-                    point,
-                    &mut self.url_regex.clone(),
-                );
+                // muxterm patch P10: paths hover like URLs, URLs win ties.
+                self.last_content.hovered_hyperlink =
+                    regex_match_at(terminal, point, &mut self.url_regex.clone())
+                        .or_else(|| {
+                            regex_match_at(
+                                terminal,
+                                point,
+                                &mut self.path_regex.clone(),
+                            )
+                        });
             },
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
             },
             LinkAction::Open => {
-                self.open_link();
+                // muxterm patch P10: resolve the match at the clicked point
+                // from the live terminal instead of trusting the last hover
+                // (which may be stale or unset if the mouse never moved),
+                // and never panic on a failed open.
+                let text = link_text_at(
+                    terminal,
+                    point,
+                    &mut self.url_regex.clone(),
+                    &mut self.path_regex.clone(),
+                );
+                if let Some(text) = text {
+                    match &self.link_opener {
+                        Some(opener) => opener(&text),
+                        None => {
+                            let _ = open::that(text);
+                        },
+                    }
+                }
             },
         };
-    }
-
-    fn open_link(&self) {
-        if let Some(range) = &self.last_content.hovered_hyperlink {
-            let start = range.start();
-            let end = range.end();
-
-            let mut url = String::from(self.last_content.grid.index(*start).c);
-            for indexed in self.last_content.grid.iter_from(*start) {
-                url.push(indexed.c);
-                if indexed.point == *end {
-                    break;
-                }
-            }
-
-            open::that(url).unwrap_or_else(|_| {
-                panic!("link opening is failed");
-            })
-        }
     }
 
     fn process_mouse_report(
@@ -558,24 +594,55 @@ impl TerminalBackend {
         }
     }
 
-    /// Based on alacritty/src/display/hint.rs > regex_match_at
-    /// Retrieve the match, if the specified point is inside the content matching the regex.
-    fn regex_match_at(
-        &self,
-        terminal: &Term<EventProxy>,
-        point: Point,
-        regex: &mut RegexSearch,
-    ) -> Option<Match> {
-        let x = visible_regex_match_iter(terminal, regex)
-            .find(|rm| rm.contains(&point));
-        x
-    }
+}
+
+/// The URL detector, upstream's pattern unchanged.
+fn url_regex() -> RegexSearch {
+    RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap()
+}
+
+/// muxterm patch P10: path-shaped tokens - absolute (`/x/y`), homedir
+/// (`~/x`), dot-relative (`./x`, `../x`), and bare-relative with at least
+/// one slash (`src/app.rs`, as rustc and grep print), optionally carrying a
+/// `:line` or `:line:col` suffix. Existence is deliberately not checked
+/// here (the grid has no cwd); the app-side opener filters false positives
+/// like `and/or` by only opening paths that exist.
+fn path_regex() -> RegexSearch {
+    RegexSearch::new(
+        r#"(~|\.\.?|[A-Za-z0-9._@%+-]+)?(/[A-Za-z0-9._@%+-]+)+/?(:\d+(:\d+)?)?"#,
+    )
+    .unwrap()
+}
+
+/// Based on alacritty/src/display/hint.rs > regex_match_at
+/// Retrieve the match, if the specified point is inside the content matching the regex.
+/// muxterm patch P10: a free fn generic over the event listener (was a
+/// method hardcoded to EventProxy) so tests can use term::test::mock_term.
+fn regex_match_at<T: EventListener>(
+    terminal: &Term<T>,
+    point: Point,
+    regex: &mut RegexSearch,
+) -> Option<Match> {
+    visible_regex_match_iter(terminal, regex).find(|rm| rm.contains(&point))
+}
+
+/// muxterm patch P10: the text of the link under a grid point, URLs
+/// winning over paths (every URL tail is also a path-shaped token).
+fn link_text_at<T: EventListener>(
+    terminal: &Term<T>,
+    point: Point,
+    url_regex: &mut RegexSearch,
+    path_regex: &mut RegexSearch,
+) -> Option<String> {
+    regex_match_at(terminal, point, url_regex)
+        .or_else(|| regex_match_at(terminal, point, path_regex))
+        .map(|m| terminal.bounds_to_string(*m.start(), *m.end()))
 }
 
 /// Copied from alacritty/src/display/hint.rs:
 /// Iterate over all visible regex matches.
-fn visible_regex_match_iter<'a>(
-    term: &'a Term<EventProxy>,
+fn visible_regex_match_iter<'a, T: EventListener>(
+    term: &'a Term<T>,
     regex: &'a mut RegexSearch,
 ) -> impl Iterator<Item = Match> + 'a {
     let viewport_start = Line(-(term.grid().display_offset() as i32));
@@ -625,5 +692,76 @@ pub struct EventProxy(mpsc::Sender<Event>);
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let _ = self.0.send(event.clone());
+    }
+}
+
+// muxterm patch P10: link detection tests over a mock terminal.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::term::test::mock_term;
+
+    /// The link text found when clicking (line, col) of `content`.
+    fn link_at(content: &str, line: i32, col: usize) -> Option<String> {
+        let term = mock_term(content);
+        link_text_at(
+            &term,
+            Point::new(Line(line), Column(col)),
+            &mut url_regex(),
+            &mut path_regex(),
+        )
+    }
+
+    #[test]
+    fn urls_and_paths_are_found_under_the_point() {
+        let line = "see https://example.com/a?b=1 and /tmp/out.png here";
+        assert_eq!(
+            link_at(line, 0, 10),
+            Some("https://example.com/a?b=1".into())
+        );
+        assert_eq!(link_at(line, 0, 36), Some("/tmp/out.png".into()));
+        // Plain prose around them is not a link.
+        assert_eq!(link_at(line, 0, 0), None);
+        assert_eq!(link_at(line, 0, 30), None);
+    }
+
+    #[test]
+    fn url_wins_over_its_own_path_tail() {
+        // The point sits in the path part of the URL; the whole URL must
+        // come back, not the /a/b tail.
+        let text = link_at("https://example.com/a/b", 0, 21).unwrap();
+        assert_eq!(text, "https://example.com/a/b");
+    }
+
+    #[test]
+    fn path_shapes_match() {
+        for (line, col, expected) in [
+            ("--> src/tmux.rs:57:9", 6, "src/tmux.rs:57:9"),
+            ("cat ~/dev/muxterm/README.md", 6, "~/dev/muxterm/README.md"),
+            ("run ./target/debug/mux now", 8, "./target/debug/mux"),
+            ("cd ../crates/egui_term", 5, "../crates/egui_term"),
+            ("grep: src/app.rs:12: match", 8, "src/app.rs:12"),
+        ] {
+            assert_eq!(
+                link_at(line, 0, col).as_deref(),
+                Some(expected),
+                "in {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_words_do_not_match() {
+        assert_eq!(link_at("just some words", 0, 6), None);
+        assert_eq!(link_at("Makefile", 0, 3), None);
+    }
+
+    #[test]
+    fn wrapped_paths_come_back_joined() {
+        // mock_term: "\n" wraps (WRAPLINE), so this is one logical line
+        // split across two rows; the match must span the wrap and the
+        // extracted text must not contain a newline.
+        let text = link_at("ls /private/tmp/some\nthing/deep.png", 1, 3);
+        assert_eq!(text, Some("/private/tmp/something/deep.png".into()));
     }
 }
