@@ -1,5 +1,6 @@
 use egui_term::TerminalBackend;
 
+use crate::ai_prompt::LineTracker;
 use muxterm::layout::PaneId;
 
 /// One terminal pane. Dropping it shuts the PTY down, which only detaches
@@ -9,6 +10,6 @@ pub struct Pane {
     pub session: String,
     pub backend: TerminalBackend,
     pub title: String,
-    /// Heuristic: is the shell's input line empty? Gates the "? " prompt.
-    pub line_empty: bool,
+    /// Heuristic model of the shell's input line; gates the "? " prompt.
+    pub line: LineTracker,
 }

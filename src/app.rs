@@ -11,7 +11,7 @@ use egui_term::{
 };
 
 use crate::agent::{self, Agent};
-use crate::ai_prompt::{self, PromptMachine, Verdict};
+use crate::ai_prompt::{self, LineTracker, PromptMachine, Verdict};
 use crate::config;
 use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
@@ -167,7 +167,11 @@ impl App {
             session,
             backend,
             title: "shell".into(),
-            line_empty: !restored,
+            line: if restored {
+                LineTracker::Dirty
+            } else {
+                LineTracker::Known(0)
+            },
         })
     }
 
@@ -511,7 +515,7 @@ impl App {
         let Some(pane) = tab.panes.get(&focused) else {
             return;
         };
-        let mut line_empty = pane.line_empty;
+        let mut line = pane.line;
         let session = pane.session.clone();
 
         // The machine is moved out so the event loop below doesn't have to
@@ -535,7 +539,7 @@ impl App {
                 match machine.on_event(
                     &event,
                     focused,
-                    &mut line_empty,
+                    &mut line,
                     &mut at_shell,
                 ) {
                     Verdict::Pass => kept.push(event),
@@ -570,7 +574,7 @@ impl App {
                 cmd.push(b'\r');
                 writes.push(cmd);
                 machine.cancel();
-                line_empty = true;
+                line = LineTracker::Known(0);
             } else {
                 self.agent_ok.remove(self.agent.id);
                 machine
@@ -584,7 +588,7 @@ impl App {
             .get_mut(self.active)
             .and_then(|tab| tab.panes.get_mut(&focused))
         {
-            pane.line_empty = line_empty;
+            pane.line = line;
             for bytes in writes {
                 pane.backend.process_command(BackendCommand::Write(bytes));
             }
