@@ -324,6 +324,11 @@ impl<'a> TerminalView<'a> {
             self.theme.get_color(Color::Named(NamedColor::Background));
         let is_app_cursor_mode =
             content.terminal_mode.contains(TermMode::APP_CURSOR);
+        // muxterm patch P11: honor DECTCEM (\e[?25l/h). TUI programs hide
+        // the cursor while they repaint and address every rewritten line;
+        // drawing it anyway makes it visibly dart across the pane.
+        let cursor_visible =
+            content.terminal_mode.contains(TermMode::SHOW_CURSOR);
         let display_offset = content.grid.display_offset() as i32;
         let fonts = painter.fonts(|f| f.clone());
         // Run batching assumes every ASCII glyph advances exactly one cell,
@@ -429,8 +434,8 @@ impl<'a> TerminalView<'a> {
                 });
             }
 
-            // Handle cursor rendering
-            if content.grid.cursor.point == indexed.point {
+            // Handle cursor rendering (P11: only while DECTCEM-visible)
+            if cursor_visible && content.grid.cursor.point == indexed.point {
                 let cursor_rect = Rect::from_min_size(
                     Pos2::new(x, y),
                     Vec2::new(draw_width, cell_height),
@@ -463,7 +468,8 @@ impl<'a> TerminalView<'a> {
                     run.text.push(' ');
                 }
             } else {
-                if content.grid.cursor.point == indexed.point
+                if cursor_visible
+                    && content.grid.cursor.point == indexed.point
                     && is_app_cursor_mode
                 {
                     std::mem::swap(&mut fg, &mut bg);

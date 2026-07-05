@@ -756,6 +756,22 @@ mod tests {
         assert_eq!(link_at("Makefile", 0, 3), None);
     }
 
+    // muxterm patch P11: the view's cursor gate rests on SHOW_CURSOR
+    // tracking DECTCEM; pin that here where a mock term can see it.
+    #[test]
+    fn dectcem_drives_show_cursor_mode() {
+        let mut term = mock_term("some content");
+        let mut parser =
+            alacritty_terminal::vte::ansi::Processor::<
+                alacritty_terminal::vte::ansi::StdSyncHandler,
+            >::default();
+        assert!(term.mode().contains(TermMode::SHOW_CURSOR));
+        parser.advance(&mut term, b"\x1b[?25l");
+        assert!(!term.mode().contains(TermMode::SHOW_CURSOR));
+        parser.advance(&mut term, b"\x1b[?25h");
+        assert!(term.mode().contains(TermMode::SHOW_CURSOR));
+    }
+
     #[test]
     fn wrapped_paths_come_back_joined() {
         // mock_term: "\n" wraps (WRAPLINE), so this is one logical line

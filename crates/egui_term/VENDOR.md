@@ -76,3 +76,10 @@ tmux-backed design. Local patches:
   link-opening release skips copy-on-select, and the match helpers are free
   fns generic over `EventListener` so `term::test::mock_term` can drive
   unit tests.
+- **P11** (`src/view.rs`): honor DECTCEM cursor visibility. The renderer
+  drew the block cursor whenever it passed `grid.cursor.point`, ignoring
+  `TermMode::SHOW_CURSOR`, so TUI repaints (which hide the cursor, rewrite
+  lines by cursor-addressing, then show it) flashed the cursor at every
+  intermediate position - a fast "scanning" flicker across the pane. The
+  cursor rect, its IME anchor, and the cursor-cell fg/bg swap now only
+  apply while the mode contains `SHOW_CURSOR`.
