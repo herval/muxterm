@@ -64,6 +64,7 @@ Requires `tmux` (`brew install tmux`).
 | cmd+opt+arrows | move focus between panes directionally¹ |
 | cmd+[ / cmd+] | cycle focus through panes |
 | cmd+c / cmd+v | copy / paste |
+| mouse select | copies to the clipboard automatically (`copy_on_select`, toggle in settings) |
 | shift+PageUp or mouse wheel | tmux copy-mode scrollback |
 | `?` then space (at an empty shell prompt) | ask the AI agent — enter runs it in the pane, esc cancels |
 
@@ -96,7 +97,10 @@ agent_model = ""       # --model for "? " answers; empty = fast default
                        # ("haiku" for claude)
 agent_context_lines = 200   # pane scrollback sent as context (0 = none)
 dim_inactive_panes = 0.12   # unfocused-split fade toward bg (0.0 - 0.8)
-pane_titles = true          # per-pane title badge (top-right) on split tabs
+pane_titles = true          # per-pane title badge (top-right) on split tabs;
+                            # also a checkbox in settings (cmd+,)
+copy_on_select = true       # mouse selections copy to the clipboard as
+                            # they finish; off = select, then cmd+c
 
 [font]
 family = "Menlo"       # font name in the macOS font folders, or a file path

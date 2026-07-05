@@ -294,6 +294,15 @@ impl TerminalBackend {
         result
     }
 
+    /// muxterm patch P8: the selection as text straight from the live
+    /// terminal - not the last-rendered frame, so a SelectStart processed
+    /// this frame is already included - with line breaks preserved. None
+    /// when nothing is effectively selected (a bare click), so callers
+    /// can't clobber the clipboard with an empty string.
+    pub fn selection_content(&self) -> Option<String> {
+        self.term.lock().selection_to_string()
+    }
+
     pub fn sync(&mut self) -> &RenderableContent {
         // Clear-before-clone: a PTY write racing the clone re-marks the
         // flag and the next frame picks it up; the ordering can lose a

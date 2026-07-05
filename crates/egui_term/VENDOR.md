@@ -31,3 +31,21 @@ tmux-backed design. Local patches:
   like US-International (~ ' ` ^ ") and CJK input methods produce nothing or
   a bare base letter, because winit only delivers composition when a widget
   enables IME.
+- **P7** (`src/view.rs`): mouse drag under tmux mouse mode. Track the drag
+  started at press time (`is_dragged`/`mouse_reporting_drag`) so motion and
+  release are routed the same way as the press: as mouse reports whenever the
+  application enabled `MOUSE_DRAG`/`MOUSE_MOTION` (tmux `mouse on` is mode
+  1002), or as a local selection when Shift bypasses reporting. Upstream
+  never set `is_dragged` on a reported press and only forwarded motion under
+  mode 1003, so tmux saw press+release with no drag in between and mouse
+  selection was impossible.
+- **P8** (`src/view.rs`, `src/backend/mod.rs`): copy on select. New
+  `TerminalView::set_copy_on_select(bool)` (default off): finishing a local
+  mouse selection - drag release, double- or triple-click - emits
+  `InputAction::CopySelection`, which copies the selection to the clipboard.
+  It reads the new `TerminalBackend::selection_content()` (the live `Term`'s
+  `selection_to_string()`), so a SelectStart issued earlier in the same
+  frame is included, line breaks survive, and an empty selection is `None` -
+  a bare click never touches the clipboard. The macOS `Event::Copy` arm now
+  reads the same live selection instead of the flattened render-grid walk,
+  so cmd+c copies preserve newlines too.

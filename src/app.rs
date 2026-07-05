@@ -18,6 +18,7 @@ use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
 use muxterm::mesh;
 use crate::pane::Pane;
+use crate::settings;
 use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
@@ -53,6 +54,9 @@ pub struct App {
     theme_name: String,
     /// Per-pane title badges on split tabs (config `pane_titles`).
     pane_titles: bool,
+    /// Mouse selections copy to the clipboard as soon as they finish
+    /// (config `copy_on_select`; the tmux side lives in tmux.conf).
+    copy_on_select: bool,
     settings_open: bool,
     dirty: bool,
     config_mtime: Option<SystemTime>,
@@ -75,7 +79,7 @@ impl App {
         let (style, custom_font) = config::resolve(&config::load());
         config::install_fonts(&cc.egui_ctx, custom_font);
         theme::apply_visuals(&cc.egui_ctx, &style.ui);
-        if let Err(e) = tmux.write_conf() {
+        if let Err(e) = tmux.write_conf(style.copy_on_select) {
             log::error!("failed to write tmux.conf: {e:#}");
         }
 
@@ -92,6 +96,7 @@ impl App {
             ui_theme: style.ui,
             theme_name: style.name,
             pane_titles: style.pane_titles,
+            copy_on_select: style.copy_on_select,
             settings_open: false,
             dirty: false,
             config_mtime: config::mtime(),
@@ -507,6 +512,16 @@ impl App {
         self.pane_titles = style.pane_titles;
         self.agent = style.agent;
         self.agent_context_lines = style.agent_context_lines;
+        if self.copy_on_select != style.copy_on_select {
+            self.copy_on_select = style.copy_on_select;
+            // The drag-end side of copy-on-select is a tmux binding;
+            // rewrite the conf and re-source it into the running server
+            // (config files only apply on server start).
+            if let Err(e) = self.tmux.write_conf(self.copy_on_select) {
+                log::error!("failed to write tmux.conf: {e:#}");
+            }
+            self.tmux.source_conf();
+        }
     }
 
     /// Route keyboard events through the "? " prompt machine before any
@@ -611,126 +626,69 @@ impl App {
         }
     }
 
+    /// cmd+c when the selection lives in tmux, not in the local grid: the
+    /// widget sees an empty local selection and ignores the Copy event, so
+    /// a copy-mode selection (the copy_on_select=off drag path, or any
+    /// scrollback selection) would be uncopyable. Ask tmux to copy it; the
+    /// text reaches the clipboard through the OSC 52 round trip
+    /// (PtyEvent::ClipboardStore). The event is left in place - the widget's
+    /// own Copy handling stays a no-op for an empty local selection.
+    fn copy_intercept(&mut self, ctx: &egui::Context) {
+        if self.settings_open {
+            return;
+        }
+        let copied = ctx.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+        });
+        if !copied {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get(&tab.focused) else {
+            return;
+        };
+        // A local (shift+drag) selection is the terminal widget's to copy.
+        if pane.backend.last_content().selectable_range.is_some() {
+            return;
+        }
+        if self.tmux.selection_present(&pane.session) {
+            self.tmux.copy_selection(&pane.session);
+        }
+    }
+
     fn show_settings(&mut self, ctx: &egui::Context) {
-        let mut open = self.settings_open;
-        let mut chosen: Option<&'static str> = None;
-        let mut chosen_agent: Option<&'static str> = None;
-        let mut commit_size: Option<f32> = None;
-
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.set_width(300.0);
-                ui.label(RichText::new("Theme").strong());
-                ui.add_space(4.0);
-                for name in theme::PRESET_NAMES {
-                    let preset = theme::preset(name).unwrap();
-                    ui.horizontal(|ui| {
-                        let (strip, _) = ui.allocate_exact_size(
-                            Vec2::new(66.0, 14.0),
-                            egui::Sense::hover(),
-                        );
-                        let swatches = [
-                            preset.bg,
-                            preset.ansi[1],
-                            preset.ansi[2],
-                            preset.ansi[4],
-                            preset.accent,
-                        ];
-                        for (i, hex) in swatches.iter().enumerate() {
-                            let c = theme::parse_hex(hex)
-                                .unwrap_or(egui::Color32::BLACK);
-                            let r = Rect::from_min_size(
-                                strip.min + Vec2::new(i as f32 * 13.0, 0.0),
-                                Vec2::new(12.0, 14.0),
-                            );
-                            ui.painter().rect_filled(
-                                r,
-                                CornerRadius::same(2),
-                                c,
-                            );
-                            // keep light swatches visible on light panes
-                            ui.painter().rect_stroke(
-                                r,
-                                CornerRadius::same(2),
-                                Stroke::new(1.0, self.ui_theme.text_dim),
-                                StrokeKind::Inside,
-                            );
-                        }
-                        let selected = self.theme_name == *name;
-                        if ui.selectable_label(selected, *name).clicked()
-                            && !selected
-                        {
-                            chosen = Some(name);
-                        }
-                    });
-                }
-
-                ui.add_space(10.0);
-                ui.label(RichText::new("Font").strong());
-                let mut size = self.font.size;
-                let resp = ui.add(
-                    egui::Slider::new(&mut size, 8.0..=24.0)
-                        .step_by(0.5)
-                        .text("size"),
-                );
-                if resp.changed() {
-                    self.font.size = size; // live preview
-                }
-                if resp.drag_stopped()
-                    || (resp.changed() && !resp.dragged())
-                {
-                    commit_size = Some(size);
-                }
-
-                ui.add_space(10.0);
-                ui.label(RichText::new("AI agent").strong());
-                ui.add_space(4.0);
-                for a in agent::AGENTS {
-                    let selected = self.agent.id == a.id;
-                    if ui.selectable_label(selected, a.label).clicked()
-                        && !selected
-                    {
-                        chosen_agent = Some(a.id);
-                    }
-                }
-                ui.label(
-                    RichText::new("type \"? \" at an empty shell prompt to ask")
-                        .color(self.ui_theme.text_dim)
-                        .size(11.0),
-                );
-
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Edit config file…").clicked() {
-                        let _ = std::process::Command::new("/usr/bin/open")
-                            .arg("-t")
-                            .arg(config::path())
-                            .spawn();
-                    }
-                    ui.label(
-                        RichText::new("color overrides & font family")
-                            .color(self.ui_theme.text_dim)
-                            .size(11.0),
-                    );
-                });
-            });
-
-        self.settings_open = open;
-        if let Some(name) = chosen {
+        let out = settings::show(
+            ctx,
+            &self.ui_theme,
+            &self.font,
+            &self.theme_name,
+            self.agent,
+            self.copy_on_select,
+            self.pane_titles,
+        );
+        if let Some(name) = out.theme {
             config::set_theme(name);
             self.reload_config(ctx);
         }
-        if let Some(id) = chosen_agent {
+        if let Some(id) = out.agent {
             config::set_agent(id);
             self.reload_config(ctx);
         }
-        if let Some(size) = commit_size {
+        if let Some(on) = out.copy_on_select {
+            config::set_copy_on_select(on);
+            // reload_config picks up the flag and re-sources tmux.conf.
+            self.reload_config(ctx);
+        }
+        if let Some(on) = out.pane_titles {
+            config::set_pane_titles(on);
+            self.reload_config(ctx);
+        }
+        if let Some(size) = out.font_size {
+            self.font.size = size;
             config::set_font_size(size);
-            // Sync mtime so the poller doesn't reload and yank the slider.
+            // Sync mtime so the poller doesn't reload and fight the buttons.
             self.config_mtime = config::mtime();
         }
     }
@@ -776,6 +734,7 @@ impl eframe::App for App {
             self.settings_open = false;
         }
         self.ai_intercept(ctx);
+        self.copy_intercept(ctx);
 
         self.drain_pty_events(ctx);
 
@@ -833,6 +792,7 @@ impl eframe::App for App {
                         &self.font,
                         &self.term_theme,
                         &self.ui_theme,
+                        self.copy_on_select,
                         &mut rects,
                         &mut ui_actions,
                     );
@@ -1129,6 +1089,7 @@ fn show_node(
     font: &FontId,
     term_theme: &TerminalTheme,
     ui_theme: &UiTheme,
+    copy_on_select: bool,
     rects: &mut HashMap<PaneId, Rect>,
     ui_actions: &mut Vec<UiAction>,
 ) {
@@ -1146,7 +1107,8 @@ fn show_node(
                 .set_font(TerminalFont::new(FontSettings {
                     font_type: font.clone(),
                 }))
-                .set_theme(term_theme.clone());
+                .set_theme(term_theme.clone())
+                .set_copy_on_select(copy_on_select);
             let response = child.add(view);
             // Wash unfocused panes toward the background, like iTerm's
             // "dim inactive split panes".
@@ -1210,7 +1172,7 @@ fn show_node(
             );
             show_node(
                 ui, first, first_rect, path << 1, panes, focused, font,
-                term_theme, ui_theme, rects, ui_actions,
+                term_theme, ui_theme, copy_on_select, rects, ui_actions,
             );
             show_node(
                 ui,
@@ -1222,6 +1184,7 @@ fn show_node(
                 font,
                 term_theme,
                 ui_theme,
+                copy_on_select,
                 rects,
                 ui_actions,
             );

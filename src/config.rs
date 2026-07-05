@@ -37,6 +37,10 @@ agent = "claude"
 # Show each pane's title in its top-right corner when the tab is split.
 # pane_titles = true
 
+# Copy mouse selections straight to the clipboard (iTerm's "copy on
+# select"). When off, select then copy explicitly with cmd+c.
+copy_on_select = true
+
 [font]
 # Monospace font: a name searched in the macOS font folders, or a path to a
 # .ttf/.otf/.ttc file. Comment out for the built-in font (Hack).
@@ -66,6 +70,8 @@ pub struct ConfigFile {
     pub dim_inactive_panes: f32,
     /// Show each pane's title in its top-right corner when the tab is split.
     pub pane_titles: bool,
+    /// Mouse selections copy to the clipboard as soon as they finish.
+    pub copy_on_select: bool,
     pub font: FontConfig,
     pub colors: HashMap<String, String>,
 }
@@ -78,6 +84,7 @@ impl Default for ConfigFile {
             agent_context_lines: 200,
             dim_inactive_panes: 0.12,
             pane_titles: true,
+            copy_on_select: true,
             font: FontConfig::default(),
             colors: HashMap::new(),
         }
@@ -108,6 +115,7 @@ pub struct Style {
     pub agent: &'static Agent,
     pub agent_context_lines: u32,
     pub pane_titles: bool,
+    pub copy_on_select: bool,
 }
 
 pub fn path() -> PathBuf {
@@ -189,6 +197,7 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             agent,
             agent_context_lines: cfg.agent_context_lines,
             pane_titles: cfg.pane_titles,
+            copy_on_select: cfg.copy_on_select,
         },
         font_data,
     )
@@ -228,6 +237,30 @@ pub fn set_agent(id: &str) {
         fs::write(path(), replace_top_level_line(&text, "agent", &line))
     {
         log::warn!("could not save agent choice: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's copy-on-select checkbox.
+pub fn set_copy_on_select(on: bool) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("copy_on_select = {on}");
+    if let Err(e) = fs::write(
+        path(),
+        replace_top_level_line(&text, "copy_on_select", &line),
+    ) {
+        log::warn!("could not save copy_on_select: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's pane-titles checkbox.
+pub fn set_pane_titles(on: bool) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("pane_titles = {on}");
+    if let Err(e) = fs::write(
+        path(),
+        replace_top_level_line(&text, "pane_titles", &line),
+    ) {
+        log::warn!("could not save pane_titles: {e:#}");
     }
 }
 
@@ -400,6 +433,32 @@ mod tests {
         };
         let (style, _) = resolve(&cfg);
         assert!(!style.pane_titles);
+    }
+
+    #[test]
+    fn copy_on_select_defaults_on_and_parses() {
+        assert!(ConfigFile::default().copy_on_select);
+        let cfg: ConfigFile = toml::from_str("copy_on_select = false").unwrap();
+        assert!(!cfg.copy_on_select);
+        let (style, _) = resolve(&cfg);
+        assert!(!style.copy_on_select);
+
+        // The default config file documents the real default.
+        let cfg: ConfigFile = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert!(cfg.copy_on_select);
+    }
+
+    #[test]
+    fn copy_on_select_line_is_rewritten_at_top_level() {
+        let text = "theme = \"dracula\"\ncopy_on_select = true\n\n[font]\n";
+        let out = replace_top_level_line(
+            text,
+            "copy_on_select",
+            "copy_on_select = false",
+        );
+        assert!(out.contains("copy_on_select = false"));
+        assert!(!out.contains("copy_on_select = true"));
+        assert!(out.contains("theme = \"dracula\""));
     }
 
     #[test]

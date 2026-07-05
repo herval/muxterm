@@ -10,10 +10,11 @@ use egui_term::BackendSettings;
 // binary discovery are shared with the `mux` agent-mesh CLI.
 use muxterm::mesh::{find_tmux, SESSION_PREFIX, SOCKET};
 
-/// Regenerated on every launch (it only applies when the server starts).
+/// Regenerated on every launch (it only applies when the server starts) and
+/// re-sourced into a running server when copy_on_select changes.
 /// `status off` makes sessions look like a plain terminal; the `Ms` override
 /// makes tmux emit OSC 52 on copy, which surfaces as PtyEvent::ClipboardStore.
-const CONF: &str = r##"# managed by muxterm - regenerated at every launch
+const CONF_BASE: &str = r##"# managed by muxterm - regenerated at every launch
 set -g status off
 set -g mouse on
 set -s escape-time 0
@@ -28,6 +29,24 @@ setw -g aggressive-resize on
 bind -n S-PPage copy-mode -u
 "##;
 
+/// Mouse drags inside panes are driven by tmux copy-mode, so copy-on-select
+/// for them is a tmux binding, not app code. Both values are spelled out
+/// explicitly (`on` is tmux's own default) so that re-sourcing the file
+/// flips a running server in either direction:
+/// - on: releasing a drag copies the selection (OSC 52 -> clipboard).
+/// - off: releasing keeps the selection on screen and copies nothing;
+///   cmd+c (App::copy_intercept) does the explicit copy.
+fn conf(copy_on_select: bool) -> String {
+    let drag_end = if copy_on_select {
+        "bind -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel\n\
+         bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel\n"
+    } else {
+        "unbind -T copy-mode MouseDragEnd1Pane\n\
+         unbind -T copy-mode-vi MouseDragEnd1Pane\n"
+    };
+    format!("{CONF_BASE}{drag_end}")
+}
+
 pub struct TmuxCtl {
     bin: PathBuf,
     conf: PathBuf,
@@ -41,12 +60,21 @@ impl TmuxCtl {
         })
     }
 
-    pub fn write_conf(&self) -> Result<()> {
+    pub fn write_conf(&self, copy_on_select: bool) -> Result<()> {
         if let Some(parent) = self.conf.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&self.conf, CONF)?;
+        fs::write(&self.conf, conf(copy_on_select))?;
         Ok(())
+    }
+
+    /// Apply the conf to an already-running server (config files are only
+    /// read at server start). Silently a no-op when no server is up.
+    pub fn source_conf(&self) {
+        let _ = Command::new(&self.bin)
+            .args(["-L", SOCKET, "source-file"])
+            .arg(&self.conf)
+            .output();
     }
 
     pub fn new_session_name() -> String {
@@ -164,6 +192,46 @@ impl TmuxCtl {
         (!text.is_empty()).then_some(text)
     }
 
+    /// Is the session's active pane sitting in copy-mode with a selection?
+    /// (`display-message` rejects the `=` target prefix; session names are
+    /// fixed-length uuids, so prefix ambiguity can't bite.)
+    pub fn selection_present(&self, session: &str) -> bool {
+        let out = Command::new(&self.bin)
+            .args([
+                "-L",
+                SOCKET,
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "#{selection_present}",
+            ])
+            .output();
+        match out {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim() == "1"
+            },
+            _ => false,
+        }
+    }
+
+    /// Copy the active copy-mode selection, exactly like the default
+    /// drag-end binding would: the text reaches the clipboard through the
+    /// OSC 52 round trip (PtyEvent::ClipboardStore).
+    pub fn copy_selection(&self, session: &str) {
+        let _ = Command::new(&self.bin)
+            .args([
+                "-L",
+                SOCKET,
+                "send-keys",
+                "-t",
+                &format!("={session}:"),
+                "-X",
+                "copy-selection-and-cancel",
+            ])
+            .output();
+    }
+
     /// `=` forces an exact match; `-t name` alone prefix-matches.
     pub fn kill_session(&self, session: &str) {
         let _ = Command::new(&self.bin)
@@ -233,6 +301,27 @@ mod tests {
         }
         for cmd in ["vim", "node", "claude", "ssh", ""] {
             assert!(!is_shell(cmd), "{cmd} should not count as a shell");
+        }
+    }
+
+    #[test]
+    fn conf_flips_drag_end_bindings() {
+        let on = conf(true);
+        assert!(on.contains(
+            "bind -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel"
+        ));
+        assert!(on.contains(
+            "bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel"
+        ));
+        assert!(!on.contains("unbind"));
+        let off = conf(false);
+        assert!(off.contains("unbind -T copy-mode MouseDragEnd1Pane"));
+        assert!(off.contains("unbind -T copy-mode-vi MouseDragEnd1Pane"));
+        assert!(!off.contains("copy-selection-and-cancel"));
+        // The shared base must survive in both variants.
+        for text in [&on, &off] {
+            assert!(text.contains("set -g mouse on"));
+            assert!(text.contains("set -s set-clipboard on"));
         }
     }
 

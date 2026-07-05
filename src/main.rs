@@ -5,6 +5,7 @@ mod app;
 mod config;
 mod keys;
 mod pane;
+mod settings;
 mod tabbar;
 mod theme;
 mod tmux;

@@ -26,6 +26,10 @@ const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 enum InputAction {
     BackendCall(BackendCommand),
     WriteToClipboard(String),
+    // muxterm patch P8: copy the live selection when the action is applied
+    // (after any BackendCall queued before it, so a double-click's
+    // SelectStart is already visible to it). Empty selections are ignored.
+    CopySelection,
     Ignore,
 }
 
@@ -49,6 +53,9 @@ pub struct TerminalView<'a> {
     font: TerminalFont,
     theme: TerminalTheme,
     bindings_layout: BindingsLayout,
+    // muxterm patch P8: finishing a local mouse selection copies it to the
+    // clipboard (iTerm's "copy on select"). Off by default.
+    copy_on_select: bool,
 }
 
 impl Widget for TerminalView<'_> {
@@ -88,6 +95,7 @@ impl<'a> TerminalView<'a> {
             font: TerminalFont::default(),
             theme: TerminalTheme::default(),
             bindings_layout: BindingsLayout::new(),
+            copy_on_select: false,
         }
     }
 
@@ -112,6 +120,12 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_size(mut self, size: Vec2) -> Self {
         self.size = size;
+        self
+    }
+
+    #[inline]
+    pub fn set_copy_on_select(mut self, copy_on_select: bool) -> Self {
+        self.copy_on_select = copy_on_select;
         self
     }
 
@@ -214,7 +228,7 @@ impl<'a> TerminalView<'a> {
                     if !accepts_pointer {
                         continue;
                     }
-                    input_actions.push(process_button_click(
+                    input_actions = process_button_click(
                         state,
                         layout,
                         self.backend,
@@ -223,7 +237,8 @@ impl<'a> TerminalView<'a> {
                         pos,
                         &modifiers,
                         pressed,
-                    ))
+                        self.copy_on_select,
+                    )
                 },
                 egui::Event::PointerMoved(pos) => {
                     if !accepts_pointer {
@@ -247,6 +262,11 @@ impl<'a> TerminalView<'a> {
                     },
                     InputAction::WriteToClipboard(data) => {
                         layout.ctx.copy_text(data);
+                    },
+                    InputAction::CopySelection => {
+                        if let Some(data) = self.backend.selection_content() {
+                            layout.ctx.copy_text(data);
+                        }
                     },
                     InputAction::Ignore => {},
                 }
@@ -570,11 +590,11 @@ fn process_keyboard_event(
             {
                 // muxterm patch P3: an empty selection must not clobber the
                 // clipboard (under tmux the real copy arrives via OSC 52).
-                let content = backend.selectable_content();
-                if content.is_empty() {
-                    InputAction::Ignore
-                } else {
-                    InputAction::WriteToClipboard(content)
+                // Patch P8 reads the live selection, which also preserves
+                // line breaks (the render-grid walk flattened them).
+                match backend.selection_content() {
+                    Some(content) => InputAction::WriteToClipboard(content),
+                    None => InputAction::Ignore,
                 }
             }
         },
@@ -704,6 +724,7 @@ fn process_mouse_wheel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_button_click(
     state: &mut TerminalViewState,
     layout: &Response,
@@ -713,7 +734,8 @@ fn process_button_click(
     position: Pos2,
     modifiers: &Modifiers,
     pressed: bool,
-) -> InputAction {
+    copy_on_select: bool,
+) -> Vec<InputAction> {
     match button {
         PointerButton::Primary => process_left_button(
             state,
@@ -723,11 +745,13 @@ fn process_button_click(
             position,
             modifiers,
             pressed,
+            copy_on_select,
         ),
-        _ => InputAction::Ignore,
+        _ => vec![],
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_left_button(
     state: &mut TerminalViewState,
     layout: &Response,
@@ -736,7 +760,8 @@ fn process_left_button(
     position: Pos2,
     modifiers: &Modifiers,
     pressed: bool,
-) -> InputAction {
+    copy_on_select: bool,
+) -> Vec<InputAction> {
     // muxterm patch P7: mouse selection was impossible. Under tmux (`mouse
     // on` puts the terminal in MOUSE_MODE permanently) the press was
     // forwarded here but is_dragged was never set, so process_mouse_move
@@ -749,12 +774,12 @@ fn process_left_button(
         if terminal_mode.intersects(TermMode::MOUSE_MODE) && !modifiers.shift {
             state.is_dragged = true;
             state.mouse_reporting_drag = true;
-            InputAction::BackendCall(BackendCommand::MouseReport(
+            vec![InputAction::BackendCall(BackendCommand::MouseReport(
                 MouseButton::LeftButton,
                 *modifiers,
                 state.current_mouse_position_on_grid,
                 true,
-            ))
+            ))]
         } else {
             state.mouse_reporting_drag = false;
             process_left_button_pressed(state, layout, position)
@@ -762,12 +787,12 @@ fn process_left_button(
     } else if state.mouse_reporting_drag {
         state.is_dragged = false;
         state.mouse_reporting_drag = false;
-        InputAction::BackendCall(BackendCommand::MouseReport(
+        vec![InputAction::BackendCall(BackendCommand::MouseReport(
             MouseButton::LeftButton,
             *modifiers,
             state.current_mouse_position_on_grid,
             false,
-        ))
+        ))]
     } else {
         process_left_button_released(
             state,
@@ -776,6 +801,7 @@ fn process_left_button(
             bindings_layout,
             position,
             modifiers,
+            copy_on_select,
         )
     }
 }
@@ -784,11 +810,14 @@ fn process_left_button_pressed(
     state: &mut TerminalViewState,
     layout: &Response,
     position: Pos2,
-) -> InputAction {
+) -> Vec<InputAction> {
     state.is_dragged = true;
-    InputAction::BackendCall(build_start_select_command(layout, position))
+    vec![InputAction::BackendCall(build_start_select_command(
+        layout, position,
+    ))]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_left_button_released(
     state: &mut TerminalViewState,
     layout: &Response,
@@ -796,10 +825,14 @@ fn process_left_button_released(
     bindings_layout: &BindingsLayout,
     position: Pos2,
     modifiers: &Modifiers,
-) -> InputAction {
+    copy_on_select: bool,
+) -> Vec<InputAction> {
     state.is_dragged = false;
+    let mut actions = vec![];
     if layout.double_clicked() || layout.triple_clicked() {
-        InputAction::BackendCall(build_start_select_command(layout, position))
+        actions.push(InputAction::BackendCall(build_start_select_command(
+            layout, position,
+        )));
     } else {
         let terminal_content = backend.last_content();
         let binding_action = bindings_layout.get_action(
@@ -809,14 +842,20 @@ fn process_left_button_released(
         );
 
         if binding_action == BindingAction::LinkOpen {
-            InputAction::BackendCall(BackendCommand::ProcessLink(
+            actions.push(InputAction::BackendCall(BackendCommand::ProcessLink(
                 LinkAction::Open,
                 state.current_mouse_position_on_grid,
-            ))
-        } else {
-            InputAction::Ignore
+            )));
         }
     }
+    // muxterm patch P8: every way a local selection can finish ends here -
+    // a drag release, or the double/triple-click SelectStart pushed just
+    // above (CopySelection reads the live selection, so it sees it). A
+    // plain click resolves to an empty selection and copies nothing.
+    if copy_on_select {
+        actions.push(InputAction::CopySelection);
+    }
+    actions
 }
 
 fn build_start_select_command(
