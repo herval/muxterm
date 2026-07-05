@@ -25,7 +25,12 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([400.0, 300.0])
-            .with_title("muxterm"),
+            .with_title("muxterm")
+            // iTerm-style compact chrome: no title bar, content under the
+            // traffic lights; the tab bar doubles as the drag handle.
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false),
         ..Default::default()
     };
 

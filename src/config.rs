@@ -13,8 +13,12 @@ use crate::theme::{self, UiTheme};
 
 const DEFAULT_CONFIG: &str = r##"# muxterm configuration - edits apply live while the app is running.
 
-# Built-in themes: "iterm-dark", "dracula", "solarized-dark", "gruvbox-dark"
+# Built-in themes: "iterm-dark", "dracula", "solarized-dark", "gruvbox-dark",
+#                  "iterm-light", "solarized-light", "github-light"
 theme = "iterm-dark"
+
+# How much unfocused split panes fade toward the background (0.0 - 0.8).
+# dim_inactive_panes = 0.12
 
 [font]
 # Monospace font: a name searched in the macOS font folders, or a path to a
@@ -35,6 +39,8 @@ size = 14.0
 #[serde(default)]
 pub struct ConfigFile {
     pub theme: String,
+    /// 0.0 disables dimming of unfocused panes; 0.12 is the default wash.
+    pub dim_inactive_panes: f32,
     pub font: FontConfig,
     pub colors: HashMap<String, String>,
 }
@@ -43,6 +49,7 @@ impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             theme: "iterm-dark".into(),
+            dim_inactive_panes: 0.12,
             font: FontConfig::default(),
             colors: HashMap::new(),
         }
@@ -66,6 +73,7 @@ impl Default for FontConfig {
 }
 
 pub struct Style {
+    pub name: String,
     pub term_theme: TerminalTheme,
     pub ui: UiTheme,
     pub font: FontId,
@@ -110,21 +118,26 @@ pub fn load() -> ConfigFile {
 /// Resolve a parsed config into applied styles plus (optionally) the bytes
 /// of a custom font to register.
 pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
-    let preset = theme::preset(&cfg.theme).unwrap_or_else(|| {
-        log::warn!(
-            "unknown theme {:?} (available: {}), using iterm-dark",
-            cfg.theme,
-            theme::PRESET_NAMES.join(", ")
-        );
-        theme::preset("iterm-dark").unwrap()
-    });
-    let (term_theme, ui) = theme::build(preset, &cfg.colors);
+    let (name, preset) = match theme::preset(&cfg.theme) {
+        Some(p) => (cfg.theme.clone(), p),
+        None => {
+            log::warn!(
+                "unknown theme {:?} (available: {}), using iterm-dark",
+                cfg.theme,
+                theme::PRESET_NAMES.join(", ")
+            );
+            ("iterm-dark".to_string(), theme::preset("iterm-dark").unwrap())
+        },
+    };
+    let (term_theme, ui) =
+        theme::build(preset, &cfg.colors, cfg.dim_inactive_panes);
 
     let size = cfg.font.size.clamp(6.0, 40.0);
     let font_data = cfg.font.family.as_deref().and_then(load_font_data);
 
     (
         Style {
+            name,
             term_theme,
             ui,
             font: FontId::monospace(size),
@@ -145,6 +158,74 @@ pub fn install_fonts(ctx: &egui::Context, custom: Option<FontData>) {
         }
     }
     ctx.set_fonts(defs);
+}
+
+/// Persist a theme choice by rewriting only the `theme = ...` line,
+/// preserving comments and every other setting in the file.
+pub fn set_theme(name: &str) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    if let Err(e) = fs::write(path(), replace_theme_line(&text, name)) {
+        log::warn!("could not save theme choice: {e:#}");
+    }
+}
+
+pub fn set_font_size(size: f32) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    if let Err(e) = fs::write(path(), replace_size_line(&text, size)) {
+        log::warn!("could not save font size: {e:#}");
+    }
+}
+
+fn replace_theme_line(text: &str, name: &str) -> String {
+    let line = format!("theme = \"{name}\"");
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for l in text.lines() {
+        let t = l.trim_start();
+        if !replaced && (t.starts_with("theme =") || t.starts_with("theme=")) {
+            out.push(line.clone());
+            replaced = true;
+        } else {
+            out.push(l.to_string());
+        }
+    }
+    if !replaced {
+        // Top-level keys must precede any [table] in TOML.
+        out.insert(0, line);
+    }
+    out.join("\n") + "\n"
+}
+
+fn replace_size_line(text: &str, size: f32) -> String {
+    let line = format!("size = {size:.1}");
+    let mut out: Vec<String> = Vec::new();
+    let mut section = String::new();
+    let mut replaced = false;
+    for l in text.lines() {
+        let t = l.trim();
+        if t.starts_with('[') {
+            section = t.to_string();
+        }
+        if !replaced
+            && section == "[font]"
+            && (t.starts_with("size =") || t.starts_with("size="))
+        {
+            out.push(line.clone());
+            replaced = true;
+        } else {
+            out.push(l.to_string());
+        }
+    }
+    if !replaced {
+        if let Some(pos) = out.iter().position(|l| l.trim() == "[font]") {
+            out.insert(pos + 1, line);
+        } else {
+            out.push(String::new());
+            out.push("[font]".to_string());
+            out.push(line);
+        }
+    }
+    out.join("\n") + "\n"
 }
 
 /// Find font bytes by absolute path or by name in the macOS font folders.
@@ -188,5 +269,36 @@ fn load_font_data(family: &str) -> Option<FontData> {
             );
             None
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_line_is_replaced_in_place() {
+        let text = "# comment\ntheme = \"iterm-dark\"\n\n[font]\nsize = 14.0\n";
+        let out = replace_theme_line(text, "dracula");
+        assert!(out.contains("theme = \"dracula\""));
+        assert!(!out.contains("iterm-dark"));
+        assert!(out.contains("# comment"));
+        assert!(out.contains("size = 14.0"));
+    }
+
+    #[test]
+    fn theme_line_is_prepended_when_missing() {
+        let out = replace_theme_line("[font]\nsize = 14.0\n", "gruvbox-dark");
+        assert!(out.starts_with("theme = \"gruvbox-dark\""));
+    }
+
+    #[test]
+    fn size_line_only_touches_font_section() {
+        let text = "theme = \"dracula\"\n\n[font]\nsize = 14.0\n\n[colors]\n";
+        let out = replace_size_line(text, 16.0);
+        assert!(out.contains("size = 16.0"));
+        assert!(!out.contains("size = 14.0"));
+        let out2 = replace_size_line("theme = \"dracula\"\n", 12.0);
+        assert!(out2.contains("[font]\nsize = 12.0"));
     }
 }

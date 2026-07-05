@@ -15,6 +15,7 @@ pub enum Action {
     /// Window managers like Rectangle often own cmd+opt+arrows globally,
     /// so directional nav alone can't be relied on.
     CyclePane(isize),
+    ToggleSettings,
 }
 
 const TAB_KEYS: [Key; 9] = [
@@ -56,6 +57,7 @@ pub fn drain_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         consume(cmd | Modifiers::SHIFT, Key::CloseBracket, Action::NextTab);
         consume(cmd, Key::OpenBracket, Action::CyclePane(-1));
         consume(cmd, Key::CloseBracket, Action::CyclePane(1));
+        consume(cmd, Key::Comma, Action::ToggleSettings);
         for (n, key) in TAB_KEYS.iter().enumerate() {
             consume(cmd, *key, Action::GotoTab(n));
         }

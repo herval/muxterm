@@ -42,6 +42,8 @@ pub struct App {
     font: FontId,
     term_theme: TerminalTheme,
     ui_theme: UiTheme,
+    theme_name: String,
+    settings_open: bool,
     dirty: bool,
     config_mtime: Option<SystemTime>,
     last_config_check: Instant,
@@ -68,6 +70,8 @@ impl App {
             font: style.font,
             term_theme: style.term_theme,
             ui_theme: style.ui,
+            theme_name: style.name,
+            settings_open: false,
             dirty: false,
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
@@ -357,6 +361,9 @@ impl App {
                     }
                 }
             },
+            Action::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+            },
             Action::CyclePane(step) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let leaves = tab.tree.leaves();
@@ -426,6 +433,119 @@ impl App {
             log::error!("failed to save state: {e:#}");
         }
     }
+
+    fn reload_config(&mut self, ctx: &egui::Context) {
+        self.config_mtime = config::mtime();
+        let (style, custom_font) = config::resolve(&config::load());
+        config::install_fonts(ctx, custom_font);
+        theme::apply_visuals(ctx, &style.ui);
+        self.font = style.font;
+        self.term_theme = style.term_theme;
+        self.ui_theme = style.ui;
+        self.theme_name = style.name;
+    }
+
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        let mut chosen: Option<&'static str> = None;
+        let mut commit_size: Option<f32> = None;
+
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.label(RichText::new("Theme").strong());
+                ui.add_space(4.0);
+                for name in theme::PRESET_NAMES {
+                    let preset = theme::preset(name).unwrap();
+                    ui.horizontal(|ui| {
+                        let (strip, _) = ui.allocate_exact_size(
+                            Vec2::new(66.0, 14.0),
+                            egui::Sense::hover(),
+                        );
+                        let swatches = [
+                            preset.bg,
+                            preset.ansi[1],
+                            preset.ansi[2],
+                            preset.ansi[4],
+                            preset.accent,
+                        ];
+                        for (i, hex) in swatches.iter().enumerate() {
+                            let c = theme::parse_hex(hex)
+                                .unwrap_or(egui::Color32::BLACK);
+                            let r = Rect::from_min_size(
+                                strip.min + Vec2::new(i as f32 * 13.0, 0.0),
+                                Vec2::new(12.0, 14.0),
+                            );
+                            ui.painter().rect_filled(
+                                r,
+                                CornerRadius::same(2),
+                                c,
+                            );
+                            // keep light swatches visible on light panes
+                            ui.painter().rect_stroke(
+                                r,
+                                CornerRadius::same(2),
+                                Stroke::new(1.0, self.ui_theme.text_dim),
+                                StrokeKind::Inside,
+                            );
+                        }
+                        let selected = self.theme_name == *name;
+                        if ui.selectable_label(selected, *name).clicked()
+                            && !selected
+                        {
+                            chosen = Some(name);
+                        }
+                    });
+                }
+
+                ui.add_space(10.0);
+                ui.label(RichText::new("Font").strong());
+                let mut size = self.font.size;
+                let resp = ui.add(
+                    egui::Slider::new(&mut size, 8.0..=24.0)
+                        .step_by(0.5)
+                        .text("size"),
+                );
+                if resp.changed() {
+                    self.font.size = size; // live preview
+                }
+                if resp.drag_stopped()
+                    || (resp.changed() && !resp.dragged())
+                {
+                    commit_size = Some(size);
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Edit config file…").clicked() {
+                        let _ = std::process::Command::new("/usr/bin/open")
+                            .arg("-t")
+                            .arg(config::path())
+                            .spawn();
+                    }
+                    ui.label(
+                        RichText::new("color overrides & font family")
+                            .color(self.ui_theme.text_dim)
+                            .size(11.0),
+                    );
+                });
+            });
+
+        self.settings_open = open;
+        if let Some(name) = chosen {
+            config::set_theme(name);
+            self.reload_config(ctx);
+        }
+        if let Some(size) = commit_size {
+            config::set_font_size(size);
+            // Sync mtime so the poller doesn't reload and yank the slider.
+            self.config_mtime = config::mtime();
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -437,13 +557,7 @@ impl eframe::App for App {
             self.last_config_check = Instant::now();
             let mtime = config::mtime();
             if mtime != self.config_mtime {
-                self.config_mtime = mtime;
-                let (style, custom_font) = config::resolve(&config::load());
-                config::install_fonts(ctx, custom_font);
-                theme::apply_visuals(ctx, &style.ui);
-                self.font = style.font;
-                self.term_theme = style.term_theme;
-                self.ui_theme = style.ui;
+                self.reload_config(ctx);
                 log::info!("config.toml reloaded");
             }
         }
@@ -459,6 +573,13 @@ impl eframe::App for App {
         // Order is load-bearing: shortcuts must be consumed before any
         // TerminalView clones the frame's input events.
         let mut actions = keys::drain_shortcuts(ctx);
+        if self.settings_open
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            self.settings_open = false;
+        }
 
         self.drain_pty_events(ctx);
 
@@ -483,6 +604,9 @@ impl eframe::App for App {
             match action {
                 TabBarAction::Select(i) => actions.push(Action::GotoTab(i)),
                 TabBarAction::NewTab => actions.push(Action::NewTab),
+                TabBarAction::OpenSettings => {
+                    actions.push(Action::ToggleSettings)
+                },
             }
         }
 
@@ -493,13 +617,21 @@ impl eframe::App for App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
                     let mut rects = HashMap::new();
+                    // While settings is open it owns keyboard focus; the
+                    // sentinel matches no pane, so the terminal stops
+                    // re-grabbing focus every frame.
+                    let focused = if self.settings_open {
+                        PaneId(u64::MAX)
+                    } else {
+                        tab.focused
+                    };
                     show_node(
                         ui,
                         &mut tab.tree,
                         rect,
                         1,
                         &mut tab.panes,
-                        tab.focused,
+                        focused,
                         &self.font,
                         &self.term_theme,
                         &self.ui_theme,
@@ -519,6 +651,10 @@ impl eframe::App for App {
                     tab.last_rects = rects;
                 }
             });
+
+        if self.settings_open {
+            self.show_settings(ctx);
+        }
 
         for action in ui_actions {
             match action {
@@ -574,6 +710,18 @@ fn show_node(
                 }))
                 .set_theme(term_theme.clone());
             let response = child.add(view);
+            // Wash unfocused panes toward the background, like iTerm's
+            // "dim inactive split panes".
+            if *id != focused
+                && panes.len() > 1
+                && ui_theme.dim_overlay.a() > 0
+            {
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::ZERO,
+                    ui_theme.dim_overlay,
+                );
+            }
             if response.clicked() {
                 ui_actions.push(UiAction::FocusPane(*id));
             }

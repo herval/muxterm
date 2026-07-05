@@ -14,6 +14,8 @@ pub struct UiTheme {
     pub text: Color32,
     pub text_dim: Color32,
     pub accent: Color32,
+    /// Translucent wash painted over unfocused panes (bg at some alpha).
+    pub dim_overlay: Color32,
 }
 
 pub struct Preset {
@@ -24,8 +26,15 @@ pub struct Preset {
     pub ansi: [&'static str; 16],
 }
 
-pub const PRESET_NAMES: &[&str] =
-    &["iterm-dark", "dracula", "solarized-dark", "gruvbox-dark"];
+pub const PRESET_NAMES: &[&str] = &[
+    "iterm-dark",
+    "dracula",
+    "solarized-dark",
+    "gruvbox-dark",
+    "iterm-light",
+    "solarized-light",
+    "github-light",
+];
 
 pub fn preset(name: &str) -> Option<&'static Preset> {
     match name {
@@ -73,6 +82,39 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 "#ebdbb2",
             ],
         }),
+        "iterm-light" => Some(&Preset {
+            bg: "#ffffff",
+            fg: "#000000",
+            accent: "#3b78d1",
+            ansi: [
+                "#000000", "#c91b00", "#00a600", "#997d00", "#0225c7",
+                "#ca30c7", "#009393", "#c7c7c7", "#686868", "#e02d24",
+                "#00b310", "#8f7500", "#4a63e0", "#c540c2", "#00a3a3",
+                "#f2f2f2",
+            ],
+        }),
+        "solarized-light" => Some(&Preset {
+            bg: "#fdf6e3",
+            fg: "#657b83",
+            accent: "#268bd2",
+            ansi: [
+                "#073642", "#dc322f", "#859900", "#b58900", "#268bd2",
+                "#d33682", "#2aa198", "#eee8d5", "#002b36", "#cb4b16",
+                "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1",
+                "#fdf6e3",
+            ],
+        }),
+        "github-light" => Some(&Preset {
+            bg: "#ffffff",
+            fg: "#24292f",
+            accent: "#0969da",
+            ansi: [
+                "#24292e", "#cf222e", "#116329", "#9a6700", "#0969da",
+                "#8250df", "#1b7c83", "#6e7781", "#57606a", "#a40e26",
+                "#1a7f37", "#bf8700", "#218bff", "#a475f9", "#3192aa",
+                "#8c959f",
+            ],
+        }),
         _ => None,
     }
 }
@@ -107,6 +149,7 @@ fn dim_hex(s: &str) -> String {
 pub fn build(
     preset: &Preset,
     overrides: &HashMap<String, String>,
+    dim_inactive: f32,
 ) -> (TerminalTheme, UiTheme) {
     let mut colors: HashMap<&str, String> = HashMap::new();
     colors.insert("background", preset.bg.into());
@@ -177,28 +220,43 @@ pub fn build(
     let bg = parse_hex(&get("background")).unwrap();
     let fg = parse_hex(&get("foreground")).unwrap();
     let accent = parse_hex(&get("accent")).unwrap();
+    // Chrome must darken subtly on light backgrounds and strongly on dark
+    // ones, and text emphasis goes toward the opposite pole of the bg.
+    let light = is_light(bg);
     let ui = UiTheme {
         bg,
-        tab_bar_bg: blend(bg, Color32::BLACK, 0.35),
+        tab_bar_bg: blend(bg, Color32::BLACK, if light { 0.07 } else { 0.35 }),
         tab_active_bg: blend(bg, fg, 0.13),
         tab_hover_bg: blend(bg, fg, 0.07),
         divider: blend(bg, fg, 0.12),
-        text: blend(fg, Color32::WHITE, 0.2),
+        text: blend(
+            fg,
+            if light { Color32::BLACK } else { Color32::WHITE },
+            0.2,
+        ),
         text_dim: blend(fg, bg, 0.45),
         accent,
+        dim_overlay: Color32::from_rgba_unmultiplied(
+            bg.r(),
+            bg.g(),
+            bg.b(),
+            (dim_inactive.clamp(0.0, 0.8) * 255.0) as u8,
+        ),
     };
 
     (TerminalTheme::new(Box::new(palette)), ui)
 }
 
+fn is_light(c: Color32) -> bool {
+    0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
+        >= 128.0
+}
+
 pub fn apply_visuals(ctx: &egui::Context, ui: &UiTheme) {
-    let luminance = 0.299 * ui.bg.r() as f32
-        + 0.587 * ui.bg.g() as f32
-        + 0.114 * ui.bg.b() as f32;
-    let mut visuals = if luminance < 128.0 {
-        egui::Visuals::dark()
-    } else {
+    let mut visuals = if is_light(ui.bg) {
         egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
     };
     visuals.panel_fill = ui.tab_bar_bg;
     visuals.window_fill = ui.bg;
@@ -228,7 +286,7 @@ mod tests {
         overrides.insert("background".to_string(), "#101010".to_string());
         overrides.insert("red".to_string(), "not-a-color".to_string());
         overrides.insert("bogus_key".to_string(), "#ffffff".to_string());
-        let (_, ui) = build(preset("iterm-dark").unwrap(), &overrides);
+        let (_, ui) = build(preset("iterm-dark").unwrap(), &overrides, 0.25);
         assert_eq!(ui.bg, Color32::from_rgb(0x10, 0x10, 0x10));
     }
 }

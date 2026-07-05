@@ -37,7 +37,9 @@ hotkeys or use cmd+[ / cmd+].
 **edits apply live** while the app is running):
 
 ```toml
-theme = "iterm-dark"   # or dracula | solarized-dark | gruvbox-dark
+theme = "iterm-dark"   # dracula | solarized-dark | gruvbox-dark |
+                       # iterm-light | solarized-light | github-light
+dim_inactive_panes = 0.12   # unfocused-split fade toward bg (0.0 - 0.8)
 
 [font]
 family = "Menlo"       # font name in the macOS font folders, or a file path
