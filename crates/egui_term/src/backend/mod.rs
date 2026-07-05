@@ -22,6 +22,7 @@ use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
 use std::ops::{Index, RangeInclusive};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
 
@@ -81,8 +82,11 @@ pub enum LinkAction {
 
 #[derive(Clone, Copy, Debug)]
 pub struct TerminalSize {
-    pub cell_width: u16,
-    pub cell_height: u16,
+    // Exact font metrics (not truncated to integers): the renderer batches
+    // whole runs of text into single galleys, which only lines up with the
+    // grid if cell advance and cell width agree to the sub-pixel.
+    pub cell_width: f32,
+    pub cell_height: f32,
     num_cols: u16,
     num_lines: u16,
     layout_size: Size,
@@ -91,8 +95,8 @@ pub struct TerminalSize {
 impl Default for TerminalSize {
     fn default() -> Self {
         Self {
-            cell_width: 1,
-            cell_height: 1,
+            cell_width: 1.0,
+            cell_height: 1.0,
             num_cols: 80,
             num_lines: 50,
             layout_size: Size::default(),
@@ -127,8 +131,8 @@ impl From<TerminalSize> for WindowSize {
         Self {
             num_lines: size.num_lines,
             num_cols: size.num_cols,
-            cell_width: size.cell_width,
-            cell_height: size.cell_height,
+            cell_width: size.cell_width as u16,
+            cell_height: size.cell_height as u16,
         }
     }
 }
@@ -140,6 +144,10 @@ pub struct TerminalBackend {
     size: TerminalSize,
     notifier: Notifier,
     last_content: RenderableContent,
+    /// Set by the PTY event thread and by grid-mutating commands; cleared
+    /// by `sync()`. While clear, frames reuse `last_content` instead of
+    /// re-cloning the grid under the terminal lock.
+    dirty: Arc<AtomicBool>,
 }
 
 impl TerminalBackend {
@@ -154,7 +162,17 @@ impl TerminalBackend {
             working_directory: settings.working_directory,
             ..tty::Options::default()
         };
-        let config = term::Config::default();
+        let config = term::Config {
+            // tmux owns scrollback (history-limit in the managed tmux.conf)
+            // and the wheel is forwarded to tmux copy-mode while mouse
+            // reporting is on, so the local history is only reachable if a
+            // user manually turns tmux mouse off. Keeping it tiny matters:
+            // sync() deep-clones the whole grid, history included, on every
+            // dirty frame — at the default 10k lines that's tens of MB per
+            // clone once the buffer fills.
+            scrolling_history: 200,
+            ..term::Config::default()
+        };
         let terminal_size = TerminalSize::default();
         let pty = tty::new(&pty_config, terminal_size.into(), id)?;
         let (event_sender, event_receiver) = mpsc::channel();
@@ -174,6 +192,8 @@ impl TerminalBackend {
         let notifier = Notifier(pty_event_loop.channel());
         let url_regex = RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap();
         let _pty_event_loop_thread = pty_event_loop.spawn();
+        let dirty = Arc::new(AtomicBool::new(true));
+        let thread_dirty = dirty.clone();
         let _pty_event_subscription = std::thread::Builder::new()
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
@@ -188,7 +208,10 @@ impl TerminalBackend {
                         {
                             break;
                         }
-                        app_context.clone().request_repaint();
+                        // Mark before waking the UI so the repaint that
+                        // follows can never observe a clean flag.
+                        thread_dirty.store(true, Ordering::Release);
+                        app_context.request_repaint();
                         if let Event::Exit = event {
                             break;
                         }
@@ -204,6 +227,7 @@ impl TerminalBackend {
             size: terminal_size,
             notifier,
             last_content: initial_content,
+            dirty,
         })
     }
 
@@ -214,18 +238,24 @@ impl TerminalBackend {
             BackendCommand::Write(input) => {
                 self.write(input);
                 term.scroll_display(Scroll::Bottom);
+                self.dirty.store(true, Ordering::Release);
             },
             BackendCommand::Scroll(delta) => {
                 self.scroll(&mut term, delta);
+                self.dirty.store(true, Ordering::Release);
             },
             BackendCommand::Resize(layout_size, font_size) => {
+                // resize() marks dirty itself, only on an actual change —
+                // the view issues this command every frame.
                 self.resize(&mut term, layout_size, font_size);
             },
             BackendCommand::SelectStart(selection_type, x, y) => {
                 self.start_selection(&mut term, selection_type, x, y);
+                self.dirty.store(true, Ordering::Release);
             },
             BackendCommand::SelectUpdate(x, y) => {
                 self.update_selection(&mut term, x, y);
+                self.dirty.store(true, Ordering::Release);
             },
             BackendCommand::ProcessLink(link_action, point) => {
                 self.process_link_action(&term, link_action, point);
@@ -242,10 +272,10 @@ impl TerminalBackend {
         terminal_size: &TerminalSize,
         display_offset: usize,
     ) -> Point {
-        let col = (x as usize) / (terminal_size.cell_width as usize);
+        let col = (x.max(0.0) / terminal_size.cell_width) as usize;
         let col = min(Column(col), Column(terminal_size.num_cols as usize - 1));
 
-        let line = (y as usize) / (terminal_size.cell_height as usize);
+        let line = (y.max(0.0) / terminal_size.cell_height) as usize;
         let line = min(line, terminal_size.num_lines as usize - 1);
 
         viewport_to_point(display_offset, Point::new(line, col))
@@ -265,6 +295,12 @@ impl TerminalBackend {
     }
 
     pub fn sync(&mut self) -> &RenderableContent {
+        // Clear-before-clone: a PTY write racing the clone re-marks the
+        // flag and the next frame picks it up; the ordering can lose a
+        // frame of staleness but never an update.
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return &self.last_content;
+        }
         let term = self.term.clone();
         let mut terminal = term.lock();
         let selectable_range = match &terminal.selection {
@@ -444,10 +480,9 @@ impl TerminalBackend {
     }
 
     fn selection_side(&self, x: f32) -> Side {
-        let cell_x = x as usize % self.size.cell_width as usize;
-        let half_cell_width = (self.size.cell_width as f32 / 2.0) as usize;
+        let cell_x = x.max(0.0) % self.size.cell_width;
 
-        if cell_x > half_cell_width {
+        if cell_x > self.size.cell_width / 2.0 {
             Side::Right
         } else {
             Side::Left
@@ -461,19 +496,19 @@ impl TerminalBackend {
         font_size: Size,
     ) {
         if layout_size == self.size.layout_size
-            && font_size.width as u16 == self.size.cell_width
-            && font_size.height as u16 == self.size.cell_height
+            && font_size.width == self.size.cell_width
+            && font_size.height == self.size.cell_height
         {
             return;
         }
 
-        let lines = (layout_size.height / font_size.height.floor()) as u16;
-        let cols = (layout_size.width / font_size.width.floor()) as u16;
+        let lines = (layout_size.height / font_size.height) as u16;
+        let cols = (layout_size.width / font_size.width) as u16;
         if lines > 0 && cols > 0 {
             self.size = TerminalSize {
                 layout_size,
-                cell_height: font_size.height as u16,
-                cell_width: font_size.width as u16,
+                cell_height: font_size.height,
+                cell_width: font_size.width,
                 num_lines: lines,
                 num_cols: cols,
             };
@@ -483,6 +518,7 @@ impl TerminalBackend {
                 self.size.num_cols as usize,
                 self.size.num_lines as usize,
             ));
+            self.dirty.store(true, Ordering::Release);
         }
     }
 

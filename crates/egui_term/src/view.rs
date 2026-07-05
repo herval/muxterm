@@ -3,7 +3,7 @@ use alacritty_terminal::term::cell;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use egui::epaint::RectShape;
-use egui::{CornerRadius, Key};
+use egui::{Color32, CornerRadius, FontId, Key};
 use egui::Modifiers;
 use egui::MouseWheelUnit;
 use egui::Shape;
@@ -265,16 +265,39 @@ impl<'a> TerminalView<'a> {
         let content = self.backend.sync();
         let layout_min = layout.rect.min;
         let layout_max = layout.rect.max;
-        let cell_height = content.terminal_size.cell_height as f32;
-        let cell_width = content.terminal_size.cell_width as f32;
+        let cell_height = content.terminal_size.cell_height;
+        let cell_width = content.terminal_size.cell_width;
+        let font_id = self.font.font_type();
         let global_bg =
             self.theme.get_color(Color::Named(NamedColor::Background));
+        let is_app_cursor_mode =
+            content.terminal_mode.contains(TermMode::APP_CURSOR);
+        let display_offset = content.grid.display_offset() as i32;
+        let fonts = painter.fonts(|f| f.clone());
+        // Run batching assumes every ASCII glyph advances exactly one cell,
+        // which only a monospace font guarantees; anything else takes the
+        // per-cell path below.
+        let monospace = painter.fonts(|f| {
+            f.glyph_width(&font_id, 'i') == f.glyph_width(&font_id, 'W')
+        });
 
-        let mut shapes = vec![Shape::Rect(RectShape::filled(
+        // Contiguous same-bg cells merge into one rect and contiguous
+        // same-fg ASCII into one galley — the difference between ~10k
+        // shapes per frame and ~100. Three layers keep merged backgrounds
+        // from painting over a neighboring run's glyphs.
+        let mut bg_shapes = vec![Shape::Rect(RectShape::filled(
             Rect::from_min_max(layout_min, layout_max),
             CornerRadius::ZERO,
             global_bg,
         ))];
+        let mut deco_shapes: Vec<Shape> = Vec::new();
+        let mut text_shapes: Vec<Shape> = Vec::new();
+
+        let mut bg_run: Option<BgRun> = None;
+        let mut text_run: Option<TextRun> = None;
+        // (row, column) the previous cell ended at; a mismatch (row change
+        // or the spacer skipped after a wide char) breaks both runs.
+        let mut run_cursor: Option<(i32, usize)> = None;
 
         for indexed in content.grid.display_iter() {
             let flags = indexed.cell.flags;
@@ -284,8 +307,6 @@ impl<'a> TerminalView<'a> {
                 continue;
             }
 
-            let is_app_cursor_mode =
-                content.terminal_mode.contains(TermMode::APP_CURSOR);
             let is_wide_char = flags.contains(cell::Flags::WIDE_CHAR);
             let is_inverse = flags.contains(cell::Flags::INVERSE);
             let is_dim =
@@ -299,14 +320,14 @@ impl<'a> TerminalView<'a> {
                         && r.contains(&state.current_mouse_position_on_grid)
                 });
 
-            let x = layout_min.x + (cell_width * indexed.point.column.0 as f32);
-            let line_num =
-                indexed.point.line.0 + content.grid.display_offset() as i32;
+            let column = indexed.point.column.0;
+            let line_num = indexed.point.line.0 + display_offset;
+            let x = layout_min.x + (cell_width * column as f32);
             let y = layout_min.y + (cell_height * line_num as f32);
 
             let mut fg = self.theme.get_color(indexed.fg);
             let mut bg = self.theme.get_color(indexed.bg);
-            let cell_width = if is_wide_char {
+            let draw_width = if is_wide_char {
                 cell_width * 2.0
             } else {
                 cell_width
@@ -320,25 +341,37 @@ impl<'a> TerminalView<'a> {
                 std::mem::swap(&mut fg, &mut bg);
             }
 
+            if run_cursor != Some((line_num, column)) {
+                flush_bg(&mut bg_run, &mut bg_shapes, cell_height);
+                flush_text(&mut text_run, &mut text_shapes, painter, &font_id);
+            }
+            run_cursor =
+                Some((line_num, column + if is_wide_char { 2 } else { 1 }));
+
             if global_bg != bg {
-                shapes.push(Shape::Rect(RectShape::filled(
-                    Rect::from_min_size(
-                        Pos2::new(x, y),
-                        // + 1.0 is to fill grid border
-                        Vec2::new(cell_width + 1., cell_height + 1.),
-                    ),
-                    CornerRadius::ZERO,
-                    bg,
-                )));
+                match &mut bg_run {
+                    Some(run) if run.color == bg => run.width += draw_width,
+                    _ => {
+                        flush_bg(&mut bg_run, &mut bg_shapes, cell_height);
+                        bg_run = Some(BgRun {
+                            x,
+                            y,
+                            width: draw_width,
+                            color: bg,
+                        });
+                    },
+                }
+            } else {
+                flush_bg(&mut bg_run, &mut bg_shapes, cell_height);
             }
 
             // Handle hovered hyperlink underline
             if is_hovered_hyperling {
                 let underline_height = y + cell_height;
-                shapes.push(Shape::LineSegment {
+                deco_shapes.push(Shape::LineSegment {
                     points: [
                         Pos2::new(x, underline_height),
-                        Pos2::new(x + cell_width, underline_height),
+                        Pos2::new(x + draw_width, underline_height),
                     ],
                     stroke: Stroke::new(cell_height * 0.15, fg).into(),
                 });
@@ -348,10 +381,10 @@ impl<'a> TerminalView<'a> {
             if content.grid.cursor.point == indexed.point {
                 let cursor_rect = Rect::from_min_size(
                     Pos2::new(x, y),
-                    Vec2::new(cell_width, cell_height),
+                    Vec2::new(draw_width, cell_height),
                 );
                 let cursor_color = self.theme.get_color(content.cursor.fg);
-                shapes.push(Shape::Rect(RectShape::filled(
+                deco_shapes.push(Shape::Rect(RectShape::filled(
                     cursor_rect,
                     CornerRadius::default(),
                     cursor_color,
@@ -371,28 +404,123 @@ impl<'a> TerminalView<'a> {
             }
 
             // Draw text content
-            if indexed.c != ' ' && indexed.c != '\t' {
+            if indexed.c == ' ' || indexed.c == '\t' {
+                // No glyph, but an open run swallows the gap so a row of
+                // prose stays a single galley.
+                if let Some(run) = &mut text_run {
+                    run.text.push(' ');
+                }
+            } else {
                 if content.grid.cursor.point == indexed.point
                     && is_app_cursor_mode
                 {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
-                shapes.push(Shape::text(
-                    &painter.fonts(|c| c.clone()),
-                    Pos2 {
-                        x: x + (cell_width / 2.0),
-                        y,
-                    },
-                    Align2::CENTER_TOP,
-                    indexed.c,
-                    self.font.font_type(),
-                    fg,
-                ));
+                if monospace && !is_wide_char && indexed.c.is_ascii_graphic() {
+                    match &mut text_run {
+                        Some(run) if run.color == fg => run.text.push(indexed.c),
+                        _ => {
+                            flush_text(
+                                &mut text_run,
+                                &mut text_shapes,
+                                painter,
+                                &font_id,
+                            );
+                            text_run = Some(TextRun {
+                                x,
+                                y,
+                                text: indexed.c.to_string(),
+                                color: fg,
+                            });
+                        },
+                    }
+                } else {
+                    // Wide and non-ASCII glyphs keep the centered per-cell
+                    // placement: their advance need not match the grid.
+                    flush_text(
+                        &mut text_run,
+                        &mut text_shapes,
+                        painter,
+                        &font_id,
+                    );
+                    text_shapes.push(Shape::text(
+                        &fonts,
+                        Pos2 {
+                            x: x + (draw_width / 2.0),
+                            y,
+                        },
+                        Align2::CENTER_TOP,
+                        indexed.c,
+                        font_id.clone(),
+                        fg,
+                    ));
+                }
             }
         }
+        flush_bg(&mut bg_run, &mut bg_shapes, cell_height);
+        flush_text(&mut text_run, &mut text_shapes, painter, &font_id);
 
-        painter.extend(shapes);
+        painter.extend(bg_shapes);
+        painter.extend(deco_shapes);
+        painter.extend(text_shapes);
+    }
+}
+
+/// A horizontal stretch of cells sharing one background color.
+struct BgRun {
+    x: f32,
+    y: f32,
+    width: f32,
+    color: Color32,
+}
+
+/// A horizontal stretch of same-color ASCII text, laid out as one galley.
+struct TextRun {
+    x: f32,
+    y: f32,
+    text: String,
+    color: Color32,
+}
+
+fn flush_bg(
+    run: &mut Option<BgRun>,
+    shapes: &mut Vec<Shape>,
+    cell_height: f32,
+) {
+    if let Some(run) = run.take() {
+        shapes.push(Shape::Rect(RectShape::filled(
+            Rect::from_min_size(
+                Pos2::new(run.x, run.y),
+                // + 1.0 is to fill grid border
+                Vec2::new(run.width + 1., cell_height + 1.),
+            ),
+            CornerRadius::ZERO,
+            run.color,
+        )));
+    }
+}
+
+fn flush_text(
+    run: &mut Option<TextRun>,
+    shapes: &mut Vec<Shape>,
+    painter: &Painter,
+    font_id: &FontId,
+) {
+    if let Some(mut run) = run.take() {
+        // Spaces pushed to keep the run alive add nothing at the tail.
+        while run.text.ends_with(' ') {
+            run.text.pop();
+        }
+        if !run.text.is_empty() {
+            let galley =
+                painter.layout_no_wrap(run.text, font_id.clone(), run.color);
+            shapes.push(Shape::galley(
+                Pos2::new(run.x, run.y),
+                galley,
+                run.color,
+            ));
+        }
     }
 }
 

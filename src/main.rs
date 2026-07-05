@@ -24,6 +24,9 @@ fn main() -> eframe::Result {
     let tmux = tmux::TmuxCtl::discover(&state::config_dir());
 
     let options = eframe::NativeOptions {
+        // Metal via wgpu; the default glow renderer runs on Apple's
+        // deprecated OpenGL stack, with worse present latency.
+        renderer: eframe::Renderer::Wgpu,
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 720.0])
             .with_min_inner_size([400.0, 300.0])

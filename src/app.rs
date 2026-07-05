@@ -844,13 +844,13 @@ impl eframe::App for App {
                             let caret = Rect::from_min_size(
                                 rect.min
                                     + Vec2::new(
-                                        size.cell_width as f32
+                                        size.cell_width
                                             * point.column.0 as f32,
-                                        size.cell_height as f32 * row as f32,
+                                        size.cell_height * row as f32,
                                     ),
                                 Vec2::new(
-                                    size.cell_width as f32,
-                                    size.cell_height as f32,
+                                    size.cell_width,
+                                    size.cell_height,
                                 ),
                             );
                             draw_ai_overlay(
