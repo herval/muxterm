@@ -31,12 +31,15 @@ defaults rather than exposing every choice as configuration:
   output as a permanent, searchable log instead of a ring buffer (today:
   100k lines of tmux history per pane; on the roadmap: a durable on-disk
   archive).
-- **AI is a first-class tenant, not a bolt-on.** Coding agents run in
-  panes as peers: tabs are teams, panes are teammates, and the `mux` CLI
-  gives them shared context — they read each other's terminals, message
-  each other, and share a scratchpad (see [agent mesh](#agent-mesh)).
-  Planned on top: `? `-prefixed commands, so typing `? why did this build
-  fail` asks an AI that already sees your terminal.
+- **AI is a first-class tenant, not a bolt-on.** It cuts both ways. Coding
+  agents run in panes as peers: tabs are teams, panes are teammates, and
+  the `mux` CLI gives them shared context — they read each other's
+  terminals, message each other, and share a scratchpad (see
+  [agent mesh](#agent-mesh)). And AI is one keystroke from any shell: type
+  `? ` at an idle prompt and the line becomes a compose box — enter runs
+  your question through Claude Code or Codex right in the pane, with your
+  recent scrollback piped in as context, so `? why did this build fail`
+  just works.
 - **Themed, not themeable-to-death.** A curated set of themes plus a small
   override surface (`config.toml`, edits apply live). Tab bar, dividers,
   and borders derive from the palette, so the whole window always matches.
