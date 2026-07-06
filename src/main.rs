@@ -11,14 +11,22 @@ mod pane;
 mod pr_status;
 mod search;
 mod settings;
+mod sidebar;
 mod tabbar;
 mod theme;
 mod tmux;
+mod workspace;
+mod workspace_popup;
 
 use muxterm::state;
 
 fn main() -> eframe::Result {
     env_logger::init();
+
+    // Relocate state from the old ~/Library/Application Support/muxterm to
+    // ~/.muxterm before anything reads it (config, state, tmux.conf). No-op
+    // once migrated.
+    state::migrate_config_dir();
 
     // The spawned PTYs inherit this process env. When muxterm is launched
     // outside a shell (Finder/Dock) TERM is unset, and the tmux client

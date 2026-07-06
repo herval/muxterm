@@ -427,12 +427,15 @@ mod tests {
     fn tab_membership_resolution() {
         let state = StateFile {
             version: 1,
+            last_workspace_dir: None,
+            sidebar_open: true,
             windows: vec![WindowState {
                 active_tab: 0,
                 tabs: vec![
                     TabState {
                         id: "mux-tab-1111".into(),
                         focused_session: "mux-a".into(),
+                        workspace: None,
                         tree: NodeState::Split {
                             axis: SplitAxis::SideBySide,
                             ratio: 0.5,
@@ -447,6 +450,7 @@ mod tests {
                     TabState {
                         id: "mux-tab-2222".into(),
                         focused_session: "mux-c".into(),
+                        workspace: None,
                         tree: NodeState::Leaf {
                             session: "mux-c".into(),
                         },

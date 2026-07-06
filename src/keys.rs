@@ -5,6 +5,11 @@ use muxterm::layout::{Dir, SplitAxis};
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
     NewTab,
+    /// cmd+n: open the workspace-creation popup (folder + worktree + prompt +
+    /// agent). cmd+t (NewTab) stays the shortcut for a bare shell workspace.
+    NewWorkspace,
+    /// cmd+\: show/collapse the workspace sidebar.
+    ToggleSidebar,
     ClosePane,
     Split(SplitAxis),
     PrevTab,
@@ -55,6 +60,8 @@ pub fn drain_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         consume(cmd | Modifiers::SHIFT, Key::D, Action::Split(SplitAxis::Stacked));
         consume(cmd, Key::D, Action::Split(SplitAxis::SideBySide));
         consume(cmd, Key::T, Action::NewTab);
+        consume(cmd, Key::N, Action::NewWorkspace);
+        consume(cmd, Key::Backslash, Action::ToggleSidebar);
         consume(cmd, Key::W, Action::ClosePane);
         // shift+[ arrives as the logical key `{` on US-like layouts, but as
         // `[` wherever shift+[ produces something else — bind both.

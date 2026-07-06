@@ -76,6 +76,8 @@ type Fail = (i32, String);
 type CmdResult = Result<(), Fail>;
 
 fn main() {
+    // Either binary may run first; whichever does moves state to ~/.muxterm.
+    state::migrate_config_dir();
     let args: Vec<String> = env::args().skip(1).collect();
     if let Err((code, msg)) = run(args) {
         eprintln!("mux: {msg}");

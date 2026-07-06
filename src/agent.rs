@@ -16,6 +16,10 @@ pub struct Agent {
     /// question about pane output doesn't need the CLI's default model,
     /// which may be a slow flagship; None leaves the choice to the CLI.
     pub fast_model: Option<&'static str>,
+    /// Models offered in the workspace-creation model dropdown. Curated (not
+    /// every id the CLI accepts) - a bad pick just makes the CLI error; the
+    /// first entry is the dropdown default.
+    pub models: &'static [&'static str],
 }
 
 pub const AGENTS: &[Agent] = &[
@@ -24,8 +28,15 @@ pub const AGENTS: &[Agent] = &[
         label: "Claude Code",
         bin: "claude",
         fast_model: Some("haiku"),
+        models: &["sonnet", "opus", "haiku"],
     },
-    Agent { id: "codex", label: "Codex", bin: "codex", fast_model: None },
+    Agent {
+        id: "codex",
+        label: "Codex",
+        bin: "codex",
+        fast_model: None,
+        models: &["gpt-5-codex", "gpt-5"],
+    },
 ];
 
 pub fn by_id(id: &str) -> Option<&'static Agent> {
@@ -46,6 +57,25 @@ pub fn ask_command(query: &str, ctx_file: Option<&Path>) -> String {
         cmd.push_str(" < ");
         cmd.push_str(&shell_quote(&path.display().to_string()));
     }
+    cmd
+}
+
+/// The interactive command a new workspace types into its pane to launch the
+/// agent seeded with the user's task. Unlike `ask_command` (a one-shot
+/// `mux ask`), this starts the agent's own interactive session with the prompt
+/// as its first message, so the workspace is an ongoing conversation.
+pub fn launch_command(
+    agent: &Agent,
+    model: Option<&str>,
+    prompt: &str,
+) -> String {
+    let mut cmd = agent.bin.to_string();
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        cmd.push_str(" --model ");
+        cmd.push_str(m);
+    }
+    cmd.push(' ');
+    cmd.push_str(&shell_quote(prompt));
     cmd
 }
 
@@ -96,5 +126,24 @@ mod tests {
         assert!(by_id("gpt").is_none());
         assert_eq!(default_agent().id, "claude");
         assert_eq!(default_agent().fast_model, Some("haiku"));
+        assert_eq!(default_agent().models.first(), Some(&"sonnet"));
+    }
+
+    #[test]
+    fn launch_command_composes() {
+        let claude = by_id("claude").unwrap();
+        assert_eq!(
+            launch_command(claude, Some("sonnet"), "fix the build"),
+            "claude --model sonnet 'fix the build'"
+        );
+        // No model and an empty model both omit the flag.
+        assert_eq!(
+            launch_command(claude, None, "what's up"),
+            "claude 'what'\\''s up'"
+        );
+        assert_eq!(
+            launch_command(claude, Some(""), "hi"),
+            "claude 'hi'"
+        );
     }
 }

@@ -29,10 +29,13 @@ use crate::pane::Pane;
 use crate::pr_status;
 use crate::search::{self, SearchBar, SearchOp};
 use crate::settings;
+use crate::sidebar::{self, SidebarAction};
 use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
 use crate::tmux::{self, TmuxCtl};
+use crate::workspace::{self, Workspace};
+use crate::workspace_popup::{self, NewWorkspaceForm};
 
 const PANE_GAP: f32 = 4.0;
 
@@ -48,6 +51,9 @@ pub struct Tab {
     pub focused: PaneId,
     /// Screen rects from the last frame; drives cmd+opt+arrow navigation.
     pub last_rects: HashMap<PaneId, Rect>,
+    /// What this tab is for. Always present: bare for a plain cmd+t shell
+    /// tab, rich for a cmd+n workspace (folder/worktree/prompt/agent/title).
+    pub workspace: Workspace,
 }
 
 enum UiAction {
@@ -102,6 +108,19 @@ pub struct App {
     /// Dock bounce + banner on bell/`mux notify` while unfocused
     /// (config `notifications`); tab badges are not gated by this.
     notifications: bool,
+    /// The workspace sidebar's visibility (cmd+\); persisted in state.json.
+    sidebar_open: bool,
+    /// The open workspace-creation popup (cmd+n), or None.
+    new_workspace: Option<NewWorkspaceForm>,
+    /// Folder the creation popup pre-fills - the last one a workspace used.
+    last_workspace_dir: Option<String>,
+    /// tab_id -> AI-generated title, streamed in by `workspace::spawn_title`
+    /// and `spawn_name`.
+    title_tx: Sender<(String, String)>,
+    title_rx: Receiver<(String, String)>,
+    /// tab_ids with an auto-name generation in flight, so the poll sweep
+    /// doesn't spawn a second one for the same unnamed workspace.
+    naming: HashSet<String>,
 }
 
 impl App {
@@ -129,6 +148,7 @@ impl App {
         let (git_tx, git_rx) = mpsc::channel();
         let git_enabled = Arc::new(AtomicBool::new(style.git_status));
         git_status::spawn(cc.egui_ctx.clone(), git_tx, git_enabled.clone());
+        let (title_tx, title_rx) = mpsc::channel();
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -162,10 +182,18 @@ impl App {
             git_enabled,
             git_status: style.git_status,
             notifications: style.notifications,
+            sidebar_open: true,
+            new_workspace: None,
+            last_workspace_dir: None,
+            title_tx,
+            title_rx,
+            naming: HashSet::new(),
         };
 
         match state::load() {
             LoadResult::Loaded(saved) => {
+                app.sidebar_open = saved.sidebar_open;
+                app.last_workspace_dir = saved.last_workspace_dir.clone();
                 let mut referenced = HashSet::new();
                 for window in &saved.windows {
                     for tab in &window.tabs {
@@ -264,6 +292,8 @@ impl App {
 
     fn new_tab(&mut self, ctx: &egui::Context, session: Option<String>) {
         let start_dir = self.focused_cwd();
+        let workspace =
+            Workspace::bare(start_dir.as_ref().map(PathBuf::from));
         match self.create_pane(ctx, session, start_dir) {
             Ok(pane) => {
                 let id = pane.id;
@@ -275,11 +305,159 @@ impl App {
                     panes,
                     focused: id,
                     last_rects: HashMap::new(),
+                    workspace,
                 });
                 self.active = self.tabs.len() - 1;
                 self.dirty = true;
             },
             Err(e) => log::error!("failed to open a new tab: {e:#}"),
+        }
+    }
+
+    /// cmd+n: build a workspace from the creation popup's form. Creates the
+    /// worktree (if requested and the folder is a git repo), opens a pane in
+    /// the worktree/folder, launches the agent seeded with the prompt, and
+    /// kicks off the async AI title. Failures in optional steps degrade
+    /// gracefully - the workspace still opens.
+    fn create_workspace(&mut self, ctx: &egui::Context, form: NewWorkspaceForm) {
+        let root = expand_dir(&form.folder);
+        let prompt = form.prompt.trim().to_string();
+        let agent = muxterm::agent::by_id(form.agent);
+
+        // Worktree first, so the pane can start inside it.
+        let worktree = if form.create_worktree {
+            match root.as_deref() {
+                Some(r) if workspace::is_git_repo(r) => {
+                    match workspace::create_worktree(r, &prompt) {
+                        Ok(wt) => Some(wt),
+                        Err(e) => {
+                            log::warn!("worktree creation failed: {e:#}");
+                            None
+                        },
+                    }
+                },
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let start_dir = worktree
+            .as_ref()
+            .map(|w| w.path.clone())
+            .or_else(|| root.clone())
+            .map(|p| p.display().to_string());
+
+        let pane = match self.create_pane(ctx, None, start_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("failed to open workspace pane: {e:#}");
+                return;
+            },
+        };
+        let id = pane.id;
+        let mut panes = HashMap::new();
+        panes.insert(id, pane);
+        let tab_id = mesh::new_tab_id();
+
+        let model = (!form.model.is_empty()).then(|| form.model.clone());
+        let workspace = Workspace {
+            title: workspace::default_title(root.as_deref(), &prompt),
+            root: root.clone(),
+            description: None,
+            prompt: prompt.clone(),
+            worktree,
+            agent: agent.map(|a| a.id),
+            model: model.clone(),
+            created_at: mesh::now(),
+        };
+
+        self.tabs.push(Tab {
+            tab_id: tab_id.clone(),
+            tree: Node::Leaf(id),
+            panes,
+            focused: id,
+            last_rects: HashMap::new(),
+            workspace,
+        });
+        self.active = self.tabs.len() - 1;
+
+        // Launch the agent in the pane, seeded with the task (same typed-input
+        // path the "?" prompt uses). Only when there's both an agent and a
+        // prompt; an empty-prompt workspace is just a shell in the folder.
+        if let (Some(agent), false) = (agent, prompt.is_empty()) {
+            let mut cmd = muxterm::agent::launch_command(
+                agent,
+                model.as_deref(),
+                &prompt,
+            )
+            .into_bytes();
+            cmd.push(b'\r');
+            if let Some(pane) = self.tabs[self.active].panes.get_mut(&id) {
+                pane.backend.process_command(BackendCommand::Write(cmd));
+            }
+            workspace::spawn_title(
+                tab_id,
+                prompt,
+                agent,
+                self.title_tx.clone(),
+                ctx.clone(),
+            );
+        }
+
+        if let Some(r) = &root {
+            self.last_workspace_dir = Some(r.display().to_string());
+        }
+        self.dirty = true;
+    }
+
+    /// A workspace "needs a name" while its label is still the generic
+    /// auto-default (the folder basename, or "workspace") and no AI summary
+    /// has landed. cmd+n workspaces carry a prompt-derived title, so this only
+    /// catches bare cmd+t tabs (and restored pre-name ones).
+    fn workspace_needs_name(ws: &Workspace) -> bool {
+        ws.description.is_none()
+            && ws.title == workspace::default_title(ws.root.as_deref(), "")
+    }
+
+    /// Auto-name unnamed workspaces from a snapshot of their terminal, the
+    /// same haiku pipeline cmd+n uses for its prompt. Runs on the config-poll
+    /// tick; one attempt per tab at a time (the `naming` guard), and only once
+    /// the pane has produced enough output to summarize - a fresh empty shell
+    /// is left alone until it has activity.
+    fn maybe_generate_names(&mut self, ctx: &egui::Context) {
+        let candidates: Vec<(String, String)> = self
+            .tabs
+            .iter()
+            .filter(|t| {
+                Self::workspace_needs_name(&t.workspace)
+                    && !self.naming.contains(&t.tab_id)
+            })
+            .filter_map(|t| {
+                let pane = t.panes.get(&t.focused)?;
+                Some((t.tab_id.clone(), pane.session.clone()))
+            })
+            .collect();
+        for (tab_id, session) in candidates {
+            let scroll =
+                self.tmux.capture_pane(&session, 40).unwrap_or_default();
+            // Too little to name yet; retry on a later tick once there's more.
+            if scroll.split_whitespace().count() < 8 {
+                continue;
+            }
+            let cwd =
+                self.tmux.pane_current_path(&session).unwrap_or_default();
+            let context = format!(
+                "Working directory: {cwd}\n\nRecent terminal output:\n{scroll}"
+            );
+            self.naming.insert(tab_id.clone());
+            workspace::spawn_name(
+                tab_id,
+                context,
+                self.agent,
+                self.title_tx.clone(),
+                ctx.clone(),
+            );
         }
     }
 
@@ -329,12 +507,19 @@ impl App {
         } else {
             saved.id
         };
+        // Pre-workspace state files (or a bare tab) have no workspace; give
+        // them a bare one so the sidebar still lists them.
+        let workspace = saved
+            .workspace
+            .map(Workspace::from_state)
+            .unwrap_or_else(|| Workspace::bare(None));
         self.tabs.push(Tab {
             tab_id,
             tree,
             panes,
             focused,
             last_rects: HashMap::new(),
+            workspace,
         });
         Ok(())
     }
@@ -663,6 +848,24 @@ impl App {
     fn apply_action(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::NewTab => self.new_tab(ctx, None),
+            Action::NewWorkspace => {
+                if self.new_workspace.is_none() {
+                    let prefill = self
+                        .last_workspace_dir
+                        .clone()
+                        .or_else(|| self.focused_cwd())
+                        .unwrap_or_default();
+                    self.new_workspace = Some(NewWorkspaceForm::new(
+                        prefill,
+                        self.agent.id,
+                        workspace_popup::default_model(self.agent.id),
+                    ));
+                }
+            },
+            Action::ToggleSidebar => {
+                self.sidebar_open = !self.sidebar_open;
+                self.dirty = true;
+            },
             Action::ClosePane => {
                 if let Some(tab) = self.tabs.get(self.active) {
                     let focused = tab.focused;
@@ -706,7 +909,7 @@ impl App {
             Action::ToggleSearch => {
                 if self.search.active() {
                     self.search.close();
-                } else if !self.settings_open {
+                } else if !self.settings_open && self.new_workspace.is_none() {
                     if let Some(tab) = self.tabs.get(self.active) {
                         if tab.panes.contains_key(&tab.focused) {
                             // The bar owns the keyboard; the "?" compose
@@ -765,6 +968,8 @@ impl App {
 
         StateFile {
             version: state::VERSION,
+            last_workspace_dir: self.last_workspace_dir.clone(),
+            sidebar_open: self.sidebar_open,
             windows: vec![WindowState {
                 active_tab: self.active,
                 tabs: self
@@ -778,6 +983,7 @@ impl App {
                             .get(&tab.focused)
                             .map(|p| p.session.clone())
                             .unwrap_or_default(),
+                        workspace: Some(tab.workspace.to_state()),
                     })
                     .collect(),
             }],
@@ -915,7 +1121,10 @@ impl App {
     /// reach the PTY; a submit types the composed agent command into the
     /// focused pane, with recent scrollback redirected to its stdin.
     fn ai_intercept(&mut self, ctx: &egui::Context) {
-        if self.settings_open || self.search.active() {
+        if self.settings_open
+            || self.new_workspace.is_some()
+            || self.search.active()
+        {
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else {
@@ -1016,7 +1225,7 @@ impl App {
     /// (PtyEvent::ClipboardStore). The event is left in place - the widget's
     /// own Copy handling stays a no-op for an empty local selection.
     fn copy_intercept(&mut self, ctx: &egui::Context) {
-        if self.settings_open {
+        if self.settings_open || self.new_workspace.is_some() {
             return;
         }
         let copied = ctx.input(|i| {
@@ -1111,6 +1320,7 @@ impl eframe::App for App {
             }
             self.drain_split_requests(ctx);
             self.drain_notify_requests(ctx);
+            self.maybe_generate_names(ctx);
         }
 
         if log::log_enabled!(log::Level::Debug) {
@@ -1133,6 +1343,14 @@ impl eframe::App for App {
             })
         {
             self.settings_open = false;
+        }
+        // Esc closes the workspace popup, like the settings window.
+        if self.new_workspace.is_some()
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            self.new_workspace = None;
         }
         // Open/close the bar *before* search_intercept: cmd+f is already
         // consumed above, but the bar only starts intercepting once it is
@@ -1165,6 +1383,17 @@ impl eframe::App for App {
         while let Ok(snapshot) = self.git_rx.try_recv() {
             self.git = snapshot;
         }
+        // AI titles/names arrive out of band; upgrade the workspace's label.
+        while let Ok((tab_id, title)) = self.title_rx.try_recv() {
+            self.naming.remove(&tab_id);
+            if let Some(tab) =
+                self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
+            {
+                tab.workspace.title = title.clone();
+                tab.workspace.description = Some(title);
+                self.dirty = true;
+            }
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Sessions deliberately survive: dropping the app only detaches
@@ -1186,19 +1415,88 @@ impl eframe::App for App {
                 (label, attn)
             })
             .collect();
-        for action in tabbar::show(ctx, &labels, self.active, &self.ui_theme) {
+        for action in
+            tabbar::show(ctx, &labels, self.active, self.sidebar_open, &self.ui_theme)
+        {
             match action {
                 TabBarAction::Select(i) => actions.push(Action::GotoTab(i)),
                 TabBarAction::NewTab => actions.push(Action::NewTab),
                 TabBarAction::OpenSettings => {
                     actions.push(Action::ToggleSettings)
                 },
+                TabBarAction::ToggleSidebar => {
+                    actions.push(Action::ToggleSidebar)
+                },
+            }
+        }
+
+        // The workspace sidebar (a left panel) must be added before the
+        // CentralPanel. Rows are newest-first; `tab_index` maps a click back
+        // to the real tab regardless of display order.
+        if self.sidebar_open {
+            let mut rows: Vec<sidebar::Row> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, tab)| {
+                    let ws = &tab.workspace;
+                    let subtitle = ws
+                        .worktree
+                        .as_ref()
+                        .map(|w| w.branch.clone())
+                        .or_else(|| {
+                            ws.root.as_ref().and_then(|r| {
+                                r.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                            })
+                        })
+                        // A bare tab's title is already the folder name; don't
+                        // echo it as the subtitle.
+                        .filter(|s| *s != ws.title);
+                    sidebar::Row {
+                        tab_index: i,
+                        title: ws.title.clone(),
+                        subtitle,
+                        active: i == self.active,
+                    }
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                let (ca, cb) = (
+                    self.tabs[a.tab_index].workspace.created_at,
+                    self.tabs[b.tab_index].workspace.created_at,
+                );
+                cb.cmp(&ca).then(b.tab_index.cmp(&a.tab_index))
+            });
+            for action in sidebar::show(ctx, &rows, &self.font, &self.ui_theme) {
+                match action {
+                    SidebarAction::Select(i) => {
+                        actions.push(Action::GotoTab(i))
+                    },
+                    SidebarAction::NewWorkspace => {
+                        actions.push(Action::NewWorkspace)
+                    },
+                    SidebarAction::ToggleSidebar => {
+                        actions.push(Action::ToggleSidebar)
+                    },
+                }
             }
         }
 
         let mut ui_actions = Vec::new();
+        // A small left gutter separates the panes from the sidebar's resize
+        // edge; none when the sidebar is hidden so panes stay flush.
+        let content_margin = if self.sidebar_open {
+            egui::Margin { left: 6, right: 0, top: 0, bottom: 0 }
+        } else {
+            egui::Margin::ZERO
+        };
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(self.ui_theme.bg))
+            .frame(
+                egui::Frame::new()
+                    .fill(self.ui_theme.bg)
+                    .inner_margin(content_margin),
+            )
             .show(ctx, |ui| {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
@@ -1207,6 +1505,7 @@ impl eframe::App for App {
                     // bar own the keyboard, the sentinel matches no pane,
                     // so the terminal stops re-grabbing focus every frame.
                     let focused = if self.settings_open
+                        || self.new_workspace.is_some()
                         || self.ai.composing()
                         || self.search.active()
                     {
@@ -1318,6 +1617,21 @@ impl eframe::App for App {
             self.show_settings(ctx);
         }
 
+        // The workspace-creation popup. Taken out so `create_workspace` can
+        // borrow self mutably; put back unless the user finished with it.
+        if let Some(mut form) = self.new_workspace.take() {
+            match workspace_popup::show(ctx, &mut form, &self.ui_theme, &self.font)
+            {
+                workspace_popup::Outcome::Create => {
+                    self.create_workspace(ctx, form);
+                },
+                workspace_popup::Outcome::Cancel => {},
+                workspace_popup::Outcome::None => {
+                    self.new_workspace = Some(form);
+                },
+            }
+        }
+
         for action in ui_actions {
             match action {
                 UiAction::FocusPane(id) => {
@@ -1340,6 +1654,24 @@ impl eframe::App for App {
             self.dirty = false;
         }
     }
+}
+
+/// Resolve the popup's folder text into a path: trim, expand a leading `~`,
+/// treat empty as "no folder". Existence isn't checked here - the git and
+/// spawn steps handle a bad path.
+fn expand_dir(input: &str) -> Option<PathBuf> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            if let Some(home) = dirs::home_dir() {
+                return Some(home.join(rest.trim_start_matches('/')));
+            }
+        }
+    }
+    Some(PathBuf::from(s))
 }
 
 /// Write the captured scrollback where the agent command's stdin

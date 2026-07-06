@@ -7,6 +7,7 @@ pub enum TabBarAction {
     Select(usize),
     NewTab,
     OpenSettings,
+    ToggleSidebar,
 }
 
 /// Per-tab render data: label and the activity/attention dot (level plus
@@ -17,6 +18,7 @@ pub fn show(
     ctx: &egui::Context,
     tabs: &[TabInfo],
     active: usize,
+    sidebar_open: bool,
     t: &UiTheme,
 ) -> Vec<TabBarAction> {
     let mut actions = Vec::new();
@@ -28,73 +30,101 @@ pub fn show(
                 // Clear the macOS traffic-light buttons overlaying the
                 // top-left corner (no title bar in compact chrome).
                 ui.add_space(76.0);
-                ui.spacing_mut().item_spacing.x = 3.0;
-                for (i, (label, attn)) in tabs.iter().enumerate() {
-                    let is_active = i == active;
-                    let text = RichText::new(format!("{}  {}", i + 1, label))
-                        .size(12.0)
-                        .color(if is_active { t.text } else { t.text_dim });
-                    let button = egui::Button::new(text)
-                        .fill(if is_active {
-                            t.tab_active_bg
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .corner_radius(CornerRadius::same(5))
-                        .min_size(Vec2::new(130.0, 24.0));
-                    let resp = ui.add(button);
-                    if resp.clicked() {
-                        actions.push(TabBarAction::Select(i));
-                    }
-                    if is_active {
-                        ui.painter().rect_filled(
-                            Rect::from_min_max(
-                                Pos2::new(resp.rect.min.x + 4.0, resp.rect.max.y - 2.0),
-                                Pos2::new(resp.rect.max.x - 4.0, resp.rect.max.y),
-                            ),
-                            CornerRadius::same(1),
-                            t.accent,
-                        );
-                    } else if resp.hovered() {
-                        ui.painter().rect_filled(
-                            resp.rect,
-                            CornerRadius::same(5),
-                            t.tab_hover_bg.gamma_multiply(0.5),
-                        );
-                    }
-                    // The badge dot rides the tab's top-right corner as a
-                    // painter overlay - no layout shift when it appears, no
-                    // collision with the agent "●" leading the label. It
-                    // paints after the hover wash so hovering (to read the
-                    // detail text) never hides it.
-                    if let Some((level, detail)) = attn {
-                        let (color, radius) = match level {
-                            attention::Level::Attention => {
-                                (t.status_warn, 3.0)
-                            },
-                            attention::Level::Activity => {
-                                (t.text_dim, 2.5)
-                            },
-                        };
-                        ui.painter().circle_filled(
-                            Pos2::new(
-                                resp.rect.max.x - 9.0,
-                                resp.rect.min.y + 8.0,
-                            ),
-                            radius,
-                            color,
-                        );
-                        let _ = resp.on_hover_text(detail);
-                    }
-                }
-                let plus = egui::Button::new(
-                    RichText::new("+").size(15.0).color(t.text_dim),
+                // Sidebar toggle (also cmd+\); tinted when the sidebar is open.
+                let toggle = egui::Button::new(
+                    RichText::new("☰").size(14.0).color(if sidebar_open {
+                        t.text
+                    } else {
+                        t.text_dim
+                    }),
                 )
-                .fill(Color32::TRANSPARENT)
+                .fill(if sidebar_open {
+                    t.tab_active_bg
+                } else {
+                    Color32::TRANSPARENT
+                })
                 .corner_radius(CornerRadius::same(5))
                 .min_size(Vec2::new(26.0, 24.0));
-                if ui.add(plus).clicked() {
-                    actions.push(TabBarAction::NewTab);
+                if ui
+                    .add(toggle)
+                    .on_hover_text("Toggle workspaces (cmd+\\)")
+                    .clicked()
+                {
+                    actions.push(TabBarAction::ToggleSidebar);
+                }
+                ui.add_space(4.0);
+                ui.spacing_mut().item_spacing.x = 3.0;
+                // The tab list and the workspace sidebar are two views of the
+                // same tabs; show the tabs here only while the sidebar is
+                // collapsed (the ☰/⚙ chrome and drag handle stay either way).
+                if !sidebar_open {
+                    for (i, (label, attn)) in tabs.iter().enumerate() {
+                        let is_active = i == active;
+                        let text = RichText::new(format!("{}  {}", i + 1, label))
+                            .size(12.0)
+                            .color(if is_active { t.text } else { t.text_dim });
+                        let button = egui::Button::new(text)
+                            .fill(if is_active {
+                                t.tab_active_bg
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(CornerRadius::same(5))
+                            .min_size(Vec2::new(130.0, 24.0));
+                        let resp = ui.add(button);
+                        if resp.clicked() {
+                            actions.push(TabBarAction::Select(i));
+                        }
+                        if is_active {
+                            ui.painter().rect_filled(
+                                Rect::from_min_max(
+                                    Pos2::new(resp.rect.min.x + 4.0, resp.rect.max.y - 2.0),
+                                    Pos2::new(resp.rect.max.x - 4.0, resp.rect.max.y),
+                                ),
+                                CornerRadius::same(1),
+                                t.accent,
+                            );
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(
+                                resp.rect,
+                                CornerRadius::same(5),
+                                t.tab_hover_bg.gamma_multiply(0.5),
+                            );
+                        }
+                        // The badge dot rides the tab's top-right corner as a
+                        // painter overlay - no layout shift when it appears, no
+                        // collision with the agent "●" leading the label. It
+                        // paints after the hover wash so hovering (to read the
+                        // detail text) never hides it.
+                        if let Some((level, detail)) = attn {
+                            let (color, radius) = match level {
+                                attention::Level::Attention => {
+                                    (t.status_warn, 3.0)
+                                },
+                                attention::Level::Activity => {
+                                    (t.text_dim, 2.5)
+                                },
+                            };
+                            ui.painter().circle_filled(
+                                Pos2::new(
+                                    resp.rect.max.x - 9.0,
+                                    resp.rect.min.y + 8.0,
+                                ),
+                                radius,
+                                color,
+                            );
+                            let _ = resp.on_hover_text(detail);
+                        }
+                    }
+                    let plus = egui::Button::new(
+                        RichText::new("+").size(15.0).color(t.text_dim),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .corner_radius(CornerRadius::same(5))
+                    .min_size(Vec2::new(26.0, 24.0));
+                    if ui.add(plus).clicked() {
+                        actions.push(TabBarAction::NewTab);
+                    }
                 }
                 let gear = egui::Button::new(
                     RichText::new("⚙").size(14.0).color(t.text_dim),

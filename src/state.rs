@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +12,18 @@ pub const VERSION: u32 = 1;
 pub struct StateFile {
     pub version: u32,
     pub windows: Vec<WindowState>,
+    /// Folder the workspace-creation popup pre-fills next time (the last one
+    /// a workspace was created in). Absent in pre-workspace state files.
+    #[serde(default)]
+    pub last_workspace_dir: Option<String>,
+    /// Whether the workspace sidebar is shown. Defaults on so the feature is
+    /// discoverable; toggled by cmd+\.
+    #[serde(default = "default_true")]
+    pub sidebar_open: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -29,6 +41,37 @@ pub struct TabState {
     pub id: String,
     pub tree: NodeState,
     pub focused_session: String,
+    /// Workspace metadata (folder, worktree, prompt, agent, AI title). None
+    /// for a bare shell tab (cmd+t) and for pre-workspace state files.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceState>,
+}
+
+/// Serde mirror of the GUI's `workspace::Workspace`; the layout's source of
+/// truth for a workspace lives here, alongside the split tree.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkspaceState {
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub worktree: Option<WorktreeState>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub created_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorktreeState {
+    pub path: PathBuf,
+    pub branch: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -70,9 +113,66 @@ impl NodeState {
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .expect("no config directory on this platform")
-        .join("muxterm")
+    dirs::home_dir()
+        .expect("no home directory on this platform")
+        .join(".muxterm")
+}
+
+/// One-time move of muxterm's state out of the old
+/// `~/Library/Application Support/muxterm/` into `~/.muxterm/`. Idempotent -
+/// a no-op once the new dir exists - so it is safe to call at the top of
+/// every launch of either binary (whichever runs first migrates). A rename is
+/// atomic when both paths share a volume (the common case on macOS); the
+/// recursive-copy fallback covers a cross-volume move. The tmux server is
+/// unaffected: its socket is name-keyed (`-L muxterm`), and tmux.conf is
+/// regenerated at launch regardless.
+pub fn migrate_config_dir() {
+    let new = config_dir();
+    if new.exists() {
+        return;
+    }
+    let Some(old) = dirs::config_dir().map(|d| d.join("muxterm")) else {
+        return;
+    };
+    if !old.exists() {
+        return;
+    }
+    if let Some(parent) = new.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if fs::rename(&old, &new).is_ok() {
+        log::info!("migrated config dir to {}", new.display());
+        return;
+    }
+    match copy_dir_recursive(&old, &new) {
+        Ok(()) => {
+            let _ = fs::remove_dir_all(&old);
+            log::info!("migrated config dir (copy) to {}", new.display());
+        },
+        Err(e) => log::warn!("could not migrate config dir: {e:#}"),
+    }
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+/// Directory holding all workspace git worktrees (`~/.muxterm/worktrees/`).
+/// Worktrees live outside their repos so the repo's own `git status` stays
+/// clean and no `.gitignore` handling is needed.
+pub fn worktrees_dir() -> PathBuf {
+    config_dir().join("worktrees")
 }
 
 pub fn state_path() -> PathBuf {
@@ -129,6 +229,8 @@ mod tests {
     fn state_round_trip() {
         let state = StateFile {
             version: VERSION,
+            last_workspace_dir: Some("/tmp/proj".into()),
+            sidebar_open: true,
             windows: vec![WindowState {
                 active_tab: 1,
                 tabs: vec![
@@ -138,6 +240,7 @@ mod tests {
                             session: "mux-aaaa".into(),
                         },
                         focused_session: "mux-aaaa".into(),
+                        workspace: None,
                     },
                     TabState {
                         id: "mux-tab-2222".into(),
@@ -152,6 +255,20 @@ mod tests {
                             }),
                         },
                         focused_session: "mux-cccc".into(),
+                        workspace: Some(WorkspaceState {
+                            root: Some("/tmp/proj".into()),
+                            title: "wire up auth".into(),
+                            description: None,
+                            prompt: "wire up auth".into(),
+                            worktree: Some(WorktreeState {
+                                path: "/home/u/.muxterm/worktrees/wire-up-auth"
+                                    .into(),
+                                branch: "wire-up-auth".into(),
+                            }),
+                            agent: Some("claude".into()),
+                            model: Some("sonnet".into()),
+                            created_at: 123,
+                        }),
                     },
                 ],
             }],
@@ -162,6 +279,10 @@ mod tests {
         assert_eq!(back.version, VERSION);
         assert_eq!(back.windows[0].active_tab, 1);
         assert_eq!(back.windows[0].tabs.len(), 2);
+        assert_eq!(back.last_workspace_dir.as_deref(), Some("/tmp/proj"));
+        let ws = back.windows[0].tabs[1].workspace.as_ref().unwrap();
+        assert_eq!(ws.title, "wire up auth");
+        assert_eq!(ws.worktree.as_ref().unwrap().branch, "wire-up-auth");
 
         let mut sessions = HashSet::new();
         for tab in &back.windows[0].tabs {
@@ -169,5 +290,29 @@ mod tests {
         }
         assert_eq!(sessions.len(), 3);
         assert!(sessions.contains("mux-cccc"));
+    }
+
+    // A pre-workspace state file has neither `workspace` on tabs nor the
+    // top-level `last_workspace_dir`/`sidebar_open`; serde defaults must fill
+    // them so an upgrade never drops a saved layout.
+    #[test]
+    fn pre_workspace_state_loads() {
+        let json = r#"{
+            "version": 1,
+            "windows": [{
+                "active_tab": 0,
+                "tabs": [{
+                    "id": "mux-tab-1111",
+                    "tree": {"Leaf": {"session": "mux-aaaa"}},
+                    "focused_session": "mux-aaaa"
+                }]
+            }]
+        }"#;
+        let s: StateFile = serde_json::from_str(json).unwrap();
+        assert_eq!(s.windows[0].tabs.len(), 1);
+        assert!(s.windows[0].tabs[0].workspace.is_none());
+        assert!(s.last_workspace_dir.is_none());
+        // Sidebar defaults on for discoverability.
+        assert!(s.sidebar_open);
     }
 }
