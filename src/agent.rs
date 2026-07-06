@@ -54,14 +54,18 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Probe through the user's login shell: muxterm's own env lacks brew/npm
-/// PATH entries when launched from Finder (the same reason TmuxCtl::discover
-/// probes fixed paths). Fails open on spawn errors - the shell in the pane
-/// prints its own "command not found".
+/// Probe through the user's interactive login shell: muxterm's own env lacks
+/// brew/npm PATH entries when launched from Finder (the same reason
+/// TmuxCtl::discover probes fixed paths). The `-i` is load-bearing: zsh only
+/// sources `.zshrc` for *interactive* shells, and most users put their PATH
+/// there (not `.zprofile`), so a plain `-lc` probe misses `~/.local/bin` and
+/// the like - which is exactly where `claude` tends to live. This matches the
+/// pane's own interactive shell, where `mux ask` actually runs. Fails open on
+/// spawn errors - the shell in the pane prints its own "command not found".
 pub fn binary_available(bin: &str) -> bool {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     Command::new(shell)
-        .args(["-lc", &format!("command -v {bin}")])
+        .args(["-ilc", &format!("command -v {bin}")])
         .output()
         .map(|out| out.status.success())
         .unwrap_or(true)
