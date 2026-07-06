@@ -43,6 +43,11 @@ const PANE_GAP: f32 = 4.0;
 /// ungated); a confused agent must not be able to shred the layout.
 const AGENT_SPLIT_MAX_PANES: usize = 8;
 
+/// How recently a pane must have produced output to count as "working" on
+/// the sidebar. Agents stream near-continuously; this bridges brief gaps
+/// (a model thinking) without keeping the light on after it finishes.
+const WORKING_WINDOW: Duration = Duration::from_secs(3);
+
 pub struct Tab {
     /// Stable id (`mux-tab-<8hex>`) scoping the agent mesh to this tab.
     pub tab_id: String,
@@ -280,6 +285,7 @@ impl App {
                 LineTracker::Known(0)
             },
             attn: attention::Cell::new(Instant::now()),
+            last_output: None,
         })
     }
 
@@ -819,6 +825,8 @@ impl App {
                     if let Some((tab_idx, pane)) =
                         self.pane_and_tab_mut(backend_id)
                     {
+                        // Focus-independent, for the "working" dot.
+                        pane.last_output = Some(Instant::now());
                         if tab_idx != active || !focused {
                             pane.attn.output(Instant::now());
                         }
@@ -1434,7 +1442,7 @@ impl eframe::App for App {
         // CentralPanel. Rows are newest-first; `tab_index` maps a click back
         // to the real tab regardless of display order.
         if self.sidebar_open {
-            let mut rows: Vec<sidebar::Row> = self
+            let rows: Vec<sidebar::Row> = self
                 .tabs
                 .iter()
                 .enumerate()
@@ -1453,21 +1461,35 @@ impl eframe::App for App {
                         // A bare tab's title is already the folder name; don't
                         // echo it as the subtitle.
                         .filter(|s| *s != ws.title);
+                    // "Working" = an agent tab (launched with an agent, or
+                    // holding a mesh-registered pane) that produced output
+                    // very recently - a live streaming signal, focus-independent.
+                    let is_agent_tab = ws.agent.is_some()
+                        || tab
+                            .panes
+                            .values()
+                            .any(|p| self.agents.contains_key(&p.session));
+                    let recent = tab.panes.values().any(|p| {
+                        p.last_output
+                            .is_some_and(|o| o.elapsed() < WORKING_WINDOW)
+                    });
                     sidebar::Row {
                         tab_index: i,
                         title: ws.title.clone(),
                         subtitle,
                         active: i == self.active,
+                        working: is_agent_tab && recent,
                     }
                 })
                 .collect();
-            rows.sort_by(|a, b| {
-                let (ca, cb) = (
-                    self.tabs[a.tab_index].workspace.created_at,
-                    self.tabs[b.tab_index].workspace.created_at,
-                );
-                cb.cmp(&ca).then(b.tab_index.cmp(&a.tab_index))
-            });
+            // Rows stay in tab order (top = tab 1), so the list matches
+            // cmd+1..9 and the tab-switch chords: NextTab (cmd+]) increments
+            // the active index and moves the highlight *down*, PrevTab up.
+            // Keep the dots current: while anything is working, re-evaluate
+            // soon so a finished agent's light goes out promptly.
+            if rows.iter().any(|r| r.working) {
+                ctx.request_repaint_after(Duration::from_millis(600));
+            }
             for action in sidebar::show(ctx, &rows, &self.font, &self.ui_theme) {
                 match action {
                     SidebarAction::Select(i) => {

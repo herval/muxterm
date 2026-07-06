@@ -25,6 +25,8 @@ pub struct Row {
     pub title: String,
     pub subtitle: Option<String>,
     pub active: bool,
+    /// An agent in this workspace produced output recently - light the dot.
+    pub working: bool,
 }
 
 pub fn show(
@@ -107,14 +109,21 @@ fn workspace_row(
     let title_color = if row.active { t.text } else { t.text_dim };
     let pad = Vec2::new(8.0, 5.0);
 
+    // The leading dot doubles as the status light: theme green while an agent
+    // is actively working, the accent otherwise.
+    let (dot_color, dot_scale) = if row.working {
+        (t.status_ok, 0.72)
+    } else {
+        (t.accent, 0.6)
+    };
     let mut job = LayoutJob::default();
     job.wrap.max_width = (ui.available_width() - pad.x * 2.0).max(1.0);
     job.append(
         "● ",
         0.0,
         TextFormat::simple(
-            FontId::new(font.size * 0.6, font.family.clone()),
-            t.accent,
+            FontId::new(font.size * dot_scale, font.family.clone()),
+            dot_color,
         ),
     );
     job.append(&row.title, 0.0, TextFormat::simple(font.clone(), title_color));
