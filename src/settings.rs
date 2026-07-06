@@ -32,6 +32,7 @@ pub struct Outcome {
     pub agent: Option<&'static str>,
     pub copy_on_select: Option<bool>,
     pub pane_titles: Option<bool>,
+    pub git_status: Option<bool>,
     pub pr_status: Option<bool>,
     pub notifications: Option<bool>,
     pub font_size: Option<f32>,
@@ -46,6 +47,7 @@ pub fn show(
     agent: &'static Agent,
     copy_on_select: bool,
     pane_titles: bool,
+    git_status: bool,
     pr_status: bool,
     notifications: bool,
 ) -> Outcome {
@@ -119,6 +121,22 @@ pub fn show(
                 out.pane_titles = Some(!pane_titles);
             }
             grid.hint(ui, "name chip in each pane's corner");
+
+            grid.divider(ui, "Git", th.accent);
+            let mark = if git_status { "[x]" } else { "[ ]" };
+            let row = grid.body(
+                ui,
+                vec![
+                    (mark.to_string(), th.accent),
+                    (" branch status on tabs".to_string(), th.text),
+                ],
+                true,
+                false,
+            );
+            if row.clicked() {
+                out.git_status = Some(!git_status);
+            }
+            grid.hint(ui, "branch + dirty/ahead-behind state");
 
             grid.divider(ui, "GitHub", th.accent);
             let mark = if pr_status { "[x]" } else { "[ ]" };
@@ -462,6 +480,7 @@ mod tests {
                 agent::default_agent(),
                 true,
                 true,
+                true,
                 false,
                 true,
             );
@@ -554,6 +573,7 @@ mod tests {
                 &font,
                 "iterm-dark",
                 agent::default_agent(),
+                true,
                 true,
                 true,
                 false,

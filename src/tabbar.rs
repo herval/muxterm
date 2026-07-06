@@ -4,6 +4,7 @@ use egui::{
 };
 
 use crate::attention;
+use crate::git_status::Git;
 use crate::pr_status::Badge;
 use crate::theme::UiTheme;
 
@@ -13,10 +14,14 @@ pub enum TabBarAction {
     OpenSettings,
 }
 
-/// Per-tab render data: label, PR chip, and the activity/attention dot
-/// (level plus its hover text).
-pub type TabInfo =
-    (String, Option<Badge>, Option<(attention::Level, String)>);
+/// Per-tab render data: label, git-branch chip, PR chip, and the
+/// activity/attention dot (level plus its hover text).
+pub type TabInfo = (
+    String,
+    Option<Git>,
+    Option<Badge>,
+    Option<(attention::Level, String)>,
+);
 
 pub fn show(
     ctx: &egui::Context,
@@ -34,7 +39,9 @@ pub fn show(
                 // top-left corner (no title bar in compact chrome).
                 ui.add_space(76.0);
                 ui.spacing_mut().item_spacing.x = 3.0;
-                for (i, (label, badge, attn)) in tabs.iter().enumerate() {
+                for (i, (label, git, badge, attn)) in
+                    tabs.iter().enumerate()
+                {
                     let is_active = i == active;
                     let text = RichText::new(format!("{}  {}", i + 1, label))
                         .size(12.0)
@@ -90,6 +97,18 @@ pub fn show(
                             color,
                         );
                         let _ = resp.on_hover_text(detail);
+                    }
+                    // The tab's git chip: display-only (nothing to open),
+                    // so a plain hover-sensing label with the state tooltip.
+                    if let Some(g) = git {
+                        let base = if is_active { t.text } else { t.text_dim };
+                        let job =
+                            g.chip_job(FontId::proportional(11.0), base, t);
+                        ui.add(
+                            egui::Label::new(job)
+                                .sense(egui::Sense::hover()),
+                        )
+                        .on_hover_text(&g.detail);
                     }
                     // The tab's PR chip: its own button, so clicking it
                     // opens the PR page instead of selecting the tab.

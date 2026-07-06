@@ -4,6 +4,7 @@ mod ai_prompt;
 mod app;
 mod attention;
 mod config;
+mod git_status;
 mod keys;
 mod links;
 mod pane;

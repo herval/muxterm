@@ -24,6 +24,7 @@ use crate::config;
 use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
 use muxterm::mesh;
+use crate::git_status;
 use crate::pane::Pane;
 use crate::pr_status;
 use crate::search::{self, SearchBar, SearchOp};
@@ -92,6 +93,12 @@ pub struct App {
     pr_rx: Receiver<HashMap<String, pr_status::Badge>>,
     pr_enabled: Arc<AtomicBool>,
     pr_status: bool,
+    /// session -> git branch/dirty state (config `git_status`), streamed in
+    /// by the git_status poller thread; the atomic gates that thread live.
+    git: HashMap<String, git_status::Git>,
+    git_rx: Receiver<HashMap<String, git_status::Git>>,
+    git_enabled: Arc<AtomicBool>,
+    git_status: bool,
     /// Dock bounce + banner on bell/`mux notify` while unfocused
     /// (config `notifications`); tab badges are not gated by this.
     notifications: bool,
@@ -119,6 +126,9 @@ impl App {
         let (pr_tx, pr_rx) = mpsc::channel();
         let pr_enabled = Arc::new(AtomicBool::new(style.pr_status));
         pr_status::spawn(cc.egui_ctx.clone(), pr_tx, pr_enabled.clone());
+        let (git_tx, git_rx) = mpsc::channel();
+        let git_enabled = Arc::new(AtomicBool::new(style.git_status));
+        git_status::spawn(cc.egui_ctx.clone(), git_tx, git_enabled.clone());
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -147,6 +157,10 @@ impl App {
             pr_rx,
             pr_enabled,
             pr_status: style.pr_status,
+            git: HashMap::new(),
+            git_rx,
+            git_enabled,
+            git_status: style.git_status,
             notifications: style.notifications,
         };
 
@@ -790,11 +804,16 @@ impl App {
         self.agent_context_lines = style.agent_context_lines;
         self.pr_status = style.pr_status;
         self.pr_enabled.store(style.pr_status, Ordering::Relaxed);
+        self.git_status = style.git_status;
+        self.git_enabled.store(style.git_status, Ordering::Relaxed);
         self.notifications = style.notifications;
         if !style.pr_status {
             // The poller also sends a clearing snapshot, but drop the
             // badges now so the toggle feels instant.
             self.pr.clear();
+        }
+        if !style.git_status {
+            self.git.clear();
         }
         self.copy_on_select = style.copy_on_select;
         // The drag-end side of copy-on-select and the cmd+f search
@@ -1030,6 +1049,7 @@ impl App {
             self.agent,
             self.copy_on_select,
             self.pane_titles,
+            self.git_status,
             self.pr_status,
             self.notifications,
         );
@@ -1048,6 +1068,10 @@ impl App {
         }
         if let Some(on) = out.pane_titles {
             config::set_pane_titles(on);
+            self.reload_config(ctx);
+        }
+        if let Some(on) = out.git_status {
+            config::set_git_status(on);
             self.reload_config(ctx);
         }
         if let Some(on) = out.pr_status {
@@ -1138,6 +1162,9 @@ impl eframe::App for App {
         while let Ok(snapshot) = self.pr_rx.try_recv() {
             self.pr = snapshot;
         }
+        while let Ok(snapshot) = self.git_rx.try_recv() {
+            self.git = snapshot;
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Sessions deliberately survive: dropping the app only detaches
@@ -1155,10 +1182,12 @@ impl eframe::App for App {
                     pane.and_then(|p| self.agents.get(&p.session)),
                     pane.map(|p| p.title.as_str()).unwrap_or("shell"),
                 );
+                let git =
+                    pane.and_then(|p| self.git.get(&p.session)).cloned();
                 let badge =
                     pane.and_then(|p| self.pr.get(&p.session)).cloned();
                 let attn = self.tab_attention(tab);
-                (label, badge, attn)
+                (label, git, badge, attn)
             })
             .collect();
         for action in tabbar::show(ctx, &labels, self.active, &self.ui_theme) {
@@ -1225,6 +1254,7 @@ impl eframe::App for App {
                                     ui,
                                     *rect,
                                     &label,
+                                    self.git.get(&pane.session),
                                     self.pr.get(&pane.session),
                                     *id,
                                     *id == tab.focused,
@@ -1559,12 +1589,15 @@ fn draw_search_bar(
 }
 
 /// Small badge naming what a pane runs, drawn over its top-right corner,
-/// plus the pane's PR chip to its left when pr_status is on. Only split
-/// tabs get badges; a lone pane's title is already in the tab bar.
+/// plus the pane's git-branch and PR chips growing leftward from it when
+/// those features are on. Only split tabs get badges; a lone pane's title
+/// is already in the tab bar.
+#[allow(clippy::too_many_arguments)]
 fn draw_pane_title(
     ui: &egui::Ui,
     pane_rect: Rect,
     label: &str,
+    git: Option<&git_status::Git>,
     pr: Option<&pr_status::Badge>,
     pane: PaneId,
     focused: bool,
@@ -1606,41 +1639,63 @@ fn draw_pane_title(
     );
     painter.galley(rect.min + pad, galley, color);
 
-    let Some(b) = pr else {
-        return;
+    // Chips grow leftward from the title box; `left` tracks the current
+    // leftmost drawn edge, and a chip that would spill past the pane's left
+    // edge is dropped rather than clipped. PR sits nearest the title, the
+    // git chip beyond it (same left-to-right order as the tab bar).
+    let mut left = rect.min.x;
+    let chip_rect = |galley_size: Vec2, left: f32| {
+        Rect::from_min_size(
+            egui::pos2(left - galley_size.x - pad.x * 2.0 - 4.0, pane_rect.min.y + 4.0),
+            galley_size + pad * 2.0,
+        )
     };
-    let mut job = LayoutJob::default();
-    job.append(
-        "\u{25CF} ",
-        0.0,
-        TextFormat::simple(font.clone(), b.kind.color(theme)),
-    );
-    job.append(
-        &format!("#{}", b.number),
-        0.0,
-        TextFormat::simple(font, color),
-    );
-    let galley = ui.fonts(|f| f.layout_job(job));
-    let size = galley.size() + pad * 2.0;
-    let chip = Rect::from_min_size(
-        egui::pos2(rect.min.x - size.x - 4.0, pane_rect.min.y + 4.0),
-        size,
-    );
-    if chip.min.x < pane_rect.min.x + 4.0 {
-        return; // pane too narrow for a second chip
+
+    if let Some(b) = pr {
+        let mut job = LayoutJob::default();
+        job.append(
+            "\u{25CF} ",
+            0.0,
+            TextFormat::simple(font.clone(), b.kind.color(theme)),
+        );
+        job.append(
+            &format!("#{}", b.number),
+            0.0,
+            TextFormat::simple(font.clone(), color),
+        );
+        let galley = ui.fonts(|f| f.layout_job(job));
+        let chip = chip_rect(galley.size(), left);
+        if chip.min.x >= pane_rect.min.x + 4.0 {
+            painter.rect_filled(
+                chip,
+                CornerRadius::same(3),
+                theme.bg.gamma_multiply(0.8),
+            );
+            painter.galley(chip.min + pad, galley, color);
+            let resp = ui
+                .interact(chip, ui.id().with(("pr-chip", pane)), Sense::click())
+                .on_hover_text(&b.detail)
+                .on_hover_cursor(CursorIcon::PointingHand);
+            if resp.clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&b.url));
+            }
+            left = chip.min.x;
+        }
     }
-    painter.rect_filled(
-        chip,
-        CornerRadius::same(3),
-        theme.bg.gamma_multiply(0.8),
-    );
-    painter.galley(chip.min + pad, galley, color);
-    let resp = ui
-        .interact(chip, ui.id().with(("pr-chip", pane)), Sense::click())
-        .on_hover_text(&b.detail)
-        .on_hover_cursor(CursorIcon::PointingHand);
-    if resp.clicked() {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(&b.url));
+
+    if let Some(g) = git {
+        let galley = ui.fonts(|f| f.layout_job(g.chip_job(font, color, theme)));
+        let chip = chip_rect(galley.size(), left);
+        if chip.min.x >= pane_rect.min.x + 4.0 {
+            painter.rect_filled(
+                chip,
+                CornerRadius::same(3),
+                theme.bg.gamma_multiply(0.8),
+            );
+            painter.galley(chip.min + pad, galley, color);
+            ui.interact(chip, ui.id().with(("git-chip", pane)), Sense::hover())
+                .on_hover_text(&g.detail);
+        }
     }
 }
 

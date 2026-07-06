@@ -102,6 +102,17 @@ stdin, so it sees what you were just doing. Questions default to a fast
 model (`haiku` for claude); set `agent_model` in config.toml to trade speed
 for depth. `mux ask` also works from any plain terminal.
 
+## Git status
+
+Every tab whose focused pane sits in a git checkout shows its branch next
+to the title (on by default; `git_status` in settings or config.toml turns
+it off): a state dot — green when the tree is clean, yellow when dirty —
+the branch name, then compact `*N` (changed + untracked files), `↑N`
+(commits ahead of upstream) and `↓N` (behind) markers. Hover for the
+breakdown. Split tabs get the same chip per pane, so panes in different
+worktrees or branches read at a glance. It's all local `git status`, no
+network, scanned every few seconds; a detached HEAD shows the short commit.
+
 ## PR status
 
 Every tab whose focused pane sits in a git checkout shows that branch's

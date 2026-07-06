@@ -41,6 +41,10 @@ agent = "claude"
 # select"). When off, select then copy explicitly with cmd+c.
 copy_on_select = true
 
+# Show the pane's git branch beside the tab title with dirty/ahead-behind
+# markers (● branch *changed ↑ahead ↓behind). Local git only, no network.
+# git_status = true
+
 # Show the current branch's GitHub PR beside the tab title (status dot +
 # number; click opens the PR page). Needs the gh CLI, authenticated.
 # pr_status = true
@@ -81,6 +85,8 @@ pub struct ConfigFile {
     pub pane_titles: bool,
     /// Mouse selections copy to the clipboard as soon as they finish.
     pub copy_on_select: bool,
+    /// Badge each pane's git branch + dirty/ahead-behind state on the tab.
+    pub git_status: bool,
     /// Poll `gh` for the current branch's PR and badge it on the tab.
     pub pr_status: bool,
     /// Dock bounce + banner on bell/`mux notify` while unfocused.
@@ -98,6 +104,7 @@ impl Default for ConfigFile {
             dim_inactive_panes: 0.12,
             pane_titles: true,
             copy_on_select: true,
+            git_status: true,
             pr_status: true,
             notifications: true,
             font: FontConfig::default(),
@@ -131,6 +138,7 @@ pub struct Style {
     pub agent_context_lines: u32,
     pub pane_titles: bool,
     pub copy_on_select: bool,
+    pub git_status: bool,
     pub pr_status: bool,
     pub notifications: bool,
 }
@@ -215,6 +223,7 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             agent_context_lines: cfg.agent_context_lines,
             pane_titles: cfg.pane_titles,
             copy_on_select: cfg.copy_on_select,
+            git_status: cfg.git_status,
             pr_status: cfg.pr_status,
             notifications: cfg.notifications,
         },
@@ -302,6 +311,18 @@ pub fn set_pane_titles(on: bool) {
         replace_top_level_line(&text, "pane_titles", &line),
     ) {
         log::warn!("could not save pane_titles: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's git-status checkbox.
+pub fn set_git_status(on: bool) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("git_status = {on}");
+    if let Err(e) = fs::write(
+        path(),
+        replace_top_level_line(&text, "git_status", &line),
+    ) {
+        log::warn!("could not save git_status: {e:#}");
     }
 }
 
@@ -541,6 +562,15 @@ mod tests {
         assert!(!cfg.pr_status);
         let (style, _) = resolve(&cfg);
         assert!(!style.pr_status);
+    }
+
+    #[test]
+    fn git_status_defaults_on_and_parses() {
+        assert!(ConfigFile::default().git_status);
+        let cfg: ConfigFile = toml::from_str("git_status = false").unwrap();
+        assert!(!cfg.git_status);
+        let (style, _) = resolve(&cfg);
+        assert!(!style.git_status);
     }
 
     #[test]
