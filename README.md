@@ -120,7 +120,7 @@ every few seconds; GitHub itself is asked at most once per minute per
 **edits apply live** while the app is running):
 
 ```toml
-theme = "iterm-dark"   # dracula | solarized-dark | gruvbox-dark |
+theme = "iterm-dark"   # dracula | solarized-dark | gruvbox-dark | bbs |
                        # iterm-light | solarized-light | github-light
 agent = "claude"       # "?" prompt agent: claude | codex
 agent_model = ""       # --model for "?" answers; empty = fast default

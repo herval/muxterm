@@ -37,6 +37,7 @@ pub const PRESET_NAMES: &[&str] = &[
     "dracula",
     "solarized-dark",
     "gruvbox-dark",
+    "bbs",
     "iterm-light",
     "solarized-light",
     "github-light",
@@ -86,6 +87,27 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 "#b16286", "#689d6a", "#a89984", "#928374", "#fb4934",
                 "#b8bb26", "#fabd2f", "#83a598", "#d3869b", "#8ec07c",
                 "#ebdbb2",
+            ],
+        }),
+        // The DOS/VGA text-mode 16-color palette on a pure-black CRT
+        // screen — the colors BBS ANSI art was drawn with — but with the
+        // default text glowing phosphor-green like a green-screen terminal
+        // and a bright-cyan accent (the color those box-drawing borders and
+        // headers loved most). The deviation from stock CGA: the darkest
+        // slots are lifted off the floor for readability on pure black —
+        // #0000aa "DOS blue", #aa0000 red, and #555555 gray all bottom out
+        // in luminance and turn to mud, so blue becomes a deep cornflower,
+        // red a brighter scarlet, and the dim gray a legible mid-gray, each
+        // keeping its hue without the eye strain.
+        "bbs" => Some(&Preset {
+            bg: "#000000",
+            fg: "#33ff33",
+            accent: "#55ffff",
+            ansi: [
+                "#000000", "#e03c3c", "#00aa00", "#aa5500", "#3b6fd4",
+                "#aa00aa", "#00aaaa", "#aaaaaa", "#808080", "#ff5555",
+                "#55ff55", "#ffff55", "#6f8fff", "#ff55ff", "#55ffff",
+                "#ffffff",
             ],
         }),
         "iterm-light" => Some(&Preset {
@@ -253,12 +275,21 @@ pub fn build(
         ),
         text_dim: blend(fg, bg, 0.45),
         accent,
-        dim_overlay: Color32::from_rgba_unmultiplied(
-            bg.r(),
-            bg.g(),
-            bg.b(),
-            (dim_inactive.clamp(0.0, 0.8) * 255.0) as u8,
-        ),
+        // A wash of the background recedes inactive panes. The same alpha
+        // reads far weaker on dark themes — a near-black pour barely touches
+        // the sparse bright glyphs, while on a light bg it drops the
+        // contrast of dark text hard — so dark mode needs a heavier pour to
+        // recede as convincingly. (Same light/dark asymmetry as tab_bar_bg.)
+        dim_overlay: {
+            let a = dim_inactive.clamp(0.0, 0.8);
+            let a = if light { a } else { (a * 5.0).min(0.9) };
+            Color32::from_rgba_unmultiplied(
+                bg.r(),
+                bg.g(),
+                bg.b(),
+                (a * 255.0) as u8,
+            )
+        },
         status_ok: parse_hex(&get("green")).unwrap(),
         status_warn: parse_hex(&get("yellow")).unwrap(),
         status_err: parse_hex(&get("red")).unwrap(),
