@@ -112,6 +112,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
             Ok(())
         },
         "ask" => cmd_ask(rest),
+        "approve" => cmd_approve(),
         "whoami" => cmd_whoami(as_session, json),
         "join" => cmd_join(as_session, rest),
         "run" => cmd_run(as_session, rest),
@@ -540,6 +541,13 @@ fn cmd_ask(mut args: Vec<String>) -> CmdResult {
     let code = ask::run(agent, model.as_deref(), &query)
         .map_err(|e| (EXIT_NOT_FOUND, e))?;
     std::process::exit(code);
+}
+
+/// Internal: claude's PreToolUse approval hook for `mux ask`. Reads the tool
+/// call on stdin, asks the human on the pane's terminal, prints allow/deny.
+/// Not for direct use - wired in by `ask::run` via `--settings`.
+fn cmd_approve() -> CmdResult {
+    ask::approve().map_err(|e| (EXIT_USAGE, format!("approve: {e}")))
 }
 
 fn cmd_whoami(as_session: Option<String>, json: bool) -> CmdResult {

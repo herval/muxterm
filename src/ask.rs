@@ -8,8 +8,11 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -80,8 +83,15 @@ pub fn run(
         return Ok(cmd.status().map_err(spawn_err)?.code().unwrap_or(1));
     }
 
+    // The approver must outlive the whole stream: claude may ask for a tool
+    // at any point. It removes its socket on drop, when `run` returns.
+    let approver = Approver::start();
     let mut cmd = Command::new(agent.bin);
     cmd.args(claude_args(model, !io::stdin().is_terminal()));
+    if let (Some(ap), Some(settings)) = (&approver, approval_settings()) {
+        cmd.args(["--settings", &settings]);
+        cmd.env("MUX_APPROVE_SOCK", &ap.sock_path);
+    }
     cmd.arg(query);
     cmd.stdout(Stdio::piped());
     let mut child = cmd.spawn().map_err(spawn_err)?;
@@ -107,11 +117,11 @@ pub fn run(
 /// stream-json is the only print-mode format that exposes tool calls, and
 /// it requires --verbose; --include-partial-messages adds the text deltas
 /// that make the answer stream instead of landing all at once.
-/// --dangerously-skip-permissions is what lets the agent actually *act*: in
-/// headless `-p` mode there is no prompt to approve a Bash/Edit/Write, so
-/// without it every such tool is auto-denied and the model can only answer
-/// in prose. The pane is the user's own interactive shell - the same place
-/// they would run claude by hand - so full tool access is the intent.
+/// --dangerously-skip-permissions turns off the headless auto-deny that
+/// would otherwise block every Bash/Edit/Write (there is no prompt to
+/// approve in `-p` mode). Approval is reinstated *selectively* by the
+/// PreToolUse hook wired in `run` (see [`approval_settings`]): read-only
+/// tools run freely, mutating ones ask on /dev/tty first.
 fn claude_args(model: Option<&str>, with_context: bool) -> Vec<String> {
     let mut args =
         vec!["-p".to_string(), "--dangerously-skip-permissions".to_string()];
@@ -131,6 +141,168 @@ fn claude_args(model: Option<&str>, with_context: bool) -> Vec<String> {
         .map(String::from),
     );
     args
+}
+
+/// The mutating tools gated behind an interactive y/N: shell commands and
+/// file writes. Anchored so `Write` matches only the Write tool, never
+/// TodoWrite. Read-only tools (Read, Grep, Glob, ...) stay unmatched and
+/// run without a prompt - approving each one would drown the useful gates.
+const GATED_TOOLS: &str = "^(Bash|Edit|Write|MultiEdit|NotebookEdit)$";
+
+/// The `--settings` payload that makes claude ask before it acts: a
+/// PreToolUse hook on [`GATED_TOOLS`] that shells out to `mux approve`
+/// (this same binary), which prompts on /dev/tty and answers allow/deny.
+/// None only if the running executable can't be located, in which case the
+/// agent falls back to unattended `--dangerously-skip-permissions`.
+fn approval_settings() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let hook =
+        format!("{} approve", agent::shell_quote(&exe.display().to_string()));
+    Some(approval_settings_json(&hook))
+}
+
+fn approval_settings_json(hook_command: &str) -> String {
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": GATED_TOOLS,
+                // Generous: the timer runs while the human decides, and a
+                // hook timeout must not silently let the command through.
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_command,
+                    "timeout": 600,
+                }],
+            }],
+        },
+    })
+    .to_string()
+}
+
+/// The body behind `mux approve` - claude's PreToolUse hook. Reads the tool
+/// call as JSON on stdin and prints the allow/deny decision claude reads
+/// back. Claude runs hooks in a fresh session with *no controlling
+/// terminal*, so the hook cannot prompt on /dev/tty itself; it relays the
+/// request over a unix socket to the `mux ask` parent, which owns the pane
+/// and does the asking. Fails closed: no socket, dead parent, or unreadable
+/// input all deny, so an unapproved command never runs by default.
+pub fn approve() -> io::Result<()> {
+    let mut payload = String::new();
+    let _ = io::stdin().read_to_string(&mut payload);
+    let v: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+    let tool = v["tool_name"].as_str().unwrap_or("tool");
+    let summary = args_summary(&v["tool_input"].to_string());
+
+    let approved = relay(tool, &summary).unwrap_or(false);
+    println!("{}", decision(approved));
+    Ok(())
+}
+
+/// Hook side of the relay: hand the tool over to the `mux ask` parent named
+/// by `MUX_APPROVE_SOCK` and wait for its verdict.
+fn relay(tool: &str, summary: &str) -> io::Result<bool> {
+    let path = std::env::var("MUX_APPROVE_SOCK").map_err(|_| {
+        io::Error::new(io::ErrorKind::NotFound, "no approval socket")
+    })?;
+    relay_on(&path, tool, summary)
+}
+
+fn relay_on(sock: &str, tool: &str, summary: &str) -> io::Result<bool> {
+    let stream = UnixStream::connect(sock)?;
+    let req = serde_json::json!({ "tool": tool, "summary": summary });
+    writeln!(&stream, "{req}")?;
+    let mut resp = String::new();
+    BufReader::new(&stream).read_line(&mut resp)?;
+    Ok(resp.trim() == "allow")
+}
+
+/// Bridges claude's terminal-less hook back to the human. Lives in the
+/// `mux ask` process - the pane's foreground job, which *does* own the
+/// controlling terminal - and answers relay requests by prompting on
+/// /dev/tty. The listener thread dies with the process; the socket file is
+/// unlinked on drop.
+struct Approver {
+    sock_path: PathBuf,
+}
+
+impl Approver {
+    /// None if the socket can't be bound - the caller then leaves the hook
+    /// unwired and the agent runs unattended rather than denying blindly.
+    fn start() -> Option<Self> {
+        let sock_path = std::env::temp_dir()
+            .join(format!("mux-approve-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).ok()?;
+        thread::spawn(move || serve(&listener));
+        Some(Self { sock_path })
+    }
+}
+
+impl Drop for Approver {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.sock_path);
+    }
+}
+
+/// One approval per connection. Claude runs tools serially - it blocks on
+/// each hook - so requests arrive one at a time and never race the stream
+/// for the terminal.
+fn serve(listener: &UnixListener) {
+    for stream in listener.incoming().flatten() {
+        let _ = handle_request(stream);
+    }
+}
+
+fn handle_request(stream: UnixStream) -> io::Result<()> {
+    let mut req = String::new();
+    BufReader::new(&stream).read_line(&mut req)?;
+    let v: Value = serde_json::from_str(&req).unwrap_or(Value::Null);
+    let tool = v["tool"].as_str().unwrap_or("tool");
+    let summary = v["summary"].as_str().unwrap_or("");
+    let verdict = if ask_tty(tool, summary).unwrap_or(false) {
+        "allow"
+    } else {
+        "deny"
+    };
+    writeln!(&stream, "{verdict}")
+}
+
+/// Prompt on /dev/tty - not stdin, which carries the piped scrollback - and
+/// read a line. Any answer starting with y/Y approves; everything else
+/// (including a bare Enter) skips.
+fn ask_tty(tool: &str, summary: &str) -> io::Result<bool> {
+    let mut tty =
+        fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    write!(tty, "{}", approval_prompt(tool, summary))?;
+    tty.flush()?;
+    let mut line = String::new();
+    BufReader::new(tty).read_line(&mut line)?;
+    Ok(matches!(line.trim_start().bytes().next(), Some(b'y' | b'Y')))
+}
+
+fn approval_prompt(tool: &str, summary: &str) -> String {
+    let what = match summary {
+        "" => tool.to_string(),
+        s => format!("{tool} {s}"),
+    };
+    format!("\n\x1b[1;33m▸ approve\x1b[0m {what} \x1b[2m[y/N]\x1b[0m ")
+}
+
+/// The PreToolUse decision object claude reads from the hook's stdout.
+fn decision(approved: bool) -> String {
+    let (verdict, reason) = if approved {
+        ("allow", "approved in pane")
+    } else {
+        ("deny", "not approved in pane")
+    };
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": verdict,
+            "permissionDecisionReason": reason,
+        },
+    })
+    .to_string()
 }
 
 /// Renders claude's stream-json lines for a terminal: answer text streams
@@ -437,6 +609,76 @@ mod tests {
                 "{DIM}»   ⎿ cat: no such file or directory{RESET}\nplain warning\n"
             )
         );
+    }
+
+    #[test]
+    fn approval_settings_wire_the_hook_on_mutating_tools() {
+        let json = approval_settings_json("'/opt/mux' approve");
+        let v: Value = serde_json::from_str(&json).unwrap();
+        let hook = &v["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["matcher"], GATED_TOOLS);
+        assert_eq!(hook["hooks"][0]["command"], "'/opt/mux' approve");
+        assert_eq!(hook["hooks"][0]["type"], "command");
+        // The matcher gates the Write tool but not TodoWrite.
+        let re = regex_lite(GATED_TOOLS);
+        assert!(re("Bash") && re("Write") && re("NotebookEdit"));
+        assert!(!re("TodoWrite") && !re("Read") && !re("WebFetch"));
+    }
+
+    /// Just enough of the anchored-alternation matcher to assert intent
+    /// without a regex dep: `^(a|b|c)$` means exact membership.
+    fn regex_lite(pattern: &str) -> impl Fn(&str) -> bool {
+        let inner = pattern
+            .trim_start_matches("^(")
+            .trim_end_matches(")$")
+            .split('|')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        move |s: &str| inner.iter().any(|p| p == s)
+    }
+
+    #[test]
+    fn decision_maps_to_allow_or_deny() {
+        let allow: Value = serde_json::from_str(&decision(true)).unwrap();
+        assert_eq!(
+            allow["hookSpecificOutput"]["permissionDecision"],
+            "allow"
+        );
+        let deny: Value = serde_json::from_str(&decision(false)).unwrap();
+        assert_eq!(deny["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(deny["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    }
+
+    #[test]
+    fn relay_round_trips_request_and_verdict() {
+        let sock = std::env::temp_dir()
+            .join(format!("mux-approve-test-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = thread::spawn(move || {
+            let mut verdicts = ["allow\n", "deny\n"].into_iter();
+            for stream in listener.incoming().flatten().take(2) {
+                let mut req = String::new();
+                BufReader::new(&stream).read_line(&mut req).unwrap();
+                let v: Value = serde_json::from_str(&req).unwrap();
+                assert_eq!(v["tool"], "Bash");
+                write!(&stream, "{}", verdicts.next().unwrap()).unwrap();
+            }
+        });
+        let path = sock.display().to_string();
+        assert!(relay_on(&path, "Bash", "echo hi").unwrap());
+        assert!(!relay_on(&path, "Bash", "rm -rf /").unwrap());
+        server.join().unwrap();
+        let _ = fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn approval_prompt_names_the_tool_and_summary() {
+        let p = approval_prompt("Bash", "git push --force");
+        assert!(p.contains("Bash git push --force"));
+        assert!(p.contains("[y/N]"));
+        // No summary: just the tool name, no trailing space before the tag.
+        assert!(approval_prompt("Bash", "").contains("approve\x1b[0m Bash "));
     }
 
     #[test]
