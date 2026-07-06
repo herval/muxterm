@@ -1109,6 +1109,16 @@ impl eframe::App for App {
         {
             self.settings_open = false;
         }
+        // Open/close the bar *before* search_intercept: cmd+f is already
+        // consumed above, but the bar only starts intercepting once it is
+        // active. If a first query character is batched into the same egui
+        // frame as the cmd+f chord (fast typing), applying the toggle here
+        // means the bar owns that character instead of leaking it to the
+        // still-focused TerminalView. The rest of the batch stays deferred.
+        if actions.iter().any(|a| matches!(a, Action::ToggleSearch)) {
+            actions.retain(|a| !matches!(a, Action::ToggleSearch));
+            self.apply_action(ctx, Action::ToggleSearch);
+        }
         self.search_intercept(ctx);
         self.ai_intercept(ctx);
         self.copy_intercept(ctx);
