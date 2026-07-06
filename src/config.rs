@@ -440,6 +440,12 @@ mod tests {
         ctx.fonts(|f| {
             assert!(f.has_glyphs(&font, "✻✳✽✢✶✦★"), "dingbats missing");
             assert!(f.has_glyphs(&font, "⠋⠙⠹"), "braille missing");
+            // Block elements (Claude Code's banner art, TUI gauges) come
+            // from Hack itself; keep them covered if the stack changes.
+            assert!(
+                f.has_glyphs(&font, "▐▛█▜▌▘▝▎░▒▓▀▄"),
+                "block elements missing"
+            );
         });
     }
 

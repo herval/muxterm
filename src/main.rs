@@ -22,6 +22,17 @@ fn main() -> eframe::Result {
     // refuses to start without a usable one.
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var("COLORTERM", "truecolor");
+    // Finder/Dock launches also carry no locale, which leaves the tmux
+    // server and every pane program in the POSIX/ASCII locale. The tmux
+    // client itself is covered by `-u` (tmux.rs), but shells and CLIs in
+    // panes still need a UTF-8 LC_CTYPE; default one like iTerm2 does.
+    // Never override a locale the user actually has.
+    if std::env::var_os("LC_ALL").is_none()
+        && std::env::var_os("LC_CTYPE").is_none()
+        && std::env::var_os("LANG").is_none()
+    {
+        std::env::set_var("LANG", "en_US.UTF-8");
+    }
 
     let tmux = tmux::TmuxCtl::discover(&state::config_dir());
 

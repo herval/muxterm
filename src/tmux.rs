@@ -84,6 +84,11 @@ impl TmuxCtl {
     }
 
     /// The whole trick of muxterm: the pane's PTY runs a tmux client.
+    /// `-u` declares the client terminal UTF-8 capable. tmux otherwise
+    /// guesses from LC_ALL/LC_CTYPE/LANG, which are all unset when the
+    /// app is launched from Finder/Dock - and a non-UTF-8 client gets
+    /// every non-Latin-1 glyph redrawn as `_` (block-art logos and
+    /// spinners turn into rows of underscores).
     /// `-A` attaches if the session exists and creates it otherwise, so
     /// restore-after-relaunch and fresh spawn are the same code path.
     /// `-D` kicks any stale client so pane sizing is never fought over.
@@ -96,6 +101,7 @@ impl TmuxCtl {
         start_dir: Option<String>,
     ) -> BackendSettings {
         let mut args = vec![
+            "-u".into(),
             "-L".into(),
             SOCKET.into(),
             "-f".into(),
@@ -303,6 +309,21 @@ mod tests {
         for cmd in ["vim", "node", "claude", "ssh", ""] {
             assert!(!is_shell(cmd), "{cmd} should not count as a shell");
         }
+    }
+
+    #[test]
+    fn spawn_forces_utf8_client() {
+        // Finder-launched apps have no locale env, and without -u tmux
+        // draws every non-Latin-1 glyph on the client as '_'.
+        let ctl = TmuxCtl {
+            bin: PathBuf::from("/usr/bin/tmux"),
+            conf: PathBuf::from("/tmp/tmux.conf"),
+        };
+        let settings = ctl.spawn_settings("mux-abcd1234", None);
+        assert_eq!(settings.args.first().map(String::as_str), Some("-u"));
+        let new_session =
+            settings.args.iter().position(|a| a == "new-session");
+        assert!(new_session.is_some(), "client must open a session");
     }
 
     #[test]
