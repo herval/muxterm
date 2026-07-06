@@ -321,10 +321,23 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
 
 #[cfg(target_os = "macos")]
 fn platform_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
+    // muxterm patch P13: standard macOS line-editing chords (iTerm2 defaults).
+    // The COMMAND arrow/backspace entries here *replace* the cross-platform
+    // defaults (same Binding key) so `command` maps to ⌘ only on macOS; on
+    // Linux/Windows those defaults stay Ctrl+arrow word-jumps untouched.
     generate_bindings!(
         KeyboardBinding;
         C, Modifiers::MAC_CMD; BindingAction::Copy;
         V, Modifiers::MAC_CMD; BindingAction::Paste;
+        // option+arrows jump a word (readline backward-word / forward-word).
+        ArrowLeft,  Modifiers::ALT; BindingAction::Esc("\x1bb".into());
+        ArrowRight, Modifiers::ALT; BindingAction::Esc("\x1bf".into());
+        // cmd+arrows jump to line start/end (Ctrl-A / Ctrl-E).
+        ArrowLeft,  Modifiers::COMMAND; BindingAction::Char('\x01');
+        ArrowRight, Modifiers::COMMAND; BindingAction::Char('\x05');
+        // cmd+delete kills the line back to the start (Ctrl-U);
+        // option+delete already sends ESC-DEL (backward-kill-word).
+        Backspace,  Modifiers::COMMAND; BindingAction::Char('\x15');
     )
 }
 
@@ -465,6 +478,44 @@ mod tests {
             );
             assert_eq!(action, &found_action);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_text_editing_chords() {
+        let layout = BindingsLayout::default();
+        let mode = TerminalMode::empty();
+        let esc = |seq: &str| BindingAction::Esc(seq.into());
+        let key = InputKind::KeyCode;
+        // option+arrows -> word jump (readline backward/forward-word).
+        assert_eq!(
+            layout.get_action(key(Key::ArrowLeft), Modifiers::ALT, mode),
+            esc("\x1bb")
+        );
+        assert_eq!(
+            layout.get_action(key(Key::ArrowRight), Modifiers::ALT, mode),
+            esc("\x1bf")
+        );
+        // cmd+arrows -> line start/end (Ctrl-A / Ctrl-E). On macOS the physical
+        // ⌘ sets both mac_cmd and command.
+        let cmd = Modifiers::MAC_CMD | Modifiers::COMMAND;
+        assert_eq!(
+            layout.get_action(key(Key::ArrowLeft), cmd, mode),
+            BindingAction::Char('\x01')
+        );
+        assert_eq!(
+            layout.get_action(key(Key::ArrowRight), cmd, mode),
+            BindingAction::Char('\x05')
+        );
+        // cmd+delete -> kill line to start (Ctrl-U); option+delete -> ESC-DEL.
+        assert_eq!(
+            layout.get_action(key(Key::Backspace), cmd, mode),
+            BindingAction::Char('\x15')
+        );
+        assert_eq!(
+            layout.get_action(key(Key::Backspace), Modifiers::ALT, mode),
+            esc("\x1b\x7f")
+        );
     }
 
     #[test]

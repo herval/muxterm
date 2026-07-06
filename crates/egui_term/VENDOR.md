@@ -94,3 +94,12 @@ tmux-backed design. Local patches:
   ahead of the cursor while typing. `font_measure` now returns
   round(width*ppp)/ppp, which the per-glyph pen rounding then matches
   exactly at every column.
+- **P13** (`src/bindings.rs`, `platform_keyboard_bindings`): standard macOS
+  line-editing chords, matching iTerm2's default key maps. option+left/right
+  send `ESC b`/`ESC f` (readline backward/forward-word) instead of the
+  cross-platform `CSI 1;3D`/`1;3C`; cmd+left/right send `Ctrl-A`/`Ctrl-E`
+  (line start/end); cmd+delete sends `Ctrl-U` (kill to line start).
+  option+delete already sent `ESC DEL` (backward-kill-word). The cmd entries
+  reuse the `Modifiers::COMMAND` arrow/backspace Binding keys so they *replace*
+  the cross-platform defaults on macOS only (where `command` == ⌘), leaving
+  Linux/Windows Ctrl+arrow word-jumps untouched.
