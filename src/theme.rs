@@ -299,7 +299,7 @@ pub fn build(
     (TerminalTheme::new(Box::new(palette)), ui)
 }
 
-fn is_light(c: Color32) -> bool {
+pub(crate) fn is_light(c: Color32) -> bool {
     0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
         >= 128.0
 }

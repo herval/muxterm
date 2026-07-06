@@ -214,7 +214,8 @@ impl App {
             id.0,
             ctx.clone(),
             self.pty_tx.clone(),
-            self.tmux.spawn_settings(&session, start_dir),
+            self.tmux
+                .spawn_settings(&session, start_dir, !theme::is_light(self.ui_theme.bg)),
         )?;
         // cmd+clicked URLs/paths: relative paths resolve against this
         // pane's cwd, so the opener is tied to the session.

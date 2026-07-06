@@ -121,12 +121,18 @@ impl TmuxCtl {
     /// restore-after-relaunch and fresh spawn are the same code path.
     /// `-D` kicks any stale client so pane sizing is never fought over.
     /// `-c` sets the new shell's start directory (ignored on attach).
-    /// `-e` marks the pane environment for agent-mesh detection (also
-    /// ignored on attach - pre-existing sessions keep their environment).
+    /// `-e` seeds the pane environment: `MUXTERM*` for agent-mesh
+    /// detection, and `COLORFGBG` so terminal-background sniffers (Claude
+    /// Code's `auto` theme, vim, bat, delta) match muxterm's own theme
+    /// rather than the stale value inherited from whatever launched the app
+    /// - macOS hands Finder/Dock launches a `0;15` (light) COLORFGBG that
+    /// otherwise leaks into every pane. All `-e` vars are ignored on attach,
+    /// so pre-existing sessions keep the environment they first spawned with.
     pub fn spawn_settings(
         &self,
         session: &str,
         start_dir: Option<String>,
+        dark: bool,
     ) -> BackendSettings {
         let mut args = vec![
             "-u".into(),
@@ -141,6 +147,11 @@ impl TmuxCtl {
             "MUXTERM=1".into(),
             "-e".into(),
             format!("MUXTERM_SESSION={session}"),
+            "-e".into(),
+            // Claude Code's `auto` theme reads only COLORFGBG's last field
+            // (<=6 or ==8 => dark); the canonical fg;bg pair also steers
+            // other background sniffers the same way.
+            format!("COLORFGBG={}", if dark { "15;0" } else { "0;15" }),
             "-s".into(),
             session.into(),
         ];
@@ -485,11 +496,26 @@ mod tests {
             bin: PathBuf::from("/usr/bin/tmux"),
             conf: PathBuf::from("/tmp/tmux.conf"),
         };
-        let settings = ctl.spawn_settings("mux-abcd1234", None);
+        let settings = ctl.spawn_settings("mux-abcd1234", None, true);
         assert_eq!(settings.args.first().map(String::as_str), Some("-u"));
         let new_session =
             settings.args.iter().position(|a| a == "new-session");
         assert!(new_session.is_some(), "client must open a session");
+    }
+
+    #[test]
+    fn spawn_advertises_theme_background() {
+        // Claude Code's `auto` theme (and vim/bat/delta) read COLORFGBG's
+        // last field for light/dark; muxterm must overwrite the value the
+        // OS leaked in so panes match the app's own theme, not the launcher.
+        let ctl = TmuxCtl {
+            bin: PathBuf::from("/usr/bin/tmux"),
+            conf: PathBuf::from("/tmp/tmux.conf"),
+        };
+        let dark = ctl.spawn_settings("mux-abcd1234", None, true);
+        assert!(dark.args.iter().any(|a| a == "COLORFGBG=15;0"));
+        let light = ctl.spawn_settings("mux-abcd1234", None, false);
+        assert!(light.args.iter().any(|a| a == "COLORFGBG=0;15"));
     }
 
     fn style() -> SearchStyle {
