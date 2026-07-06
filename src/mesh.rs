@@ -50,10 +50,17 @@ pub fn requests_dir() -> PathBuf {
     config_dir().join("requests")
 }
 
+/// Separate from `requests/`: the split drainer consumes-and-deletes every
+/// json file in that directory, so notify requests must not share it.
+pub fn notify_dir() -> PathBuf {
+    config_dir().join("notify")
+}
+
 pub fn ensure_dirs() {
     let _ = fs::create_dir_all(inbox_dir());
     let _ = fs::create_dir_all(ctx_dir());
     let _ = fs::create_dir_all(requests_dir());
+    let _ = fs::create_dir_all(notify_dir());
 }
 
 pub fn now() -> u64 {
@@ -255,6 +262,68 @@ pub fn clear_split_requests() {
     }
 }
 
+/// `mux notify`: a pane raising its hand for the muxterm UI (tab badge,
+/// and a banner while the window is unfocused). Fire-and-forget: the GUI
+/// drains the spool on its poll tick; nothing travels back.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NotifyRequest {
+    pub v: u32,
+    /// Session of the pane raising its hand.
+    pub from: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    pub ts: u64,
+}
+
+pub fn write_notify_request(req: &NotifyRequest) -> anyhow::Result<()> {
+    fs::create_dir_all(notify_dir())?;
+    // ts is seconds; the pid keeps rapid-fire notifies from distinct
+    // invocations from overwriting each other.
+    let path = notify_dir().join(format!(
+        "{}-{}-{}.json",
+        req.from,
+        req.ts,
+        std::process::id()
+    ));
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(req)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Drain pending notify requests, oldest first; each file is removed as
+/// it is read (`.json.tmp` staging files are skipped, as with splits).
+pub fn take_notify_requests() -> Vec<NotifyRequest> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(notify_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let _ = fs::remove_file(&path);
+        if let Ok(req) = serde_json::from_str::<NotifyRequest>(&text) {
+            out.push(req);
+        }
+    }
+    out.sort_by_key(|req| req.ts);
+    out
+}
+
+/// A raise spooled while the GUI was closed is stale by the next launch.
+pub fn clear_notify_requests() {
+    if let Ok(entries) = fs::read_dir(notify_dir()) {
+        for entry in entries.flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Deregister a session and drop its inbox artifacts (pane closed).
 pub fn remove_session(session: &str) {
     let mut reg = load_registry();
@@ -435,5 +504,24 @@ mod tests {
         )
         .unwrap();
         assert!(bare.cwd.is_none());
+    }
+
+    #[test]
+    fn notify_request_round_trip() {
+        let req = NotifyRequest {
+            v: 1,
+            from: "mux-aaaa".into(),
+            message: Some("tests green".into()),
+            ts: 42,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: NotifyRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.from, "mux-aaaa");
+        assert_eq!(back.message.as_deref(), Some("tests green"));
+        assert_eq!(back.ts, 42);
+        // message is optional on the wire.
+        let bare: NotifyRequest =
+            serde_json::from_str(r#"{"v":1,"from":"mux-a","ts":1}"#).unwrap();
+        assert!(bare.message.is_none());
     }
 }

@@ -29,6 +29,16 @@ setw -g aggressive-resize on
 bind -n S-PPage copy-mode -u
 "##;
 
+/// Theme-derived colors for tmux's copy-mode search highlight, built by
+/// theme::search_highlight - the one place theme values reach the conf.
+/// Hex strings are single-quoted there: an unquoted `#` starts a comment.
+#[derive(Debug)]
+pub struct SearchStyle {
+    pub match_bg: String,
+    pub current_bg: String,
+    pub current_fg: String,
+}
+
 /// Mouse drags inside panes are driven by tmux copy-mode, so copy-on-select
 /// for them is a tmux binding, not app code. Both values are spelled out
 /// explicitly (`on` is tmux's own default) so that re-sourcing the file
@@ -36,7 +46,7 @@ bind -n S-PPage copy-mode -u
 /// - on: releasing a drag copies the selection (OSC 52 -> clipboard).
 /// - off: releasing keeps the selection on screen and copies nothing;
 ///   cmd+c (App::copy_intercept) does the explicit copy.
-fn conf(copy_on_select: bool) -> String {
+fn conf(copy_on_select: bool, search: &SearchStyle) -> String {
     let drag_end = if copy_on_select {
         "bind -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel\n\
          bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel\n"
@@ -44,7 +54,13 @@ fn conf(copy_on_select: bool) -> String {
         "unbind -T copy-mode MouseDragEnd1Pane\n\
          unbind -T copy-mode-vi MouseDragEnd1Pane\n"
     };
-    format!("{CONF_BASE}{drag_end}")
+    // The cmd+f highlight (tmux >= 3.2 for the match styles).
+    let search_style = format!(
+        "set -g copy-mode-match-style 'bg={}'\n\
+         set -g copy-mode-current-match-style 'bg={},fg={}'\n",
+        search.match_bg, search.current_bg, search.current_fg,
+    );
+    format!("{CONF_BASE}{drag_end}{search_style}")
 }
 
 /// Clone: pane link-openers each carry one onto their worker thread.
@@ -62,12 +78,24 @@ impl TmuxCtl {
         })
     }
 
-    pub fn write_conf(&self, copy_on_select: bool) -> Result<()> {
+    /// Returns whether the on-disk conf actually changed, so callers know
+    /// to re-source a running server (copy_on_select or theme changes).
+    pub fn write_conf(
+        &self,
+        copy_on_select: bool,
+        search: &SearchStyle,
+    ) -> Result<bool> {
+        let content = conf(copy_on_select, search);
+        if fs::read_to_string(&self.conf).ok().as_deref()
+            == Some(content.as_str())
+        {
+            return Ok(false);
+        }
         if let Some(parent) = self.conf.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&self.conf, conf(copy_on_select))?;
-        Ok(())
+        fs::write(&self.conf, &content)?;
+        Ok(true)
     }
 
     /// Apply the conf to an already-running server (config files are only
@@ -239,6 +267,104 @@ impl TmuxCtl {
             .output();
     }
 
+    /// One tmux invocation per cmd+f edit: (re)enter copy-mode, jump to
+    /// the bottom of history so the newest match wins, run the plain-text
+    /// search, and read the match counters back on the same round trip.
+    /// The `--` belongs to the copy-mode command's own argument parser -
+    /// without it a query starting with `-` is rejected as a flag.
+    pub fn search_text(
+        &self,
+        session: &str,
+        query: &str,
+    ) -> Option<SearchStatus> {
+        let target = format!("={session}:");
+        let query = escape_semi(query);
+        self.search_op(session, &[
+            "send-keys",
+            "-t",
+            &target,
+            "-X",
+            "history-bottom",
+            ";",
+            "send-keys",
+            "-t",
+            &target,
+            "-X",
+            "search-backward-text",
+            "--",
+            &query,
+        ])
+    }
+
+    /// Enter / cmd+g: continue toward older matches. Works even after a
+    /// click or drag dropped the pane out of copy-mode - tmux keeps the
+    /// pane's last search string across copy-mode instances.
+    pub fn search_next(&self, session: &str) -> Option<SearchStatus> {
+        let target = format!("={session}:");
+        self.search_op(session, &[
+            "send-keys",
+            "-t",
+            &target,
+            "-X",
+            "search-again",
+        ])
+    }
+
+    /// shift+Enter / cmd+shift+g: back toward newer matches.
+    pub fn search_prev(&self, session: &str) -> Option<SearchStatus> {
+        let target = format!("={session}:");
+        self.search_op(session, &[
+            "send-keys",
+            "-t",
+            &target,
+            "-X",
+            "search-reverse",
+        ])
+    }
+
+    /// Query emptied: leave copy-mode entirely, which drops the match
+    /// highlights and unfreezes the pane. `-q` is a no-op outside a mode,
+    /// so no `#{pane_in_mode}` guard is needed.
+    pub fn search_clear(&self, session: &str) {
+        let _ = Command::new(&self.bin)
+            .args([
+                "-L",
+                SOCKET,
+                "copy-mode",
+                "-q",
+                "-t",
+                &format!("={session}:"),
+            ])
+            .output();
+    }
+
+    /// `copy-mode ; <steps> ; display-message`, sequenced by lone `;`
+    /// argv elements so the whole op is a single fork + server round
+    /// trip. copy-mode goes first because it is a no-op when the pane is
+    /// already in it: any interaction that knocked the pane out of
+    /// copy-mode (drag-copy, click) self-heals on the next op.
+    /// display-message wants the bare session name (it rejects `=`).
+    fn search_op(&self, session: &str, steps: &[&str]) -> Option<SearchStatus> {
+        let target = format!("={session}:");
+        let out = Command::new(&self.bin)
+            .args(["-L", SOCKET, "copy-mode", "-t", &target, ";"])
+            .args(steps)
+            .args([
+                ";",
+                "display-message",
+                "-p",
+                "-t",
+                session,
+                "#{search_present} #{search_count} #{search_count_partial}",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_search_status(&String::from_utf8_lossy(&out.stdout))
+    }
+
     /// `=` forces an exact match; `-t name` alone prefix-matches.
     pub fn kill_session(&self, session: &str) {
         let _ = Command::new(&self.bin)
@@ -286,6 +412,46 @@ pub fn is_shell(cmd: &str) -> bool {
     )
 }
 
+/// What a search op reads back from tmux.
+#[derive(Debug)]
+pub struct SearchStatus {
+    /// #{search_count}: total matches. None when the server predates the
+    /// format variable (tmux < 3.5) - the bar hides its counter but the
+    /// search itself still works.
+    pub total: Option<u32>,
+    /// #{search_count_partial}: tmux capped the count; render "N+".
+    pub partial: bool,
+}
+
+/// display-message output "1 17 0" -> 17 matches; "1 120 1" -> capped;
+/// "1  " -> matched but no search_count (tmux < 3.5); "0  " -> the search
+/// ran and found nothing (a no-match search leaves search_present unset,
+/// verified against tmux 3.7); "" -> the sequence aborted before
+/// display-message ran (no search at all).
+fn parse_search_status(stdout: &str) -> Option<SearchStatus> {
+    let mut fields = stdout.split_whitespace();
+    if fields.next()? != "1" {
+        return Some(SearchStatus {
+            total: Some(0),
+            partial: false,
+        });
+    }
+    let total = fields.next().and_then(|f| f.parse().ok());
+    let partial = fields.next() == Some("1");
+    Some(SearchStatus { total, partial })
+}
+
+/// tmux re-parses argv words: one that is `;` or ends with an unescaped
+/// `;` splits the command sequence, and unescaping eats one trailing
+/// backslash. Guarding the final character is sufficient - mid-string
+/// semicolons are already literal.
+fn escape_semi(query: &str) -> String {
+    match query.strip_suffix(';') {
+        Some(head) => format!("{head}\\;"),
+        None => query.to_string(),
+    }
+}
+
 /// capture-pane pads the visible region with blank lines; strip them (and
 /// per-line trailing whitespace) so the context file ends at real content.
 fn trim_capture(text: &str) -> String {
@@ -326,9 +492,17 @@ mod tests {
         assert!(new_session.is_some(), "client must open a session");
     }
 
+    fn style() -> SearchStyle {
+        SearchStyle {
+            match_bg: "#46648b".into(),
+            current_bg: "#4a90d9".into(),
+            current_fg: "#1d1e23".into(),
+        }
+    }
+
     #[test]
     fn conf_flips_drag_end_bindings() {
-        let on = conf(true);
+        let on = conf(true, &style());
         assert!(on.contains(
             "bind -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel"
         ));
@@ -336,7 +510,7 @@ mod tests {
             "bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel"
         ));
         assert!(!on.contains("unbind"));
-        let off = conf(false);
+        let off = conf(false, &style());
         assert!(off.contains("unbind -T copy-mode MouseDragEnd1Pane"));
         assert!(off.contains("unbind -T copy-mode-vi MouseDragEnd1Pane"));
         assert!(!off.contains("copy-selection-and-cancel"));
@@ -345,6 +519,46 @@ mod tests {
             assert!(text.contains("set -g mouse on"));
             assert!(text.contains("set -s set-clipboard on"));
         }
+    }
+
+    #[test]
+    fn conf_injects_search_match_styles() {
+        let text = conf(true, &style());
+        assert!(text
+            .contains("set -g copy-mode-match-style 'bg=#46648b'"));
+        assert!(text.contains(
+            "set -g copy-mode-current-match-style 'bg=#4a90d9,fg=#1d1e23'"
+        ));
+    }
+
+    #[test]
+    fn escape_semi_protects_only_a_trailing_semicolon() {
+        assert_eq!(escape_semi("foo"), "foo");
+        assert_eq!(escape_semi("a;b"), "a;b");
+        assert_eq!(escape_semi("foo;"), "foo\\;");
+        assert_eq!(escape_semi(";"), "\\;");
+        // tmux's unescape eats one trailing backslash, so a query ending
+        // in `\;` needs the extra layer to round-trip literally.
+        assert_eq!(escape_semi("foo\\;"), "foo\\\\;");
+    }
+
+    #[test]
+    fn search_status_parses_and_degrades() {
+        let s = parse_search_status("1 17 0\n").unwrap();
+        assert_eq!(s.total, Some(17));
+        assert!(!s.partial);
+        let s = parse_search_status("1 120 1\n").unwrap();
+        assert_eq!(s.total, Some(120));
+        assert!(s.partial);
+        // tmux < 3.5: search_count expands to nothing.
+        let s = parse_search_status("1  \n").unwrap();
+        assert_eq!(s.total, None);
+        assert!(!s.partial);
+        // The search ran and found nothing.
+        let s = parse_search_status("0  \n").unwrap();
+        assert_eq!(s.total, Some(0));
+        // The command sequence aborted early (no search at all).
+        assert!(parse_search_status("").is_none());
     }
 
     #[test]

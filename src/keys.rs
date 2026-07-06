@@ -16,6 +16,13 @@ pub enum Action {
     /// so directional nav alone can't be relied on.
     CyclePane(isize),
     ToggleSettings,
+    /// cmd+f: open/close the scrollback-search bar on the focused pane.
+    ToggleSearch,
+    /// cmd+g / cmd+shift+g: walk matches while the bar is open. Consumed
+    /// unconditionally like every chord here; the "is search active"
+    /// gate lives in App::apply_action, which owns that state.
+    SearchNext,
+    SearchPrev,
 }
 
 const TAB_KEYS: [Key; 9] = [
@@ -58,6 +65,9 @@ pub fn drain_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         consume(cmd, Key::OpenBracket, Action::CyclePane(-1));
         consume(cmd, Key::CloseBracket, Action::CyclePane(1));
         consume(cmd, Key::Comma, Action::ToggleSettings);
+        consume(cmd, Key::F, Action::ToggleSearch);
+        consume(cmd | Modifiers::SHIFT, Key::G, Action::SearchPrev);
+        consume(cmd, Key::G, Action::SearchNext);
         for (n, key) in TAB_KEYS.iter().enumerate() {
             consume(cmd, *key, Action::GotoTab(n));
         }

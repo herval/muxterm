@@ -3,6 +3,7 @@ use egui::{
     Color32, CornerRadius, FontId, Pos2, Rect, RichText, TextFormat, Vec2,
 };
 
+use crate::attention;
 use crate::pr_status::Badge;
 use crate::theme::UiTheme;
 
@@ -12,9 +13,14 @@ pub enum TabBarAction {
     OpenSettings,
 }
 
+/// Per-tab render data: label, PR chip, and the activity/attention dot
+/// (level plus its hover text).
+pub type TabInfo =
+    (String, Option<Badge>, Option<(attention::Level, String)>);
+
 pub fn show(
     ctx: &egui::Context,
-    tabs: &[(String, Option<Badge>)],
+    tabs: &[TabInfo],
     active: usize,
     t: &UiTheme,
 ) -> Vec<TabBarAction> {
@@ -28,7 +34,7 @@ pub fn show(
                 // top-left corner (no title bar in compact chrome).
                 ui.add_space(76.0);
                 ui.spacing_mut().item_spacing.x = 3.0;
-                for (i, (label, badge)) in tabs.iter().enumerate() {
+                for (i, (label, badge, attn)) in tabs.iter().enumerate() {
                     let is_active = i == active;
                     let text = RichText::new(format!("{}  {}", i + 1, label))
                         .size(12.0)
@@ -60,6 +66,30 @@ pub fn show(
                             CornerRadius::same(5),
                             t.tab_hover_bg.gamma_multiply(0.5),
                         );
+                    }
+                    // The badge dot rides the tab's top-right corner as a
+                    // painter overlay - no layout shift when it appears, no
+                    // collision with the agent "●" leading the label. It
+                    // paints after the hover wash so hovering (to read the
+                    // detail text) never hides it.
+                    if let Some((level, detail)) = attn {
+                        let (color, radius) = match level {
+                            attention::Level::Attention => {
+                                (t.status_warn, 3.0)
+                            },
+                            attention::Level::Activity => {
+                                (t.text_dim, 2.5)
+                            },
+                        };
+                        ui.painter().circle_filled(
+                            Pos2::new(
+                                resp.rect.max.x - 9.0,
+                                resp.rect.min.y + 8.0,
+                            ),
+                            radius,
+                            color,
+                        );
+                        let _ = resp.on_hover_text(detail);
                     }
                     // The tab's PR chip: its own button, so clicking it
                     // opens the PR page instead of selecting the tab.

@@ -82,6 +82,7 @@ through your login shell.
 | mouse select | copies to the clipboard automatically (`copy_on_select`, toggle in settings) |
 | cmd+click | open the URL or file path under the pointer (hold cmd to see links underlined; relative paths resolve against the pane's cwd and open only if they exist) |
 | shift+PageUp or mouse wheel | tmux copy-mode scrollback |
+| cmd+f | search scrollback (tmux history; enter/⇧enter or cmd+g/cmd+shift+g walk matches, esc closes the bar and leaves the view at the match) |
 | cmd+, | settings (esc closes) |
 | `?` (at an empty shell prompt) | ask the AI agent — enter runs it in the pane, esc cancels |
 

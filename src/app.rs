@@ -19,12 +19,14 @@ use egui_term::{
 use muxterm::agent::{self, Agent};
 
 use crate::ai_prompt::{self, LineTracker, PromptMachine, Verdict};
+use crate::attention;
 use crate::config;
 use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
 use muxterm::mesh;
 use crate::pane::Pane;
 use crate::pr_status;
+use crate::search::{self, SearchBar, SearchOp};
 use crate::settings;
 use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
@@ -74,6 +76,8 @@ pub struct App {
     last_config_check: Instant,
     /// The "?" prompt line.
     ai: PromptMachine,
+    /// The cmd+f scrollback-search bar.
+    search: SearchBar,
     agent: &'static Agent,
     agent_context_lines: u32,
     /// Cache of `binary_available` probes; misses are evicted on failed
@@ -88,6 +92,9 @@ pub struct App {
     pr_rx: Receiver<HashMap<String, pr_status::Badge>>,
     pr_enabled: Arc<AtomicBool>,
     pr_status: bool,
+    /// Dock bounce + banner on bell/`mux notify` while unfocused
+    /// (config `notifications`); tab badges are not gated by this.
+    notifications: bool,
 }
 
 impl App {
@@ -96,8 +103,16 @@ impl App {
         let (style, custom_font) = config::resolve(&config::load());
         config::install_fonts(&cc.egui_ctx, custom_font);
         theme::apply_visuals(&cc.egui_ctx, &style.ui);
-        if let Err(e) = tmux.write_conf(style.copy_on_select) {
-            log::error!("failed to write tmux.conf: {e:#}");
+        // The server may have survived a previous run (sessions outlive the
+        // app), so source the conf when its content changed - a no-op when
+        // no server is up yet.
+        match tmux.write_conf(
+            style.copy_on_select,
+            &theme::search_highlight(&style.ui),
+        ) {
+            Ok(true) => tmux.source_conf(),
+            Ok(false) => {},
+            Err(e) => log::error!("failed to write tmux.conf: {e:#}"),
         }
 
         let (pty_tx, pty_rx) = mpsc::channel();
@@ -122,6 +137,7 @@ impl App {
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
             ai: PromptMachine::default(),
+            search: SearchBar::default(),
             agent: style.agent,
             agent_context_lines: style.agent_context_lines,
             agent_ok: HashMap::new(),
@@ -131,6 +147,7 @@ impl App {
             pr_rx,
             pr_enabled,
             pr_status: style.pr_status,
+            notifications: style.notifications,
         };
 
         match state::load() {
@@ -173,8 +190,10 @@ impl App {
         let live_tabs: HashSet<String> =
             app.tabs.iter().map(|t| t.tab_id.clone()).collect();
         mesh::prune(&live_sessions, &live_tabs);
-        // Spooled split requests are from writers that gave up long ago.
+        // Spooled split requests are from writers that gave up long ago,
+        // and spooled raises are stale by the next launch.
         mesh::clear_split_requests();
+        mesh::clear_notify_requests();
 
         app
     }
@@ -217,6 +236,7 @@ impl App {
             } else {
                 LineTracker::Known(0)
             },
+            attn: attention::Cell::new(Instant::now()),
         })
     }
 
@@ -341,6 +361,31 @@ impl App {
         }
     }
 
+    /// `mux notify`: a pane raising its hand. Unlike a bell it can carry
+    /// a message, and it always re-alerts - raising twice means it twice.
+    fn drain_notify_requests(&mut self, ctx: &egui::Context) {
+        for req in mesh::take_notify_requests() {
+            let found = self.tabs.iter_mut().find_map(|tab| {
+                tab.panes.values_mut().find(|p| p.session == req.from)
+            });
+            let Some(pane) = found else {
+                log::debug!("notify from {}: not a muxterm pane", req.from);
+                continue;
+            };
+            pane.attn.notify(req.message.clone());
+            let name = self
+                .agents
+                .get(&req.from)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| req.from.clone());
+            let body = match &req.message {
+                Some(msg) => format!("{name}: {msg}"),
+                None => format!("{name} raised a hand"),
+            };
+            self.fire_alert(ctx, &body);
+        }
+    }
+
     /// Unlike a user split this targets the *requester's* pane, not the
     /// focused one, and steals no focus - the user may be typing elsewhere.
     fn apply_split_request(
@@ -457,7 +502,93 @@ impl App {
             .find_map(|tab| tab.panes.get_mut(&PaneId(backend_id)))
     }
 
+    /// Like `pane_mut`, but also yields the tab index - pty events need
+    /// to know whether their pane is visible right now.
+    fn pane_and_tab_mut(
+        &mut self,
+        backend_id: u64,
+    ) -> Option<(usize, &mut Pane)> {
+        self.tabs.iter_mut().enumerate().find_map(|(i, tab)| {
+            tab.panes.get_mut(&PaneId(backend_id)).map(|p| (i, p))
+        })
+    }
+
+    /// Roll a tab's pane badges up to one indicator: the strongest level,
+    /// with one hover line per pane flagged at that level.
+    fn tab_attention(
+        &self,
+        tab: &Tab,
+    ) -> Option<(attention::Level, String)> {
+        let mut flagged: Vec<(attention::Level, String)> = tab
+            .panes
+            .values()
+            .filter_map(|p| {
+                p.attn.indicator().map(|(level, reason)| {
+                    (level, self.reason_line(&p.session, reason))
+                })
+            })
+            .collect();
+        let top = flagged.iter().map(|(level, _)| *level).max()?;
+        flagged.retain(|(level, _)| *level == top);
+        let detail = flagged
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some((top, detail))
+    }
+
+    /// One hover line for a flagged pane, named like the mesh knows it.
+    fn reason_line(
+        &self,
+        session: &str,
+        reason: &attention::Reason,
+    ) -> String {
+        let line = match reason {
+            attention::Reason::Output => "new output".to_string(),
+            attention::Reason::Bell => "bell".to_string(),
+            attention::Reason::Notify(Some(msg)) => format!("raised: {msg}"),
+            attention::Reason::Notify(None) => "raised a hand".to_string(),
+        };
+        match self.agents.get(session) {
+            Some(a) => format!("{}: {line}", a.name),
+            None => line,
+        }
+    }
+
+    /// The alert body's tab name, matching what the tab bar shows.
+    fn tab_alert_label(&self, tab_idx: usize) -> String {
+        let Some(tab) = self.tabs.get(tab_idx) else {
+            return "?".into();
+        };
+        let pane = tab.panes.get(&tab.focused);
+        tab_label(
+            pane.and_then(|p| self.agents.get(&p.session)),
+            pane.map(|p| p.title.as_str()).unwrap_or("shell"),
+        )
+    }
+
+    /// OS-level side of an attention rise: a single dock bounce (macOS
+    /// ignores it while the app is active) plus an osascript banner. Only
+    /// when the window is unfocused - a visible rise is the tab bar's
+    /// job - and only with config `notifications` on.
+    fn fire_alert(&self, ctx: &egui::Context, body: &str) {
+        if !self.notifications || ctx.input(|i| i.focused) {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Informational,
+        ));
+        attention::banner("muxterm", body);
+    }
+
     fn drain_pty_events(&mut self, ctx: &egui::Context) {
+        // Visibility at drain time decides what counts as "background":
+        // any pane outside the active tab, or every pane while the window
+        // is unfocused (a bell in the active tab still alerts from
+        // another app, like iTerm).
+        let focused = ctx.input(|i| i.focused);
+        let active = self.active;
         while let Ok((backend_id, event)) = self.pty_rx.try_recv() {
             match event {
                 PtyEvent::Exit | PtyEvent::ChildExit(_) => {
@@ -482,6 +613,31 @@ impl App {
                         pane.backend.process_command(BackendCommand::Write(
                             text.into_bytes(),
                         ));
+                    }
+                },
+                PtyEvent::Wakeup => {
+                    if let Some((tab_idx, pane)) =
+                        self.pane_and_tab_mut(backend_id)
+                    {
+                        if tab_idx != active || !focused {
+                            pane.attn.output(Instant::now());
+                        }
+                    }
+                },
+                PtyEvent::Bell => {
+                    let rang = self
+                        .pane_and_tab_mut(backend_id)
+                        .filter(|(tab_idx, _)| *tab_idx != active || !focused)
+                        .and_then(|(tab_idx, pane)| {
+                            pane.attn.bell().then_some(tab_idx)
+                        });
+                    if let Some(tab_idx) = rang {
+                        let body = format!(
+                            "bell in tab {}: {}",
+                            tab_idx + 1,
+                            self.tab_alert_label(tab_idx),
+                        );
+                        self.fire_alert(ctx, &body);
                     }
                 },
                 _ => {},
@@ -532,6 +688,22 @@ impl App {
             Action::ToggleSettings => {
                 self.settings_open = !self.settings_open;
             },
+            Action::ToggleSearch => {
+                if self.search.active() {
+                    self.search.close();
+                } else if !self.settings_open {
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        if tab.panes.contains_key(&tab.focused) {
+                            // The bar owns the keyboard; the "?" compose
+                            // line can't coexist with it.
+                            self.ai.cancel();
+                            self.search.open(tab.focused);
+                        }
+                    }
+                }
+            },
+            Action::SearchNext => self.search_step(SearchOp::Next),
+            Action::SearchPrev => self.search_step(SearchOp::Prev),
             Action::CyclePane(step) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let leaves = tab.tree.leaves();
@@ -617,20 +789,104 @@ impl App {
         self.agent_context_lines = style.agent_context_lines;
         self.pr_status = style.pr_status;
         self.pr_enabled.store(style.pr_status, Ordering::Relaxed);
+        self.notifications = style.notifications;
         if !style.pr_status {
             // The poller also sends a clearing snapshot, but drop the
             // badges now so the toggle feels instant.
             self.pr.clear();
         }
-        if self.copy_on_select != style.copy_on_select {
-            self.copy_on_select = style.copy_on_select;
-            // The drag-end side of copy-on-select is a tmux binding;
-            // rewrite the conf and re-source it into the running server
-            // (config files only apply on server start).
-            if let Err(e) = self.tmux.write_conf(self.copy_on_select) {
-                log::error!("failed to write tmux.conf: {e:#}");
+        self.copy_on_select = style.copy_on_select;
+        // The drag-end side of copy-on-select and the cmd+f search
+        // highlight are tmux settings; rewrite the conf and re-source it
+        // into the running server whenever its content actually changed
+        // (config files only apply on server start).
+        match self.tmux.write_conf(
+            self.copy_on_select,
+            &theme::search_highlight(&self.ui_theme),
+        ) {
+            Ok(true) => self.tmux.source_conf(),
+            Ok(false) => {},
+            Err(e) => log::error!("failed to write tmux.conf: {e:#}"),
+        }
+    }
+
+    /// Route keyboard events through the cmd+f search bar before any
+    /// TerminalView clones the frame's input. Each edit drives tmux
+    /// copy-mode search on the bound pane; the resulting redraw (scroll
+    /// position, match highlights) comes back through the PTY like any
+    /// other tmux output.
+    fn search_intercept(&mut self, ctx: &egui::Context) {
+        if self.settings_open || !self.search.active() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let focused = tab.focused;
+        self.search.sync(focused, tab.panes.contains_key(&focused));
+        if !self.search.active() {
+            return;
+        }
+        let Some(pane) = tab.panes.get(&focused) else {
+            return;
+        };
+        let session = pane.session.clone();
+
+        let mut ops = Vec::new();
+        ctx.input_mut(|i| {
+            let events = std::mem::take(&mut i.events);
+            let mut kept = Vec::with_capacity(events.len());
+            for event in events {
+                match self.search.on_event(&event) {
+                    search::Verdict::Pass => kept.push(event),
+                    search::Verdict::Consume => {},
+                    search::Verdict::Op(op) => ops.push(op),
+                }
             }
-            self.tmux.source_conf();
+            i.events = kept;
+        });
+        for op in search::coalesce(ops) {
+            self.run_search_op(&session, op);
+        }
+    }
+
+    fn run_search_op(&mut self, session: &str, op: SearchOp) {
+        let status = match op {
+            SearchOp::Search(q) => self.tmux.search_text(session, &q),
+            SearchOp::Next => self.tmux.search_next(session),
+            SearchOp::Prev => self.tmux.search_prev(session),
+            SearchOp::Clear => {
+                self.tmux.search_clear(session);
+                self.search.set_count(None);
+                return;
+            },
+        };
+        self.search.set_count(status.and_then(|s| {
+            s.total.map(|total| search::MatchCount {
+                total,
+                partial: s.partial,
+            })
+        }));
+    }
+
+    /// cmd+g / cmd+shift+g: walk matches; a no-op unless the bar is open
+    /// with a query (the chords are consumed unconditionally in keys.rs,
+    /// which has no access to this state).
+    fn search_step(&mut self, op: SearchOp) {
+        let has_query = matches!(
+            &self.search.state,
+            search::State::Open { query, .. } if !query.is_empty()
+        );
+        if !has_query {
+            return;
+        }
+        let session = self
+            .search
+            .pane
+            .and_then(|p| self.tabs.get(self.active)?.panes.get(&p))
+            .map(|pane| pane.session.clone());
+        if let Some(session) = session {
+            self.run_search_op(&session, op);
         }
     }
 
@@ -639,7 +895,7 @@ impl App {
     /// reach the PTY; a submit types the composed agent command into the
     /// focused pane, with recent scrollback redirected to its stdin.
     fn ai_intercept(&mut self, ctx: &egui::Context) {
-        if self.settings_open {
+        if self.settings_open || self.search.active() {
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else {
@@ -774,6 +1030,7 @@ impl App {
             self.copy_on_select,
             self.pane_titles,
             self.pr_status,
+            self.notifications,
         );
         if let Some(name) = out.theme {
             config::set_theme(name);
@@ -794,6 +1051,10 @@ impl App {
         }
         if let Some(on) = out.pr_status {
             config::set_pr_status(on);
+            self.reload_config(ctx);
+        }
+        if let Some(on) = out.notifications {
+            config::set_notifications(on);
             self.reload_config(ctx);
         }
         if let Some(size) = out.font_size {
@@ -824,6 +1085,7 @@ impl eframe::App for App {
                     mesh::load_registry().agents.into_iter().collect();
             }
             self.drain_split_requests(ctx);
+            self.drain_notify_requests(ctx);
         }
 
         if log::log_enabled!(log::Level::Debug) {
@@ -834,9 +1096,11 @@ impl eframe::App for App {
             });
         }
 
-        // Order is load-bearing: shortcuts and the "?" prompt machine must
-        // both run before any TerminalView clones the frame's input events,
-        // and shortcuts first so chords never reach the machine.
+        // Order is load-bearing: shortcuts, the search bar, and the "?"
+        // prompt machine must all run before any TerminalView clones the
+        // frame's input events; shortcuts first so chords never reach the
+        // machines, and the search bar before "?" so an open bar owns the
+        // keyboard (ai_intercept bows out while it is active).
         let mut actions = keys::drain_shortcuts(ctx);
         if self.settings_open
             && ctx.input_mut(|i| {
@@ -845,10 +1109,21 @@ impl eframe::App for App {
         {
             self.settings_open = false;
         }
+        self.search_intercept(ctx);
         self.ai_intercept(ctx);
         self.copy_intercept(ctx);
 
         self.drain_pty_events(ctx);
+        // Looking at a tab acknowledges its badges: seeing the active tab
+        // with the window focused clears them, which covers every
+        // tab-switch path and window refocus in one sweep.
+        if ctx.input(|i| i.focused) {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                for pane in tab.panes.values_mut() {
+                    pane.attn.viewed();
+                }
+            }
+        }
         while let Ok(snapshot) = self.pr_rx.try_recv() {
             self.pr = snapshot;
         }
@@ -860,7 +1135,7 @@ impl eframe::App for App {
             return;
         }
 
-        let labels: Vec<(String, Option<pr_status::Badge>)> = self
+        let labels: Vec<tabbar::TabInfo> = self
             .tabs
             .iter()
             .map(|tab| {
@@ -871,7 +1146,8 @@ impl eframe::App for App {
                 );
                 let badge =
                     pane.and_then(|p| self.pr.get(&p.session)).cloned();
-                (label, badge)
+                let attn = self.tab_attention(tab);
+                (label, badge, attn)
             })
             .collect();
         for action in tabbar::show(ctx, &labels, self.active, &self.ui_theme) {
@@ -891,10 +1167,12 @@ impl eframe::App for App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
                     let mut rects = HashMap::new();
-                    // While settings or the "?" compose line own the
-                    // keyboard, the sentinel matches no pane, so the
-                    // terminal stops re-grabbing focus every frame.
-                    let focused = if self.settings_open || self.ai.composing()
+                    // While settings, the "?" compose line, or the search
+                    // bar own the keyboard, the sentinel matches no pane,
+                    // so the terminal stops re-grabbing focus every frame.
+                    let focused = if self.settings_open
+                        || self.ai.composing()
+                        || self.search.active()
                     {
                         PaneId(u64::MAX)
                     } else {
@@ -974,6 +1252,22 @@ impl eframe::App for App {
                                 buffer,
                                 error.as_deref(),
                                 self.agent,
+                                &self.font,
+                                &self.ui_theme,
+                            );
+                        }
+                    }
+                    if let search::State::Open { query, count } =
+                        &self.search.state
+                    {
+                        if let Some(rect) =
+                            self.search.pane.and_then(|p| rects.get(&p))
+                        {
+                            draw_search_bar(
+                                ui,
+                                *rect,
+                                query,
+                                *count,
                                 &self.font,
                                 &self.ui_theme,
                             );
@@ -1136,6 +1430,121 @@ fn draw_ai_overlay(
             hint_color,
         );
     }
+}
+
+/// The cmd+f search bar, a strip over the pane's top-right corner (the
+/// pane-title spot - it covers the badge and tmux's own copy-mode
+/// indicator, both redundant while searching). tmux draws the matches
+/// and moves the viewport; this is only the query line and counter.
+fn draw_search_bar(
+    ui: &egui::Ui,
+    pane_rect: Rect,
+    query: &str,
+    count: Option<search::MatchCount>,
+    font: &FontId,
+    theme: &UiTheme,
+) {
+    let painter = ui.painter();
+    let probe =
+        painter.layout_no_wrap("M".into(), font.clone(), theme.text);
+    let char_w = probe.size().x.max(1.0);
+    let row_h = probe.size().y.max(1.0);
+
+    // Compact fixed-width strip; panes too narrow for a usable query
+    // field get no bar (the search itself still runs in tmux).
+    let width = (36.0 * char_w + 20.0).min(pane_rect.width() - 8.0);
+    if width < 14.0 * char_w {
+        return;
+    }
+    let pad = Vec2::new(8.0, 3.0);
+    let rect = Rect::from_min_size(
+        egui::pos2(pane_rect.max.x - width - 4.0, pane_rect.min.y + 4.0),
+        Vec2::new(width, row_h + pad.y * 2.0),
+    );
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(3),
+        theme::blend(theme.bg, theme.accent, 0.18),
+    );
+
+    let mid = rect.center().y;
+    let prefix =
+        painter.layout_no_wrap("/ ".into(), font.clone(), theme.accent);
+    let text_left = rect.min.x + pad.x + prefix.size().x;
+    painter.galley(
+        egui::pos2(rect.min.x + pad.x, mid - prefix.size().y / 2.0),
+        prefix,
+        theme.accent,
+    );
+
+    // Right-aligned: the match counter, then the key hint while the bar
+    // still leaves the query a dozen cells of room.
+    let count_text = match count {
+        Some(c) if c.partial => format!("{}+", c.total),
+        Some(c) => c.total.to_string(),
+        None => String::new(),
+    };
+    let mut right_limit = rect.max.x - pad.x;
+    if !count_text.is_empty() {
+        let counter = painter.layout_no_wrap(
+            count_text,
+            FontId::proportional(11.0),
+            theme.text_dim,
+        );
+        right_limit -= counter.size().x;
+        painter.galley(
+            egui::pos2(right_limit, mid - counter.size().y / 2.0),
+            counter,
+            theme.text_dim,
+        );
+        right_limit -= char_w;
+    }
+    let hint = painter.layout_no_wrap(
+        "esc close · ⏎ next · ⇧⏎ prev".into(),
+        FontId::proportional(11.0),
+        theme.text_dim,
+    );
+    if right_limit - hint.size().x - text_left >= 12.0 * char_w {
+        right_limit -= hint.size().x;
+        painter.galley(
+            egui::pos2(right_limit, mid - hint.size().y / 2.0),
+            hint,
+            theme.text_dim,
+        );
+        right_limit -= char_w;
+    }
+
+    // Tail-truncate the query (its cursor sits at the end, so the newest
+    // text must stay visible); one cell is reserved for the block cursor.
+    // No matches tints the query, like iTerm's not-found field.
+    let avail = (right_limit - text_left).max(0.0);
+    let budget = ((avail / char_w) as usize).saturating_sub(1);
+    let chars = query.chars().count();
+    let visible: String = if chars > budget {
+        query.chars().skip(chars - budget).collect()
+    } else {
+        query.to_string()
+    };
+    let query_color = match count {
+        Some(c) if c.total == 0 => theme.status_err,
+        _ => theme.text,
+    };
+    let text =
+        painter.layout_no_wrap(visible, font.clone(), query_color);
+    let cursor_x = text_left + text.size().x;
+    painter.galley(
+        egui::pos2(text_left, mid - text.size().y / 2.0),
+        text,
+        query_color,
+    );
+    painter.rect_filled(
+        Rect::from_min_size(
+            egui::pos2(cursor_x + 1.0, rect.min.y + pad.y),
+            Vec2::new(char_w, row_h),
+        ),
+        CornerRadius::ZERO,
+        theme.accent,
+    );
 }
 
 /// Small badge naming what a pane runs, drawn over its top-right corner,

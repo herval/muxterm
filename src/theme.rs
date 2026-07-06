@@ -145,6 +145,17 @@ pub(crate) fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
+/// tmux copy-mode search highlight (cmd+f), derived from the theme like
+/// the rest of the chrome: every match gets a subtle accent wash with
+/// its own text kept, the current match inverts to full accent.
+pub(crate) fn search_highlight(ui: &UiTheme) -> crate::tmux::SearchStyle {
+    crate::tmux::SearchStyle {
+        match_bg: to_hex(blend(ui.bg, ui.accent, 0.35)),
+        current_bg: to_hex(ui.accent),
+        current_fg: to_hex(ui.bg),
+    }
+}
+
 fn dim_hex(s: &str) -> String {
     let c = parse_hex(s).unwrap_or(Color32::GRAY);
     to_hex(blend(c, Color32::BLACK, 0.3))
@@ -288,6 +299,18 @@ mod tests {
                 assert!(parse_hex(c).is_some(), "{name} ansi {c}");
             }
         }
+    }
+
+    #[test]
+    fn search_highlight_derives_valid_hex() {
+        let (_, ui) =
+            build(preset("iterm-dark").unwrap(), &HashMap::new(), 0.25);
+        let style = search_highlight(&ui);
+        for hex in [&style.match_bg, &style.current_bg, &style.current_fg] {
+            assert!(parse_hex(hex).is_some(), "bad hex {hex}");
+        }
+        assert_eq!(style.current_bg, to_hex(ui.accent));
+        assert_eq!(style.current_fg, to_hex(ui.bg));
     }
 
     #[test]

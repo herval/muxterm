@@ -32,6 +32,7 @@ const EXIT_REFUSED: i32 = 8;
 
 const TELL_MAX: usize = 64 * 1024;
 const POST_MAX: usize = 16 * 1024;
+const NOTIFY_MAX: usize = 1024;
 
 const USAGE: &str = "\
 mux - agent mesh for muxterm panes (team = the panes of one tab)
@@ -62,6 +63,8 @@ usage: mux [--as <session>] [--json] <command> [args]
                                type a message into a teammate's terminal
                                (msg from stdin when omitted)
   post <peer> [msg...]         queue a message in their inbox (+1 notify)
+  notify [msg...]              raise your tab's attention badge in the
+                               muxterm UI (banner when it is unfocused)
   inbox [--consume]            read your queued messages
   ctx set <k> <v...> | get [k] | del <k>
                                shared per-tab key-value scratchpad
@@ -119,6 +122,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "read" => cmd_read(as_session, rest),
         "tell" => cmd_tell(as_session, rest),
         "post" => cmd_post(as_session, rest),
+        "notify" => cmd_notify(as_session, rest),
         "inbox" => cmd_inbox(as_session, rest, json),
         "ctx" => cmd_ctx(as_session, rest, json),
         "brief" => cmd_brief(as_session),
@@ -1191,6 +1195,31 @@ fn cmd_post(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
         }
     }
     println!("posted to {display}");
+    Ok(())
+}
+
+/// Raise this pane's attention badge in the GUI. Fire-and-forget: the GUI
+/// drains the spool on its poll tick and clears anything spooled while the
+/// app was closed, so there is no outcome to poll for.
+fn cmd_notify(as_session: Option<String>, args: Vec<String>) -> CmdResult {
+    let tmux = Tmux::new()?;
+    let sc = scope(&tmux, as_session)?;
+    let message = (!args.is_empty()).then(|| args.join(" "));
+    if message.as_ref().is_some_and(|m| m.len() > NOTIFY_MAX) {
+        return Err((
+            EXIT_USAGE,
+            "message too large (1 KiB max); it becomes a banner one-liner"
+                .to_string(),
+        ));
+    }
+    mesh::write_notify_request(&mesh::NotifyRequest {
+        v: 1,
+        from: sc.session,
+        message,
+        ts: mesh::now(),
+    })
+    .map_err(|e| (EXIT_TMUX, format!("spooling notify: {e}")))?;
+    println!("raised");
     Ok(())
 }
 

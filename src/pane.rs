@@ -1,6 +1,7 @@
 use egui_term::TerminalBackend;
 
 use crate::ai_prompt::LineTracker;
+use crate::attention;
 use muxterm::layout::PaneId;
 
 /// One terminal pane. Dropping it shuts the PTY down, which only detaches
@@ -12,4 +13,6 @@ pub struct Pane {
     pub title: String,
     /// Heuristic model of the shell's input line; gates the "?" prompt.
     pub line: LineTracker,
+    /// Pending activity/attention badge, rolled up per-tab in the tab bar.
+    pub attn: attention::Cell,
 }

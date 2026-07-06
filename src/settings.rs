@@ -33,6 +33,7 @@ pub struct Outcome {
     pub copy_on_select: Option<bool>,
     pub pane_titles: Option<bool>,
     pub pr_status: Option<bool>,
+    pub notifications: Option<bool>,
     pub font_size: Option<f32>,
 }
 
@@ -46,6 +47,7 @@ pub fn show(
     copy_on_select: bool,
     pane_titles: bool,
     pr_status: bool,
+    notifications: bool,
 ) -> Outcome {
     let mut out = Outcome::default();
     let grid = Grid {
@@ -133,6 +135,22 @@ pub fn show(
                 out.pr_status = Some(!pr_status);
             }
             grid.hint(ui, "branch's PR beside the title; needs gh");
+
+            grid.divider(ui, "Alerts", th.accent);
+            let mark = if notifications { "[x]" } else { "[ ]" };
+            let row = grid.body(
+                ui,
+                vec![
+                    (mark.to_string(), th.accent),
+                    (" notifications".to_string(), th.text),
+                ],
+                true,
+                false,
+            );
+            if row.clicked() {
+                out.notifications = Some(!notifications);
+            }
+            grid.hint(ui, "dock bounce + banner from background panes");
 
             grid.divider(ui, "AI agent", th.accent);
             for a in agent::AGENTS {
@@ -445,6 +463,7 @@ mod tests {
                 true,
                 true,
                 false,
+                true,
             );
         };
         // A window's first frame is an invisible sizing pass; the second
@@ -456,8 +475,8 @@ mod tests {
         for clipped in &output.shapes {
             collect_texts(&clipped.shape, &mut texts);
         }
-        // Top + bottom + 6 section rules + 7 themes + 2 agents +
-        // 3 checkboxes + 4 hints, plus the seg-built rows in pieces.
+        // Top + bottom + 7 section rules + 7 themes + 2 agents +
+        // 4 checkboxes + 5 hints, plus the seg-built rows in pieces.
         assert!(
             texts.len() >= 20,
             "expected the panel's text runs, found {}",
@@ -538,6 +557,7 @@ mod tests {
                 true,
                 true,
                 false,
+                true,
             );
         };
         let _ = ctx.run(input.clone(), frame);

@@ -45,6 +45,11 @@ copy_on_select = true
 # number; click opens the PR page). Needs the gh CLI, authenticated.
 # pr_status = true
 
+# Bounce the dock and post a banner when the muxterm window is unfocused
+# and a background pane rings the terminal bell or an agent runs
+# `mux notify`. Tab badges are always on; this gates only the OS alerts.
+# notifications = true
+
 [font]
 # Monospace font: a name searched in the macOS font folders, or a path to a
 # .ttf/.otf/.ttc file. Comment out for the built-in font (Hack).
@@ -78,6 +83,8 @@ pub struct ConfigFile {
     pub copy_on_select: bool,
     /// Poll `gh` for the current branch's PR and badge it on the tab.
     pub pr_status: bool,
+    /// Dock bounce + banner on bell/`mux notify` while unfocused.
+    pub notifications: bool,
     pub font: FontConfig,
     pub colors: HashMap<String, String>,
 }
@@ -92,6 +99,7 @@ impl Default for ConfigFile {
             pane_titles: true,
             copy_on_select: true,
             pr_status: true,
+            notifications: true,
             font: FontConfig::default(),
             colors: HashMap::new(),
         }
@@ -124,6 +132,7 @@ pub struct Style {
     pub pane_titles: bool,
     pub copy_on_select: bool,
     pub pr_status: bool,
+    pub notifications: bool,
 }
 
 pub fn path() -> PathBuf {
@@ -207,6 +216,7 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             pane_titles: cfg.pane_titles,
             copy_on_select: cfg.copy_on_select,
             pr_status: cfg.pr_status,
+            notifications: cfg.notifications,
         },
         font_data,
     )
@@ -304,6 +314,18 @@ pub fn set_pr_status(on: bool) {
         replace_top_level_line(&text, "pr_status", &line),
     ) {
         log::warn!("could not save pr_status: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's notifications checkbox.
+pub fn set_notifications(on: bool) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("notifications = {on}");
+    if let Err(e) = fs::write(
+        path(),
+        replace_top_level_line(&text, "notifications", &line),
+    ) {
+        log::warn!("could not save notifications: {e:#}");
     }
 }
 
@@ -519,6 +541,16 @@ mod tests {
         assert!(!cfg.pr_status);
         let (style, _) = resolve(&cfg);
         assert!(!style.pr_status);
+    }
+
+    #[test]
+    fn notifications_default_on_and_parses() {
+        assert!(ConfigFile::default().notifications);
+        let cfg: ConfigFile =
+            toml::from_str("notifications = false").unwrap();
+        assert!(!cfg.notifications);
+        let (style, _) = resolve(&cfg);
+        assert!(!style.notifications);
     }
 
     #[test]
