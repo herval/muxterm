@@ -17,12 +17,14 @@ use serde_json::Value;
 use crate::agent::{self, Agent};
 use crate::state;
 
-/// Steers claude away from exploratory tool-use turns - the unbounded part
-/// of a one-shot's latency - when the answer is usually already in the
-/// piped scrollback. Only added when stdin is redirected: without it there
-/// is no terminal output to answer from, and tools may be genuinely needed.
+/// Tells claude that piped stdin is the pane's recent scrollback and that a
+/// request to *do* something should be carried out with its tools, not merely
+/// described. Only added when stdin is redirected - the normal "?" flow -
+/// since without piped context there is nothing to anchor "this pane" to.
 const CONTEXT_HINT: &str =
-    "Answer from the terminal output on stdin; avoid tools unless essential.";
+    "The stdin holds this terminal pane's recent scrollback as context. When \
+     the request asks you to do something, carry it out with your tools (run \
+     commands, edit files) instead of only describing the steps.";
 
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
@@ -66,6 +68,11 @@ pub fn run(
     if agent.id == "codex" {
         let mut cmd = Command::new(agent.bin);
         cmd.arg("exec");
+        // Let the agent act: workspace-write permits running commands and
+        // editing files, confined to the pane's cwd (no network, no writes
+        // outside the workspace) - `exec`'s default read-only sandbox would
+        // block every change.
+        cmd.args(["--sandbox", "workspace-write"]);
         if let Some(m) = model {
             cmd.args(["--model", m]);
         }
@@ -100,8 +107,14 @@ pub fn run(
 /// stream-json is the only print-mode format that exposes tool calls, and
 /// it requires --verbose; --include-partial-messages adds the text deltas
 /// that make the answer stream instead of landing all at once.
+/// --dangerously-skip-permissions is what lets the agent actually *act*: in
+/// headless `-p` mode there is no prompt to approve a Bash/Edit/Write, so
+/// without it every such tool is auto-denied and the model can only answer
+/// in prose. The pane is the user's own interactive shell - the same place
+/// they would run claude by hand - so full tool access is the intent.
 fn claude_args(model: Option<&str>, with_context: bool) -> Vec<String> {
-    let mut args = vec!["-p".to_string()];
+    let mut args =
+        vec!["-p".to_string(), "--dangerously-skip-permissions".to_string()];
     if let Some(m) = model {
         args.extend(["--model".into(), m.into()]);
     }
@@ -347,9 +360,15 @@ mod tests {
     fn claude_args_gate_the_hint_on_piped_context() {
         let args = claude_args(Some("haiku"), true);
         assert!(args.contains(&"--append-system-prompt".to_string()));
-        assert_eq!(args[..3], ["-p", "--model", "haiku"]);
+        // Full tool access is always on so the agent can act, not just answer.
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert_eq!(
+            args[..4],
+            ["-p", "--dangerously-skip-permissions", "--model", "haiku"]
+        );
         let args = claude_args(None, false);
         assert!(!args.contains(&"--append-system-prompt".to_string()));
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(args.contains(&"--include-partial-messages".to_string()));
     }
 
