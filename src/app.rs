@@ -1182,12 +1182,10 @@ impl eframe::App for App {
                     pane.and_then(|p| self.agents.get(&p.session)),
                     pane.map(|p| p.title.as_str()).unwrap_or("shell"),
                 );
-                let git =
-                    pane.and_then(|p| self.git.get(&p.session)).cloned();
                 let badge =
                     pane.and_then(|p| self.pr.get(&p.session)).cloned();
                 let attn = self.tab_attention(tab);
-                (label, git, badge, attn)
+                (label, badge, attn)
             })
             .collect();
         for action in tabbar::show(ctx, &labels, self.active, &self.ui_theme) {
