@@ -1,10 +1,6 @@
-use egui::text::LayoutJob;
-use egui::{
-    Color32, CornerRadius, FontId, Pos2, Rect, RichText, TextFormat, Vec2,
-};
+use egui::{Color32, CornerRadius, Pos2, Rect, RichText, Vec2};
 
 use crate::attention;
-use crate::pr_status::Badge;
 use crate::theme::UiTheme;
 
 pub enum TabBarAction {
@@ -13,13 +9,9 @@ pub enum TabBarAction {
     OpenSettings,
 }
 
-/// Per-tab render data: label, PR chip, and the activity/attention dot
-/// (level plus its hover text). The git-branch chip is pane-only.
-pub type TabInfo = (
-    String,
-    Option<Badge>,
-    Option<(attention::Level, String)>,
-);
+/// Per-tab render data: label and the activity/attention dot (level plus
+/// its hover text). The git-branch and PR chips are pane-only.
+pub type TabInfo = (String, Option<(attention::Level, String)>);
 
 pub fn show(
     ctx: &egui::Context,
@@ -37,7 +29,7 @@ pub fn show(
                 // top-left corner (no title bar in compact chrome).
                 ui.add_space(76.0);
                 ui.spacing_mut().item_spacing.x = 3.0;
-                for (i, (label, badge, attn)) in tabs.iter().enumerate() {
+                for (i, (label, attn)) in tabs.iter().enumerate() {
                     let is_active = i == active;
                     let text = RichText::new(format!("{}  {}", i + 1, label))
                         .size(12.0)
@@ -93,38 +85,6 @@ pub fn show(
                             color,
                         );
                         let _ = resp.on_hover_text(detail);
-                    }
-                    // The tab's PR chip: its own button, so clicking it
-                    // opens the PR page instead of selecting the tab.
-                    if let Some(b) = badge {
-                        let mut job = LayoutJob::default();
-                        job.append(
-                            "\u{25CF} ",
-                            0.0,
-                            TextFormat::simple(
-                                FontId::proportional(11.0),
-                                b.kind.color(t),
-                            ),
-                        );
-                        job.append(
-                            &format!("#{}", b.number),
-                            0.0,
-                            TextFormat::simple(
-                                FontId::proportional(11.0),
-                                if is_active { t.text } else { t.text_dim },
-                            ),
-                        );
-                        let chip = egui::Button::new(job)
-                            .fill(Color32::TRANSPARENT)
-                            .corner_radius(CornerRadius::same(5))
-                            .min_size(Vec2::new(0.0, 24.0));
-                        let resp =
-                            ui.add(chip).on_hover_text(&b.detail);
-                        if resp.clicked() {
-                            ui.ctx().open_url(egui::OpenUrl::new_tab(
-                                &b.url,
-                            ));
-                        }
                     }
                 }
                 let plus = egui::Button::new(

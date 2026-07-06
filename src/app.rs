@@ -1182,10 +1182,8 @@ impl eframe::App for App {
                     pane.and_then(|p| self.agents.get(&p.session)),
                     pane.map(|p| p.title.as_str()).unwrap_or("shell"),
                 );
-                let badge =
-                    pane.and_then(|p| self.pr.get(&p.session)).cloned();
                 let attn = self.tab_attention(tab);
-                (label, badge, attn)
+                (label, attn)
             })
             .collect();
         for action in tabbar::show(ctx, &labels, self.active, &self.ui_theme) {
