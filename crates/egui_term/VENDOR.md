@@ -83,3 +83,14 @@ tmux-backed design. Local patches:
   intermediate position - a fast "scanning" flicker across the pane. The
   cursor rect, its IME anchor, and the cursor-cell fg/bg swap now only
   apply while the mode contains `SHOW_CURSOR`.
+- **P12** (`src/font.rs`, `font_measure`): quantize the cell width to the
+  physical pixel grid. epaint's text layout rounds the pen x to a whole
+  pixel after every glyph, so a P9 batched galley advances by
+  round(advance*ppp)/ppp per char - fractionally less than the raw
+  `glyph_width` P9 used as the cell width. Long same-color runs drifted
+  left of the grid (~0.2pt/cell at 12pt on retina) while everything drawn
+  per-cell (cursor, the next colored run) snapped back to it, which read
+  as phantom extra spaces before every color change and a gap that grew
+  ahead of the cursor while typing. `font_measure` now returns
+  round(width*ppp)/ppp, which the per-glyph pen rounding then matches
+  exactly at every column.
