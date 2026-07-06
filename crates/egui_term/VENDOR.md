@@ -103,3 +103,10 @@ tmux-backed design. Local patches:
   reuse the `Modifiers::COMMAND` arrow/backspace Binding keys so they *replace*
   the cross-platform defaults on macOS only (where `command` == ⌘), leaving
   Linux/Windows Ctrl+arrow word-jumps untouched.
+- **P14** (`src/backend/mod.rs`, `term::Config`): double-click selects a whole
+  non-whitespace run. Double-click already maps to `SelectionType::Semantic`,
+  but alacritty's default `semantic_escape_chars` (",│`|:\"' ()[]{}<>\t")
+  treats quotes/brackets/colons/etc. as word boundaries, so a double-click on
+  `foo(bar)` or `a/b:c` only grabbed a fragment. Setting the boundary set to
+  just whitespace (`" \t"`) makes Semantic selection cover every contiguous
+  non-whitespace character, matching iTerm/macOS word selection.

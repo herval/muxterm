@@ -179,6 +179,13 @@ impl TerminalBackend {
             // dirty frame — at the default 10k lines that's tens of MB per
             // clone once the buffer fills.
             scrolling_history: 200,
+            // muxterm patch P14: double-click selects a whole non-whitespace
+            // run. Alacritty's default semantic_escape_chars (",│`|:\"' ()[]{}<>\t")
+            // split words at quotes/brackets/colons/slashes' neighbors, so a
+            // double-click on foo(bar) or a/b:c only grabbed a fragment. Reducing
+            // the boundary set to just whitespace makes Semantic selection cover
+            // every contiguous non-whitespace character, matching iTerm/macOS.
+            semantic_escape_chars: " \t".to_owned(),
             ..term::Config::default()
         };
         let terminal_size = TerminalSize::default();
