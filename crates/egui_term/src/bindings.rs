@@ -234,6 +234,12 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         Backslash,    Modifiers::CTRL; BindingAction::Char('\x1c');
         Minus,        Modifiers::CTRL; BindingAction::Char('\x1f');
         // SHIFT
+        // Shift+Enter as a soft line break: under the kitty keyboard
+        // protocol (which apps like Claude Code enable) report it as the
+        // disambiguated CSI-u sequence for Enter (13) + Shift (mod 2), so
+        // the app can tell it from a submitting Enter. Without that mode a
+        // plain shell can't decode CSI-u, so fall back to a bare CR.
+        Enter,      Modifiers::SHIFT, +TerminalMode::DISAMBIGUATE_ESC_CODES; BindingAction::Esc("\x1b[13;2u".into());
         Enter,      Modifiers::SHIFT; BindingAction::Char('\x0d');
         Backspace,  Modifiers::SHIFT; BindingAction::Char('\x7f');
         Tab,        Modifiers::SHIFT; BindingAction::Esc("\x1b[Z".into());
@@ -478,6 +484,43 @@ mod tests {
             );
             assert_eq!(action, &found_action);
         }
+    }
+
+    #[test]
+    fn shift_enter_soft_break() {
+        let layout = BindingsLayout::default();
+        let key = InputKind::KeyCode;
+        // Plain shell (no kitty protocol): Shift+Enter is a bare CR, so it
+        // acts like Enter and never emits an undecodable escape.
+        assert_eq!(
+            layout.get_action(
+                key(Key::Enter),
+                Modifiers::SHIFT,
+                TerminalMode::empty(),
+            ),
+            BindingAction::Char('\x0d'),
+        );
+        // Under the kitty keyboard protocol it reports the disambiguated
+        // CSI-u for Enter (13) + Shift (mod 2), which an app reads as a
+        // newline insert rather than a submit.
+        assert_eq!(
+            layout.get_action(
+                key(Key::Enter),
+                Modifiers::SHIFT,
+                TerminalMode::DISAMBIGUATE_ESC_CODES,
+            ),
+            BindingAction::Esc("\x1b[13;2u".into()),
+        );
+        // Plain Enter stays a bare CR even in that mode - we don't promote
+        // it to CSI-u, so a submitting Enter is untouched.
+        assert_eq!(
+            layout.get_action(
+                key(Key::Enter),
+                Modifiers::default(),
+                TerminalMode::DISAMBIGUATE_ESC_CODES,
+            ),
+            BindingAction::Char('\x0d'),
+        );
     }
 
     #[cfg(target_os = "macos")]

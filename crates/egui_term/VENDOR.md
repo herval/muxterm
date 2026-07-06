@@ -110,3 +110,13 @@ tmux-backed design. Local patches:
   `foo(bar)` or `a/b:c` only grabbed a fragment. Setting the boundary set to
   just whitespace (`" \t"`) makes Semantic selection cover every contiguous
   non-whitespace character, matching iTerm/macOS word selection.
+- **P15** (`src/bindings.rs`, `default_keyboard_bindings`): Shift+Enter as a
+  soft line break. It bound to a bare `\x0d`, byte-identical to Enter, so an
+  app couldn't distinguish the two and always submitted. Now, when the
+  terminal mode carries `DISAMBIGUATE_ESC_CODES` (set when an app enables the
+  kitty keyboard protocol - Claude Code and other TUIs do), Shift+Enter
+  reports the kitty CSI-u sequence `ESC [ 13 ; 2 u` (Enter keycode 13, Shift
+  = modifier 2), which the app decodes as a `return` key carrying the shift
+  flag and inserts a newline instead of submitting. A second binding keeps
+  the bare CR when that mode is off, so a plain shell (which can't decode
+  CSI-u) is unaffected.
