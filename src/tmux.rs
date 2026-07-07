@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -219,6 +219,31 @@ impl TmuxCtl {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let cmd = stdout.lines().next().unwrap_or("").trim().to_string();
         (!cmd.is_empty()).then_some(cmd)
+    }
+
+    /// Foreground process of every session's active pane in one tmux round
+    /// trip, for the sidebar's working-dot ("is something other than a shell
+    /// running?"). Polled once a second, so one subprocess covering all panes
+    /// matters - the per-session `pane_current_command` would be N.
+    pub fn foreground_commands(&self) -> HashMap<String, String> {
+        let out = Command::new(&self.bin)
+            .args([
+                "-L",
+                SOCKET,
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name} #{pane_current_command}",
+            ])
+            .output();
+        match out {
+            Ok(out) if out.status.success() => {
+                parse_foreground_commands(&String::from_utf8_lossy(
+                    &out.stdout,
+                ))
+            },
+            _ => HashMap::new(),
+        }
     }
 
     /// Last `lines` of the pane's content including scrollback, as plain
@@ -445,6 +470,19 @@ impl TmuxCtl {
 
 /// Is this pane_current_command a shell sitting at a prompt? Login shells
 /// report themselves with a leading dash ("-zsh").
+/// Parse `list-panes -a -F "#{session_name} #{pane_current_command}"` output.
+/// Session names are fixed-shape (`mux-<8hex>`, no spaces), so the first
+/// space splits; the command keeps any spaces a process title may carry.
+fn parse_foreground_commands(text: &str) -> HashMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let (session, cmd) = line.split_once(' ')?;
+            (!session.is_empty() && !cmd.is_empty())
+                .then(|| (session.to_string(), cmd.trim().to_string()))
+        })
+        .collect()
+}
+
 pub fn is_shell(cmd: &str) -> bool {
     matches!(
         cmd.trim_start_matches('-'),
@@ -515,6 +553,21 @@ mod tests {
         for cmd in ["vim", "node", "claude", "ssh", ""] {
             assert!(!is_shell(cmd), "{cmd} should not count as a shell");
         }
+    }
+
+    #[test]
+    fn foreground_commands_parse() {
+        // Claude Code's process title is its version string; commands may
+        // carry spaces; blank/malformed lines are dropped.
+        let map = parse_foreground_commands(
+            "mux-aaaa1111 zsh\nmux-bbbb2222 2.1.202\nmux-cccc3333 git log\n\nbroken\n",
+        );
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["mux-aaaa1111"], "zsh");
+        assert_eq!(map["mux-bbbb2222"], "2.1.202");
+        assert_eq!(map["mux-cccc3333"], "git log");
+        assert!(is_shell(&map["mux-aaaa1111"]));
+        assert!(!is_shell(&map["mux-bbbb2222"]));
     }
 
     #[test]

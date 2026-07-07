@@ -132,6 +132,10 @@ pub struct App {
     /// tab_ids with an auto-name generation in flight, so the poll sweep
     /// doesn't spawn a second one for the same unnamed workspace.
     naming: HashSet<String>,
+    /// session -> foreground command, refreshed once a second (one
+    /// `list-panes -a` round trip). Feeds the sidebar's working-dot: a
+    /// non-shell foreground means the pane is running *something*.
+    fg_cmds: HashMap<String, String>,
     /// tab_id -> worktree result, streamed in by `workspace::spawn_worktree`.
     /// The checkout runs off the UI thread; when it lands we cd the pane in
     /// and launch the agent, so a big/lfs repo never freezes the window.
@@ -216,6 +220,7 @@ impl App {
             title_tx,
             title_rx,
             naming: HashSet::new(),
+            fg_cmds: HashMap::new(),
             worktree_tx,
             worktree_rx,
         };
@@ -1475,6 +1480,7 @@ impl eframe::App for App {
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
             self.maybe_generate_names(ctx);
+            self.fg_cmds = self.tmux.foreground_commands();
         }
 
         if log::log_enabled!(log::Level::Debug) {
@@ -1616,16 +1622,21 @@ impl eframe::App for App {
                         // A bare tab's title is already the folder name; don't
                         // echo it as the subtitle.
                         .filter(|s| *s != ws.title);
-                    // "Working" = an agent tab (launched with an agent, or
-                    // holding a mesh-registered pane) that produced output
-                    // very recently - a live streaming signal, focus-independent.
+                    // "Working" = a pane whose foreground process is not a
+                    // shell (an agent, a build, any running program - agents
+                    // can't be name-matched: Claude Code's process title is
+                    // its version string) AND recent output - a live
+                    // streaming signal, focus-independent. Typing at a
+                    // prompt stays dark (fg = the shell), and an agent that
+                    // exited back to the shell goes idle even though the
+                    // workspace was created with one.
                     // "Blocked" = a pane raised its hand (bell / `mux notify`),
                     // i.e. it stopped and is waiting; that outranks working.
-                    let is_agent_tab = ws.agent.is_some()
-                        || tab
-                            .panes
-                            .values()
-                            .any(|p| self.agents.contains_key(&p.session));
+                    let busy = tab.panes.values().any(|p| {
+                        self.fg_cmds
+                            .get(&p.session)
+                            .is_some_and(|c| !tmux::is_shell(c))
+                    });
                     let recent = tab.panes.values().any(|p| {
                         p.last_output
                             .is_some_and(|o| o.elapsed() < WORKING_WINDOW)
@@ -1636,7 +1647,7 @@ impl eframe::App for App {
                     );
                     let status = if blocked {
                         sidebar::Status::Blocked
-                    } else if is_agent_tab && recent {
+                    } else if busy && recent {
                         sidebar::Status::Working
                     } else {
                         sidebar::Status::Idle
