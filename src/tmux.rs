@@ -27,16 +27,17 @@ set -as terminal-overrides ',xterm*:Ms=\E]52;%p1%s;%p2%s\007'
 set -g focus-events on
 setw -g aggressive-resize on
 bind -n S-PPage copy-mode -u
-# A left click is forwarded here as a mouse report (egui_term reports every
-# click while tmux `mouse on` keeps the client in mouse mode). tmux's default
-# MouseDown/Up binding then `send -M`s it into the pane unconditionally, which
-# a plain shell mishandles - the click lands as input and mangles the prompt
-# line. muxterm is one pane per session, so the default's select-pane is moot;
-# only forward the click when the app actually asked for the mouse
-# (mouse_any_flag), so at a shell a click is simply ignored. Drag-select and
-# wheel-scroll use their own bindings and are unaffected.
-bind -n MouseDown1Pane if -F '#{mouse_any_flag}' 'send -M'
-bind -n MouseUp1Pane if -F '#{mouse_any_flag}' 'send -M'
+# Drop plain left clicks entirely instead of forwarding them into the pane.
+# egui_term reports every click while tmux `mouse on` keeps the client in mouse
+# mode, and tmux's default MouseDown/Up binding `send -M`s it in: a plain shell
+# mishandles that (the click lands as input and mangles the prompt), and a
+# mouse-mode TUI - notably the agent CLIs (claude/codex), which turn mouse
+# tracking on - grabs the click and moves its own cursor. Neither is wanted, so
+# a click does nothing. Text selection is still the drag (MouseDrag1Pane ->
+# copy-mode) and scrollback is still the wheel (WheelPane); both keep their own
+# bindings. Pane focus in a split is handled by the egui layer, not here.
+unbind -n MouseDown1Pane
+unbind -n MouseUp1Pane
 "##;
 
 /// Theme-derived colors for tmux's copy-mode search highlight, built by
@@ -565,7 +566,9 @@ mod tests {
         assert!(on.contains(
             "bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel"
         ));
-        assert!(!on.contains("unbind"));
+        // copy_on_select on binds the drag-end (doesn't unbind it); the base's
+        // click unbinds are unrelated.
+        assert!(!on.contains("unbind -T copy-mode MouseDragEnd1Pane"));
         let off = conf(false, &style());
         assert!(off.contains("unbind -T copy-mode MouseDragEnd1Pane"));
         assert!(off.contains("unbind -T copy-mode-vi MouseDragEnd1Pane"));
@@ -574,14 +577,10 @@ mod tests {
         for text in [&on, &off] {
             assert!(text.contains("set -g mouse on"));
             assert!(text.contains("set -s set-clipboard on"));
-            // Clicks only reach the app when it wants the mouse, so a plain
-            // shell isn't disturbed by a click.
-            assert!(text.contains(
-                "bind -n MouseDown1Pane if -F '#{mouse_any_flag}' 'send -M'"
-            ));
-            assert!(text.contains(
-                "bind -n MouseUp1Pane if -F '#{mouse_any_flag}' 'send -M'"
-            ));
+            // Plain clicks are dropped, not forwarded, so neither a shell nor
+            // a mouse-mode agent moves its cursor on click.
+            assert!(text.contains("unbind -n MouseDown1Pane"));
+            assert!(text.contains("unbind -n MouseUp1Pane"));
         }
     }
 
