@@ -35,9 +35,6 @@ pub struct Agent {
     pub models: &'static [&'static str],
     /// How `mux ask` invokes this CLI (see AskInvocation).
     pub ask: AskInvocation,
-    /// Leading args for a quiet captured one-shot (title/name generation):
-    /// `{bin} {oneshot_args...} [--model {fast_model}] '<prompt>'`.
-    pub oneshot_args: &'static [&'static str],
 }
 
 pub const AGENTS: &[Agent] = &[
@@ -48,7 +45,6 @@ pub const AGENTS: &[Agent] = &[
         fast_model: Some("haiku"),
         models: &["opus", "claude-fable-5", "sonnet", "haiku"],
         ask: AskInvocation::ClaudeStream,
-        oneshot_args: &["-p"],
     },
     Agent {
         id: "codex",
@@ -56,20 +52,18 @@ pub const AGENTS: &[Agent] = &[
         bin: "codex",
         fast_model: Some("gpt-5.4-mini"),
         models: &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
-        // The write sandbox is deliberate for asks: exec defaults to
-        // read-only, but the agent is expected to act on the answer.
-        // oneshot_args omits it - read-only is right for titling.
+        // The write sandbox is deliberate: exec defaults to read-only, but
+        // the agent is expected to act on the answer.
         ask: AskInvocation::Exec {
             args: &["exec", "--sandbox", "workspace-write"],
         },
-        oneshot_args: &["exec"],
     },
     Agent {
         id: "pi",
         label: "Pi",
         bin: "pi",
-        // Cheap model for one-shot title/name generation. Must be a member
-        // of `models` (enforced by registry_entries_are_coherent).
+        // Cheap default for `mux ask` questions. Must be a member of
+        // `models` (enforced by registry_entries_are_coherent).
         fast_model: Some("haiku"),
         // Curated pi model patterns; first = dropdown default. pi is BYOK
         // multi-provider, so these are Claude-family shorthands (the provider
@@ -80,7 +74,6 @@ pub const AGENTS: &[Agent] = &[
         // Claude-style PreToolUse hook, so it runs like codex: autonomous and
         // ungated. Print mode is unrestricted, so no sandbox flag is needed.
         ask: AskInvocation::Exec { args: &["-p"] },
-        oneshot_args: &["-p"],
     },
 ];
 
@@ -137,25 +130,6 @@ pub fn launch_command(
 ) -> String {
     let mut cmd = agent.bin.to_string();
     if let Some(m) = model.filter(|m| !m.is_empty()) {
-        cmd.push_str(" --model ");
-        cmd.push_str(m);
-    }
-    cmd.push(' ');
-    cmd.push_str(&shell_quote(prompt));
-    cmd
-}
-
-/// The captured one-shot behind AI title/name generation (workspace.rs):
-/// non-interactive, fast model, plain-text stdout. Unlike `launch_command`
-/// (interactive, user-picked model), this always uses the registry's
-/// fast_model - a summary line doesn't need a flagship.
-pub fn oneshot_command(agent: &Agent, prompt: &str) -> String {
-    let mut cmd = agent.bin.to_string();
-    for arg in agent.oneshot_args {
-        cmd.push(' ');
-        cmd.push_str(arg);
-    }
-    if let Some(m) = agent.fast_model {
         cmd.push_str(" --model ");
         cmd.push_str(m);
     }
@@ -226,25 +200,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn oneshot_command_composes() {
-        let claude = by_id("claude").unwrap();
-        assert_eq!(
-            oneshot_command(claude, "name this"),
-            "claude -p --model haiku 'name this'"
-        );
-        let codex = by_id("codex").unwrap();
-        assert_eq!(
-            oneshot_command(codex, "name this"),
-            "codex exec --model gpt-5.4-mini 'name this'"
-        );
-        let pi = by_id("pi").unwrap();
-        assert_eq!(
-            oneshot_command(pi, "name this"),
-            "pi -p --model haiku 'name this'"
-        );
     }
 
     #[test]

@@ -125,13 +125,6 @@ pub struct App {
     new_workspace: Option<NewWorkspaceForm>,
     /// Folder the creation popup pre-fills - the last one a workspace used.
     last_workspace_dir: Option<String>,
-    /// tab_id -> AI-generated title, streamed in by `workspace::spawn_title`
-    /// and `spawn_name`.
-    title_tx: Sender<(String, String)>,
-    title_rx: Receiver<(String, String)>,
-    /// tab_ids with an auto-name generation in flight, so the poll sweep
-    /// doesn't spawn a second one for the same unnamed workspace.
-    naming: HashSet<String>,
     /// session -> foreground command, refreshed once a second (one
     /// `list-panes -a` round trip). Feeds the sidebar's working-dot: a
     /// non-shell foreground means the pane is running *something*.
@@ -168,7 +161,6 @@ impl App {
         let (git_tx, git_rx) = mpsc::channel();
         let git_enabled = Arc::new(AtomicBool::new(style.git_status));
         git_status::spawn(cc.egui_ctx.clone(), git_tx, git_enabled.clone());
-        let (title_tx, title_rx) = mpsc::channel();
         let (worktree_tx, worktree_rx) = mpsc::channel();
         let (probe_tx, probe_rx) = mpsc::channel();
         // Pre-warm the binary probes for every registry agent so the
@@ -217,9 +209,6 @@ impl App {
             sidebar_open: true,
             new_workspace: None,
             last_workspace_dir: None,
-            title_tx,
-            title_rx,
-            naming: HashSet::new(),
             fg_cmds: HashMap::new(),
             worktree_tx,
             worktree_rx,
@@ -381,7 +370,7 @@ impl App {
         let tab_id = mesh::new_tab_id();
 
         let workspace = Workspace {
-            title: workspace::default_title(root.as_deref(), &prompt),
+            title: workspace::random_title(),
             root: root.clone(),
             description: None,
             prompt: prompt.clone(),
@@ -389,9 +378,6 @@ impl App {
             agent: agent.map(|a| a.id),
             model: model.clone(),
             created_at: mesh::now(),
-            // false even for a rich workspace: the one-shot `spawn_title`
-            // below still needs to land. `mux rename` is what sets this.
-            named: false,
         };
 
         self.tabs.push(Tab {
@@ -403,17 +389,6 @@ impl App {
             workspace,
         });
         self.active = self.tabs.len() - 1;
-
-        // The AI title only needs the prompt, so it can start now regardless.
-        if let (Some(agent), false) = (agent, prompt.is_empty()) {
-            workspace::spawn_title(
-                tab_id.clone(),
-                prompt.clone(),
-                agent,
-                self.title_tx.clone(),
-                ctx.clone(),
-            );
-        }
 
         if want_worktree {
             // Defer the agent launch until the worktree exists (drain_worktrees
@@ -499,56 +474,6 @@ impl App {
                 },
             }
             self.dirty = true;
-        }
-    }
-
-    /// A workspace "needs a name" while its label is still the generic
-    /// auto-default (the folder basename, or "workspace") and no AI summary
-    /// has landed. cmd+n workspaces carry a prompt-derived title, so this only
-    /// catches bare cmd+t tabs (and restored pre-name ones).
-    fn workspace_needs_name(ws: &Workspace) -> bool {
-        ws.description.is_none()
-            && ws.title == workspace::default_title(ws.root.as_deref(), "")
-    }
-
-    /// Auto-name unnamed workspaces from a snapshot of their terminal, the
-    /// same fast-model pipeline cmd+n uses for its prompt. Runs on the config-poll
-    /// tick; one attempt per tab at a time (the `naming` guard), and only once
-    /// the pane has produced enough output to summarize - a fresh empty shell
-    /// is left alone until it has activity.
-    fn maybe_generate_names(&mut self, ctx: &egui::Context) {
-        let candidates: Vec<(String, String)> = self
-            .tabs
-            .iter()
-            .filter(|t| {
-                Self::workspace_needs_name(&t.workspace)
-                    && !self.naming.contains(&t.tab_id)
-            })
-            .filter_map(|t| {
-                let pane = t.panes.get(&t.focused)?;
-                Some((t.tab_id.clone(), pane.session.clone()))
-            })
-            .collect();
-        for (tab_id, session) in candidates {
-            let scroll =
-                self.tmux.capture_pane(&session, 40).unwrap_or_default();
-            // Too little to name yet; retry on a later tick once there's more.
-            if scroll.split_whitespace().count() < 8 {
-                continue;
-            }
-            let cwd =
-                self.tmux.pane_current_path(&session).unwrap_or_default();
-            let context = format!(
-                "Working directory: {cwd}\n\nRecent terminal output:\n{scroll}"
-            );
-            self.naming.insert(tab_id.clone());
-            workspace::spawn_name(
-                tab_id,
-                context,
-                self.agent,
-                self.title_tx.clone(),
-                ctx.clone(),
-            );
         }
     }
 
@@ -680,8 +605,7 @@ impl App {
     /// `mux rename`: a pane relabelling the workspace it lives in. We resolve
     /// the requester's session to its tab (as splits do) and update that
     /// workspace's title/description - display-only, the git branch/worktree
-    /// are untouched. `named` is set so a late auto-generated title can't
-    /// clobber the deliberate one.
+    /// are untouched.
     fn drain_rename_requests(&mut self) {
         for req in mesh::take_rename_requests() {
             if req.v != 1 {
@@ -701,8 +625,6 @@ impl App {
             if let Some(description) = req.description {
                 tab.workspace.description = Some(description);
             }
-            tab.workspace.named = true;
-            self.naming.remove(&tab.tab_id);
             self.dirty = true;
         }
     }
@@ -1479,7 +1401,6 @@ impl eframe::App for App {
             self.drain_split_requests(ctx);
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
-            self.maybe_generate_names(ctx);
             self.fg_cmds = self.tmux.foreground_commands();
         }
 
@@ -1546,21 +1467,6 @@ impl eframe::App for App {
         while let Ok((bin, ok)) = self.probe_rx.try_recv() {
             self.agent_ok.insert(bin, ok);
         }
-        // AI titles/names arrive out of band; upgrade the workspace's label.
-        while let Ok((tab_id, title)) = self.title_rx.try_recv() {
-            self.naming.remove(&tab_id);
-            if let Some(tab) =
-                self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
-            {
-                // A deliberate `mux rename` wins over a late auto-title.
-                if tab.workspace.named {
-                    continue;
-                }
-                tab.workspace.title = title.clone();
-                tab.workspace.description = Some(title);
-                self.dirty = true;
-            }
-        }
         // Finished worktree checkouts: cd the pane in and launch the agent.
         self.drain_worktrees();
 
@@ -1619,8 +1525,8 @@ impl eframe::App for App {
                                     .map(|n| n.to_string_lossy().into_owned())
                             })
                         })
-                        // A bare tab's title is already the folder name; don't
-                        // echo it as the subtitle.
+                        // Don't echo a title that already is the folder name
+                        // (a rename can make them coincide).
                         .filter(|s| *s != ws.title);
                     // "Working" = a pane whose foreground process is not a
                     // shell (an agent, a build, any running program - agents
