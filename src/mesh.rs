@@ -62,12 +62,25 @@ pub fn rename_dir() -> PathBuf {
     config_dir().join("rename")
 }
 
+/// One file per session (`<session>.json`), written by `mux agent-event`
+/// (agent lifecycle hooks) and read by the GUI's poll tick to drive the
+/// sidebar status dot. Unlike the spools above these are *state*, not a
+/// queue: files are overwritten in place and removed when the agent ends.
+pub fn agent_state_dir() -> PathBuf {
+    config_dir().join("agent-state")
+}
+
+pub fn agent_state_path(session: &str) -> PathBuf {
+    agent_state_dir().join(format!("{session}.json"))
+}
+
 pub fn ensure_dirs() {
     let _ = fs::create_dir_all(inbox_dir());
     let _ = fs::create_dir_all(ctx_dir());
     let _ = fs::create_dir_all(requests_dir());
     let _ = fs::create_dir_all(notify_dir());
     let _ = fs::create_dir_all(rename_dir());
+    let _ = fs::create_dir_all(agent_state_dir());
 }
 
 pub fn now() -> u64 {
@@ -406,6 +419,65 @@ pub fn remove_session(session: &str) {
     }
     let _ = fs::remove_file(inbox_path(session));
     let _ = fs::remove_file(flag_path(session));
+    remove_agent_state(session);
+}
+
+/// A pane agent's lifecycle state, as reported by its own hooks through
+/// `mux agent-event`: "working" (turn running), "idle" (waiting for the
+/// user), "attention" (blocked on a permission/notification). The string is
+/// deliberately open - an unknown state renders as idle rather than erroring.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AgentState {
+    pub state: String,
+    pub ts: u64,
+}
+
+/// Overwrite the session's state. Concurrent hook invocations (parallel
+/// tool calls each firing PreToolUse) may race; a pid-unique temp name plus
+/// rename keeps every observed file whole, and the racers all write the
+/// same verdict anyway.
+pub fn write_agent_state(session: &str, state: &str) -> anyhow::Result<()> {
+    let _ = fs::create_dir_all(agent_state_dir());
+    let path = agent_state_path(session);
+    let tmp = agent_state_dir().join(format!(
+        "{session}.json.{}",
+        std::process::id()
+    ));
+    let record = AgentState { state: state.to_string(), ts: now() };
+    fs::write(&tmp, serde_json::to_string(&record)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+pub fn remove_agent_state(session: &str) {
+    let _ = fs::remove_file(agent_state_path(session));
+}
+
+/// Every session's reported state (file stem -> parsed record). Unreadable
+/// entries are skipped - a torn or foreign file must not break the sweep.
+pub fn read_agent_states() -> BTreeMap<String, AgentState> {
+    let mut out = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(agent_state_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(session) =
+            path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(state) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<AgentState>(&text).ok())
+        {
+            out.insert(session, state);
+        }
+    }
+    out
 }
 
 /// Drop registry entries / inboxes for dead sessions and context files for
@@ -549,6 +621,21 @@ mod tests {
         let id = new_tab_id();
         assert!(id.starts_with(TAB_ID_PREFIX));
         assert_eq!(id.len(), TAB_ID_PREFIX.len() + 8);
+    }
+
+    #[test]
+    fn agent_state_serde_round_trips_and_tolerates_unknowns() {
+        let s = AgentState { state: "working".into(), ts: 42 };
+        let back: AgentState =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap())
+                .unwrap();
+        assert_eq!(back.state, "working");
+        assert_eq!(back.ts, 42);
+        // A newer mux may report states this build doesn't know; they must
+        // parse (the GUI renders unknowns as idle).
+        let odd: AgentState =
+            serde_json::from_str(r#"{"state":"pondering","ts":1}"#).unwrap();
+        assert_eq!(odd.state, "pondering");
     }
 
     #[test]

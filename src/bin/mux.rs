@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{self, IsTerminal, Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -66,6 +66,10 @@ usage: mux [--as <session>] [--json] <command> [args]
   post <peer> [msg...]         queue a message in their inbox (+1 notify)
   notify [msg...]              raise your tab's attention badge in the
                                muxterm UI (banner when it is unfocused)
+  agent-event <state>          report agent lifecycle to the sidebar dot
+                               (working|idle|attention|gone); wired into
+                               agent hooks automatically - inert outside
+                               muxterm, never fails, never prints
   rename [--desc <text>] [name...]
                                relabel this workspace when the objective
                                changes (display-only: name and/or --desc;
@@ -131,6 +135,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "tell" => cmd_tell(as_session, rest),
         "post" => cmd_post(as_session, rest),
         "notify" => cmd_notify(as_session, rest),
+        "agent-event" => cmd_agent_event(as_session, rest),
         "rename" => cmd_rename(as_session, rest),
         "inbox" => cmd_inbox(as_session, rest, json),
         "ctx" => cmd_ctx(as_session, rest, json),
@@ -1244,6 +1249,37 @@ fn cmd_notify(as_session: Option<String>, args: Vec<String>) -> CmdResult {
     })
     .map_err(|e| (EXIT_TMUX, format!("spooling notify: {e}")))?;
     println!("raised");
+    Ok(())
+}
+
+/// The body behind agent lifecycle hooks (claude/codex settings hooks, pi's
+/// extension): record the calling pane's agent state for the sidebar dot.
+/// Deliberately unlike every other command: it must be safe to run from any
+/// hook context, so it resolves identity from MUXTERM_SESSION alone (no
+/// tmux round trips), silently no-ops outside muxterm, drains stdin (hooks
+/// pipe a JSON payload; an unread pipe could block the agent), never prints
+/// to stdout (a PreToolUse hook's stdout can be read as a decision), and
+/// always exits 0 (a nonzero PreToolUse hook can block the tool call).
+fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
+    if !io::stdin().is_terminal() {
+        let mut sink = Vec::new();
+        let _ = io::stdin().read_to_end(&mut sink);
+    }
+    let session = as_session
+        .or_else(|| env::var("MUXTERM_SESSION").ok())
+        .filter(|s| !s.is_empty());
+    let (Some(session), Some(state)) = (session, args.first()) else {
+        return Ok(());
+    };
+    match state.as_str() {
+        "gone" => mesh::remove_agent_state(&session),
+        "working" | "idle" | "attention" => {
+            if let Err(e) = mesh::write_agent_state(&session, state) {
+                eprintln!("mux: agent-event: {e:#}");
+            }
+        },
+        other => eprintln!("mux: agent-event: unknown state {other:?}"),
+    }
     Ok(())
 }
 

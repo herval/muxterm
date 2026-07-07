@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use egui_term::TerminalBackend;
 
 use crate::ai_prompt::LineTracker;
@@ -17,8 +15,4 @@ pub struct Pane {
     pub line: LineTracker,
     /// Pending activity/attention badge, rolled up per-tab in the tab bar.
     pub attn: attention::Cell,
-    /// When this pane last produced output, set on every `PtyEvent::Wakeup`
-    /// regardless of focus (unlike `attn`, which clears for the active tab).
-    /// Drives the sidebar's "agent working" dot - a live streaming signal.
-    pub last_output: Option<Instant>,
 }

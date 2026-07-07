@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_hooks;
 mod ai_prompt;
 mod app;
 mod attention;

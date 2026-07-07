@@ -44,11 +44,6 @@ const PANE_GAP: f32 = 4.0;
 /// ungated); a confused agent must not be able to shred the layout.
 const AGENT_SPLIT_MAX_PANES: usize = 8;
 
-/// How recently a pane must have produced output to count as "working" on
-/// the sidebar. Agents stream near-continuously; this bridges brief gaps
-/// (a model thinking) without keeping the light on after it finishes.
-const WORKING_WINDOW: Duration = Duration::from_secs(3);
-
 pub struct Tab {
     /// Stable id (`mux-tab-<8hex>`) scoping the agent mesh to this tab.
     pub tab_id: String,
@@ -126,9 +121,16 @@ pub struct App {
     /// Folder the creation popup pre-fills - the last one a workspace used.
     last_workspace_dir: Option<String>,
     /// session -> foreground command, refreshed once a second (one
-    /// `list-panes -a` round trip). Feeds the sidebar's working-dot: a
-    /// non-shell foreground means the pane is running *something*.
+    /// `list-panes -a` round trip). Liveness for the agent-state files: a
+    /// pane whose foreground returned to a shell has no live agent, however
+    /// its hooks died.
     fg_cmds: HashMap<String, String>,
+    /// session -> hook-reported agent state (working/idle/attention), read
+    /// from ~/.muxterm/agent-state on the poll tick. The sole driver of the
+    /// sidebar's working/attention dot: agents report themselves through
+    /// their lifecycle hooks -> `mux agent-event` (installed by
+    /// agent_hooks::ensure_installed); non-agent programs never light it.
+    agent_states: std::collections::BTreeMap<String, mesh::AgentState>,
     /// tab_id -> worktree result, streamed in by `workspace::spawn_worktree`.
     /// The checkout runs off the UI thread into the pre-claimed directory the
     /// pane already sits in; when it lands we launch the agent, so a big/lfs
@@ -211,9 +213,14 @@ impl App {
             new_workspace: None,
             last_workspace_dir: None,
             fg_cmds: HashMap::new(),
+            agent_states: std::collections::BTreeMap::new(),
             worktree_tx,
             worktree_rx,
         };
+
+        // Wire the agents' lifecycle hooks to `mux agent-event` (the sidebar
+        // status dot). Off-thread: it probes the login shell for mux's path.
+        std::thread::spawn(crate::agent_hooks::ensure_installed);
 
         match state::load() {
             LoadResult::Loaded(saved) => {
@@ -306,7 +313,6 @@ impl App {
                 LineTracker::Known(0)
             },
             attn: attention::Cell::new(Instant::now()),
-            last_output: None,
         })
     }
 
@@ -881,8 +887,6 @@ impl App {
                     if let Some((tab_idx, pane)) =
                         self.pane_and_tab_mut(backend_id)
                     {
-                        // Focus-independent, for the "working" dot.
-                        pane.last_output = Some(Instant::now());
                         if tab_idx != active || !focused {
                             pane.attn.output(Instant::now());
                         }
@@ -1421,6 +1425,23 @@ impl eframe::App for App {
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
             self.fg_cmds = self.tmux.foreground_commands();
+            // Hook-reported agent states, pruned against liveness: a session
+            // whose foreground returned to a shell (or vanished) has no live
+            // agent - it exited or was killed without firing its end hook.
+            // The ts grace covers the hook-fired-before-fg-poll-caught-up
+            // race on a freshly launched agent.
+            self.agent_states = mesh::read_agent_states();
+            self.agent_states.retain(|session, state| {
+                let live = self
+                    .fg_cmds
+                    .get(session)
+                    .is_some_and(|cmd| !tmux::is_shell(cmd));
+                if !live && mesh::now().saturating_sub(state.ts) > 5 {
+                    mesh::remove_agent_state(session);
+                    return false;
+                }
+                true
+            });
         }
 
         if log::log_enabled!(log::Level::Debug) {
@@ -1547,32 +1568,27 @@ impl eframe::App for App {
                         // Don't echo a title that already is the folder name
                         // (a rename can make them coincide).
                         .filter(|s| *s != ws.title);
-                    // "Working" = a pane whose foreground process is not a
-                    // shell (an agent, a build, any running program - agents
-                    // can't be name-matched: Claude Code's process title is
-                    // its version string) AND recent output - a live
-                    // streaming signal, focus-independent. Typing at a
-                    // prompt stays dark (fg = the shell), and an agent that
-                    // exited back to the shell goes idle even though the
-                    // workspace was created with one.
-                    // "Blocked" = a pane raised its hand (bell / `mux notify`),
-                    // i.e. it stopped and is waiting; that outranks working.
-                    let busy = tab.panes.values().any(|p| {
-                        self.fg_cmds
-                            .get(&p.session)
-                            .is_some_and(|c| !tmux::is_shell(c))
-                    });
-                    let recent = tab.panes.values().any(|p| {
-                        p.last_output
-                            .is_some_and(|o| o.elapsed() < WORKING_WINDOW)
-                    });
+                    // The dot reflects *AI agents only*, self-reported
+                    // through their lifecycle hooks (`mux agent-event`, see
+                    // agent_hooks.rs): "working" while a turn runs (even
+                    // silent thinking), "attention" when the agent stopped
+                    // for a permission/notification. Non-agent programs never
+                    // light it. "Blocked" also covers a pane raising its hand
+                    // (bell / `mux notify`), and outranks working.
+                    let hook_state = |wanted: &str| {
+                        tab.panes.values().any(|p| {
+                            self.agent_states
+                                .get(&p.session)
+                                .is_some_and(|s| s.state == wanted)
+                        })
+                    };
                     let blocked = matches!(
                         self.tab_attention(tab),
                         Some((attention::Level::Attention, _))
-                    );
+                    ) || hook_state("attention");
                     let status = if blocked {
                         sidebar::Status::Blocked
-                    } else if busy && recent {
+                    } else if hook_state("working") {
                         sidebar::Status::Working
                     } else {
                         sidebar::Status::Idle
