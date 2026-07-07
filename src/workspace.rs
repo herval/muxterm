@@ -186,6 +186,23 @@ pub fn create_worktree(root: &Path, prompt: &str) -> anyhow::Result<Worktree> {
     anyhow::bail!("no free worktree name for {base}")
 }
 
+/// Run `create_worktree` off the UI thread - the checkout can be slow on a
+/// large or lfs-heavy repo - and stream the result back to the App by tab id.
+/// Same channel + repaint wiring as the title/name generators.
+pub fn spawn_worktree(
+    tab_id: String,
+    root: PathBuf,
+    prompt: String,
+    tx: Sender<(String, Result<Worktree, String>)>,
+    ctx: egui::Context,
+) {
+    thread::spawn(move || {
+        let res = create_worktree(&root, &prompt).map_err(|e| format!("{e:#}"));
+        let _ = tx.send((tab_id, res));
+        ctx.request_repaint();
+    });
+}
+
 fn branch_exists(root: &Path, branch: &str) -> bool {
     Command::new("git")
         .arg("-C")

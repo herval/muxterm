@@ -34,7 +34,7 @@ use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowSta
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
 use crate::tmux::{self, TmuxCtl};
-use crate::workspace::{self, Workspace};
+use crate::workspace::{self, Workspace, Worktree};
 use crate::workspace_popup::{self, NewWorkspaceForm};
 
 const PANE_GAP: f32 = 4.0;
@@ -126,6 +126,11 @@ pub struct App {
     /// tab_ids with an auto-name generation in flight, so the poll sweep
     /// doesn't spawn a second one for the same unnamed workspace.
     naming: HashSet<String>,
+    /// tab_id -> worktree result, streamed in by `workspace::spawn_worktree`.
+    /// The checkout runs off the UI thread; when it lands we cd the pane in
+    /// and launch the agent, so a big/lfs repo never freezes the window.
+    worktree_tx: Sender<(String, Result<Worktree, String>)>,
+    worktree_rx: Receiver<(String, Result<Worktree, String>)>,
 }
 
 impl App {
@@ -154,6 +159,7 @@ impl App {
         let git_enabled = Arc::new(AtomicBool::new(style.git_status));
         git_status::spawn(cc.egui_ctx.clone(), git_tx, git_enabled.clone());
         let (title_tx, title_rx) = mpsc::channel();
+        let (worktree_tx, worktree_rx) = mpsc::channel();
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -193,6 +199,8 @@ impl App {
             title_tx,
             title_rx,
             naming: HashSet::new(),
+            worktree_tx,
+            worktree_rx,
         };
 
         match state::load() {
@@ -320,39 +328,22 @@ impl App {
         }
     }
 
-    /// cmd+n: build a workspace from the creation popup's form. Creates the
-    /// worktree (if requested and the folder is a git repo), opens a pane in
-    /// the worktree/folder, launches the agent seeded with the prompt, and
-    /// kicks off the async AI title. Failures in optional steps degrade
-    /// gracefully - the workspace still opens.
+    /// cmd+n: build a workspace from the creation popup's form. The pane opens
+    /// immediately in the root folder so the window never blocks; if a worktree
+    /// was requested it is created off the UI thread (see `drain_worktrees`),
+    /// and the agent launch is deferred until the pane can cd into it. Without
+    /// a worktree the agent launches straight away.
     fn create_workspace(&mut self, ctx: &egui::Context, form: NewWorkspaceForm) {
         let root = expand_dir(&form.folder);
         let prompt = form.prompt.trim().to_string();
         let agent = muxterm::agent::by_id(form.agent);
+        let model = (!form.model.is_empty()).then(|| form.model.clone());
 
-        // Worktree first, so the pane can start inside it.
-        let worktree = if form.create_worktree {
-            match root.as_deref() {
-                Some(r) if workspace::is_git_repo(r) => {
-                    match workspace::create_worktree(r, &prompt) {
-                        Ok(wt) => Some(wt),
-                        Err(e) => {
-                            log::warn!("worktree creation failed: {e:#}");
-                            None
-                        },
-                    }
-                },
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let start_dir = worktree
-            .as_ref()
-            .map(|w| w.path.clone())
-            .or_else(|| root.clone())
-            .map(|p| p.display().to_string());
+        // A worktree only happens for a git repo; the (possibly slow) checkout
+        // is done in the background, so the pane starts in the root either way.
+        let want_worktree =
+            form.create_worktree && root.as_deref().is_some_and(workspace::is_git_repo);
+        let start_dir = root.as_ref().map(|p| p.display().to_string());
 
         let pane = match self.create_pane(ctx, None, start_dir) {
             Ok(p) => p,
@@ -366,13 +357,12 @@ impl App {
         panes.insert(id, pane);
         let tab_id = mesh::new_tab_id();
 
-        let model = (!form.model.is_empty()).then(|| form.model.clone());
         let workspace = Workspace {
             title: workspace::default_title(root.as_deref(), &prompt),
             root: root.clone(),
             description: None,
             prompt: prompt.clone(),
-            worktree,
+            worktree: None, // filled in when the async checkout finishes
             agent: agent.map(|a| a.id),
             model: model.clone(),
             created_at: mesh::now(),
@@ -388,33 +378,102 @@ impl App {
         });
         self.active = self.tabs.len() - 1;
 
-        // Launch the agent in the pane, seeded with the task (same typed-input
-        // path the "?" prompt uses). Only when there's both an agent and a
-        // prompt; an empty-prompt workspace is just a shell in the folder.
+        // The AI title only needs the prompt, so it can start now regardless.
         if let (Some(agent), false) = (agent, prompt.is_empty()) {
-            let mut cmd = muxterm::agent::launch_command(
-                agent,
-                model.as_deref(),
-                &prompt,
-            )
-            .into_bytes();
-            cmd.push(b'\r');
-            if let Some(pane) = self.tabs[self.active].panes.get_mut(&id) {
-                pane.backend.process_command(BackendCommand::Write(cmd));
-            }
             workspace::spawn_title(
-                tab_id,
-                prompt,
+                tab_id.clone(),
+                prompt.clone(),
                 agent,
                 self.title_tx.clone(),
                 ctx.clone(),
             );
         }
 
+        if want_worktree {
+            // Defer the agent launch until the worktree exists (drain_worktrees
+            // cd's in and launches). The checkout runs off the UI thread.
+            workspace::spawn_worktree(
+                tab_id,
+                root.clone().expect("want_worktree implies a root"),
+                prompt,
+                self.worktree_tx.clone(),
+                ctx.clone(),
+            );
+        } else {
+            // No worktree: run the agent straight away in the root.
+            self.launch_agent(&tab_id, None);
+        }
+
         if let Some(r) = &root {
             self.last_workspace_dir = Some(r.display().to_string());
         }
         self.dirty = true;
+    }
+
+    /// Type the agent's launch command into a workspace's pane, optionally
+    /// prefixed with a `cd` into its worktree. Used both for the immediate
+    /// (no-worktree) launch and the deferred one after the checkout lands.
+    /// A prompt-less workspace with a worktree still cd's in; an empty one is
+    /// left as a plain shell.
+    fn launch_agent(&mut self, tab_id: &str, cd: Option<&std::path::Path>) {
+        let Some(tab) = self.tabs.iter().find(|t| t.tab_id == tab_id) else {
+            return;
+        };
+        let pane_id = tab.tree.first_leaf();
+        let agent = tab.workspace.agent.and_then(muxterm::agent::by_id);
+        let model = tab.workspace.model.clone();
+        let prompt = tab.workspace.prompt.clone();
+
+        let cd_part = cd.map(|p| {
+            format!("cd {}", muxterm::agent::shell_quote(&p.display().to_string()))
+        });
+        let launch = match (agent, prompt.is_empty()) {
+            (Some(a), false) => {
+                Some(muxterm::agent::launch_command(a, model.as_deref(), &prompt))
+            },
+            _ => None,
+        };
+        let line = match (cd_part, launch) {
+            (Some(cd), Some(l)) => format!("{cd} && {l}"),
+            (Some(cd), None) => cd,
+            (None, Some(l)) => l,
+            (None, None) => return,
+        };
+
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\r');
+        if let Some(pane) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.tab_id == tab_id)
+            .and_then(|t| t.panes.get_mut(&pane_id))
+        {
+            pane.backend.process_command(BackendCommand::Write(bytes));
+        }
+    }
+
+    /// Apply finished worktree checkouts: record the worktree, then cd the
+    /// pane in and launch the agent. A failed checkout falls back to running
+    /// the agent in the root, so the workspace still works.
+    fn drain_worktrees(&mut self) {
+        while let Ok((tab_id, result)) = self.worktree_rx.try_recv() {
+            match result {
+                Ok(wt) => {
+                    let path = wt.path.clone();
+                    if let Some(tab) =
+                        self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
+                    {
+                        tab.workspace.worktree = Some(wt);
+                    }
+                    self.launch_agent(&tab_id, Some(&path));
+                },
+                Err(e) => {
+                    log::warn!("worktree creation failed: {e}");
+                    self.launch_agent(&tab_id, None);
+                },
+            }
+            self.dirty = true;
+        }
     }
 
     /// A workspace "needs a name" while its label is still the generic
@@ -1402,6 +1461,8 @@ impl eframe::App for App {
                 self.dirty = true;
             }
         }
+        // Finished worktree checkouts: cd the pane in and launch the agent.
+        self.drain_worktrees();
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Sessions deliberately survive: dropping the app only detaches
