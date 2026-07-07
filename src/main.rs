@@ -44,6 +44,16 @@ fn main() -> eframe::Result {
     {
         std::env::set_var("LANG", "en_US.UTF-8");
     }
+    // A Finder/Dock launch also inherits a minimal PATH
+    // (/usr/bin:/bin:/usr/sbin:/sbin) with no Homebrew or user bin dirs, so
+    // everything muxterm shells out to breaks in surprising ways: `git
+    // worktree add` can't find the `git-lfs` filter (checkout fails), `gh` for
+    // PR status is missing, and so on. Adopt the interactive login shell's
+    // PATH once - the same source agent-binary probing uses. Panes run their
+    // own login shell, so this only affects muxterm's own subprocesses.
+    if let Some(path) = login_shell_path() {
+        std::env::set_var("PATH", path);
+    }
 
     let tmux = tmux::TmuxCtl::discover(&state::config_dir());
 
@@ -75,4 +85,22 @@ fn main() -> eframe::Result {
             })
         }),
     )
+}
+
+/// The PATH from the user's interactive login shell (`zsh -ilc`), the same
+/// probe `agent::binary_available` uses. A sentinel line isolates the value so
+/// any `.zshrc` chatter printed to stdout can't corrupt it. None on any
+/// failure - the caller then keeps the inherited (possibly minimal) PATH.
+fn login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let out = std::process::Command::new(shell)
+        .args(["-ilc", "printf '\\n__MUX_PATH__=%s\\n' \"$PATH\""])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("__MUX_PATH__="))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
 }
