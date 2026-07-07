@@ -120,3 +120,15 @@ tmux-backed design. Local patches:
   flag and inserts a newline instead of submitting. A second binding keeps
   the bare CR when that mode is off, so a plain shell (which can't decode
   CSI-u) is unaffected.
+- **P16** (`src/view.rs`, `process_left_button`, `process_mouse_move`):
+  the left mouse button is never reported to the application - clicks and
+  drags always drive the widget's local selection, shift or not (supersedes
+  P7's left-button forwarding; P7's drag tracking remains for the local
+  path). Forwarding was unwinnable under tmux: `mouse on` keeps the client
+  in MOUSE_MODE for its whole life, so every click became a mouse report,
+  and tmux hardcodes passing the second press of a double-click through to
+  a pane whose app enabled mouse tracking (the agent CLIs do) - the app's
+  cursor moved on clicks and no binding could stop it. Local selection
+  covers what the mouse is for: click anchors quietly, drag selects (P8
+  copy-on-select), double/triple selects word/line (P14). The wheel is
+  still reported (P2) - that is how tmux scrollback works.
