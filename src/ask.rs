@@ -13,6 +13,7 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde::Deserialize;
@@ -77,9 +78,16 @@ pub fn run(
 
     // agent::AskInvocation::ClaudeStream from here down.
 
+    // The stream renderer and the approval prompt write to the same terminal
+    // from different threads on unordered channels (claude's stdout pipe vs
+    // the hook's unix socket), so a tool-call announcement can land mid-line
+    // on a pending `[y/N] `. The gate serializes them: the approver holds it
+    // from prompt to answer, the renderer takes it per stream line.
+    let term_gate = Arc::new(Mutex::new(()));
+
     // The approver must outlive the whole stream: claude may ask for a tool
     // at any point. It removes its socket on drop, when `run` returns.
-    let approver = Approver::start();
+    let approver = Approver::start(term_gate.clone());
     let mut cmd = Command::new(agent.bin);
     cmd.args(claude_args(model, !io::stdin().is_terminal()));
     if let (Some(ap), Some(settings)) = (&approver, approval_settings()) {
@@ -98,8 +106,10 @@ pub fn run(
     for line in lines {
         let line =
             line.map_err(|e| format!("reading {} output: {e}", agent.bin))?;
+        let _lock = lock(&term_gate);
         let _ = fmt.on_line(&line, &mut out);
     }
+    let _lock = lock(&term_gate);
     let _ = fmt.finish(&mut out);
 
     let status = child
@@ -237,12 +247,12 @@ struct Approver {
 impl Approver {
     /// None if the socket can't be bound - the caller then leaves the hook
     /// unwired and the agent runs unattended rather than denying blindly.
-    fn start() -> Option<Self> {
+    fn start(term_gate: Arc<Mutex<()>>) -> Option<Self> {
         let sock_path = std::env::temp_dir()
             .join(format!("mux-approve-{}.sock", std::process::id()));
         let _ = fs::remove_file(&sock_path);
         let listener = UnixListener::bind(&sock_path).ok()?;
-        thread::spawn(move || serve(&listener));
+        thread::spawn(move || serve(&listener, &term_gate));
         Some(Self { sock_path })
     }
 }
@@ -254,26 +264,36 @@ impl Drop for Approver {
 }
 
 /// One approval per connection. Claude runs tools serially - it blocks on
-/// each hook - so requests arrive one at a time and never race the stream
-/// for the terminal.
-fn serve(listener: &UnixListener) {
+/// each hook - so requests arrive one at a time; the terminal gate keeps the
+/// *stream renderer* (an unordered channel: claude's stdout pipe) from
+/// printing into a pending prompt, and parks it until the human answers.
+fn serve(listener: &UnixListener, term_gate: &Mutex<()>) {
     for stream in listener.incoming().flatten() {
-        let _ = handle_request(stream);
+        let _ = handle_request(stream, term_gate);
     }
 }
 
-fn handle_request(stream: UnixStream) -> io::Result<()> {
+fn handle_request(stream: UnixStream, term_gate: &Mutex<()>) -> io::Result<()> {
     let mut req = String::new();
     BufReader::new(&stream).read_line(&mut req)?;
     let v: Value = serde_json::from_str(&req).unwrap_or(Value::Null);
     let tool = v["tool"].as_str().unwrap_or("tool");
     let summary = v["summary"].as_str().unwrap_or("");
-    let verdict = if ask_tty(tool, summary).unwrap_or(false) {
-        "allow"
-    } else {
-        "deny"
+    let verdict = {
+        let _lock = lock(term_gate);
+        if ask_tty(tool, summary).unwrap_or(false) {
+            "allow"
+        } else {
+            "deny"
+        }
     };
     writeln!(&stream, "{verdict}")
+}
+
+/// Take the terminal gate, shrugging off poisoning: a panicked holder can't
+/// corrupt a `()`, and dropping output or a prompt would be strictly worse.
+fn lock(gate: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    gate.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Prompt on /dev/tty - not stdin, which carries the piped scrollback - and
