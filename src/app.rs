@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::text::LayoutJob;
@@ -93,8 +94,13 @@ pub struct App {
     agent: &'static Agent,
     agent_context_lines: u32,
     /// Cache of `binary_available` probes; misses are evicted on failed
-    /// submits so an install-then-retry works without a restart.
+    /// submits so an install-then-retry works without a restart. Pre-warmed
+    /// at startup by a background probe of every registry agent, so the
+    /// settings/popup agent lists can hide uninstalled CLIs.
     agent_ok: HashMap<&'static str, bool>,
+    /// Results from background `binary_available` probes (bin -> ok).
+    probe_rx: Receiver<(&'static str, bool)>,
+    probe_tx: Sender<(&'static str, bool)>,
     /// session -> registered agent (mesh registry, polled like the config).
     agents: HashMap<String, mesh::AgentInfo>,
     agents_mtime: Option<SystemTime>,
@@ -160,6 +166,15 @@ impl App {
         git_status::spawn(cc.egui_ctx.clone(), git_tx, git_enabled.clone());
         let (title_tx, title_rx) = mpsc::channel();
         let (worktree_tx, worktree_rx) = mpsc::channel();
+        let (probe_tx, probe_rx) = mpsc::channel();
+        // Pre-warm the binary probes for every registry agent so the
+        // settings/popup lists can hide uninstalled CLIs. Each probe spawns
+        // an interactive login shell, so it must stay off the UI thread.
+        spawn_agent_probe(
+            agent::AGENTS.iter().map(|a| a.bin).collect(),
+            probe_tx.clone(),
+            cc.egui_ctx.clone(),
+        );
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -182,6 +197,8 @@ impl App {
             agent: style.agent,
             agent_context_lines: style.agent_context_lines,
             agent_ok: HashMap::new(),
+            probe_rx,
+            probe_tx,
             agents: mesh::load_registry().agents.into_iter().collect(),
             agents_mtime: mesh::registry_mtime(),
             pr: HashMap::new(),
@@ -490,7 +507,7 @@ impl App {
     }
 
     /// Auto-name unnamed workspaces from a snapshot of their terminal, the
-    /// same haiku pipeline cmd+n uses for its prompt. Runs on the config-poll
+    /// same fast-model pipeline cmd+n uses for its prompt. Runs on the config-poll
     /// tick; one attempt per tab at a time (the `naming` guard), and only once
     /// the pane has produced enough output to summarize - a fresh empty shell
     /// is left alone until it has activity.
@@ -951,15 +968,24 @@ impl App {
             Action::NewTab => self.new_tab(ctx, None),
             Action::NewWorkspace => {
                 if self.new_workspace.is_none() {
+                    self.reprobe_missing_agents(ctx);
                     let prefill = self
                         .last_workspace_dir
                         .clone()
                         .or_else(|| self.focused_cwd())
                         .unwrap_or_default();
+                    // Seed with the configured agent unless its CLI is
+                    // missing; then the first installed one.
+                    let installed = agent::installed(&self.agent_ok);
+                    let seed = installed
+                        .iter()
+                        .find(|a| a.id == self.agent.id)
+                        .copied()
+                        .unwrap_or(installed[0]);
                     self.new_workspace = Some(NewWorkspaceForm::new(
                         prefill,
-                        self.agent.id,
-                        workspace_popup::default_model(self.agent.id),
+                        seed.id,
+                        workspace_popup::default_model(seed.id),
                     ));
                 }
             },
@@ -1016,6 +1042,9 @@ impl App {
             },
             Action::ToggleSettings => {
                 self.settings_open = !self.settings_open;
+                if self.settings_open {
+                    self.reprobe_missing_agents(ctx);
+                }
             },
             Action::ToggleSearch => {
                 if self.search.active() {
@@ -1360,6 +1389,18 @@ impl App {
         }
     }
 
+    /// Re-probe agents whose CLI was last seen missing, so installing one
+    /// while muxterm runs makes it appear the next time a picker opens.
+    /// Known-good bins are not re-probed (each probe costs a login shell).
+    fn reprobe_missing_agents(&self, ctx: &egui::Context) {
+        let bins: Vec<_> = agent::AGENTS
+            .iter()
+            .map(|a| a.bin)
+            .filter(|b| self.agent_ok.get(b) == Some(&false))
+            .collect();
+        spawn_agent_probe(bins, self.probe_tx.clone(), ctx.clone());
+    }
+
     fn show_settings(&mut self, ctx: &egui::Context) {
         let out = settings::show(
             ctx,
@@ -1367,6 +1408,7 @@ impl App {
             &self.font,
             &self.theme_name,
             self.agent,
+            &agent::installed(&self.agent_ok),
             self.copy_on_select,
             self.pane_titles,
             self.git_status,
@@ -1494,6 +1536,9 @@ impl eframe::App for App {
         }
         while let Ok(snapshot) = self.git_rx.try_recv() {
             self.git = snapshot;
+        }
+        while let Ok((bin, ok)) = self.probe_rx.try_recv() {
+            self.agent_ok.insert(bin, ok);
         }
         // AI titles/names arrive out of band; upgrade the workspace's label.
         while let Ok((tab_id, title)) = self.title_rx.try_recv() {
@@ -1763,8 +1808,13 @@ impl eframe::App for App {
         // The workspace-creation popup. Taken out so `create_workspace` can
         // borrow self mutably; put back unless the user finished with it.
         if let Some(mut form) = self.new_workspace.take() {
-            match workspace_popup::show(ctx, &mut form, &self.ui_theme, &self.font)
-            {
+            match workspace_popup::show(
+                ctx,
+                &mut form,
+                &agent::installed(&self.agent_ok),
+                &self.ui_theme,
+                &self.font,
+            ) {
                 workspace_popup::Outcome::Create => {
                     self.create_workspace(ctx, form);
                 },
@@ -1797,6 +1847,28 @@ impl eframe::App for App {
             self.dirty = false;
         }
     }
+}
+
+/// Probe agent binaries on a background thread (each probe spawns an
+/// interactive login shell - see agent::binary_available); results land in
+/// `agent_ok` via `probe_rx` on a later frame.
+fn spawn_agent_probe(
+    bins: Vec<&'static str>,
+    tx: Sender<(&'static str, bool)>,
+    ctx: egui::Context,
+) {
+    if bins.is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        for bin in bins {
+            let ok = agent::binary_available(bin);
+            if tx.send((bin, ok)).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+        }
+    });
 }
 
 /// Resolve the popup's folder text into a path: trim, expand a leading `~`,

@@ -530,9 +530,11 @@ fn cmd_ask(mut args: Vec<String>) -> CmdResult {
     if args.is_empty() {
         return Err((
             EXIT_USAGE,
-            "usage: mux ask [--agent claude|codex] [--model <m>] \
-             <question...>  (terminal context on stdin)"
-                .to_string(),
+            format!(
+                "usage: mux ask [--agent {}] [--model <m>] \
+                 <question...>  (terminal context on stdin)",
+                muxterm::agent::ids().join("|")
+            ),
         ));
     }
     let query = args.join(" ");
@@ -540,7 +542,13 @@ fn cmd_ask(mut args: Vec<String>) -> CmdResult {
     let (agent, model) = ask::configured();
     let agent = match &agent_flag {
         Some(id) => muxterm::agent::by_id(id).ok_or_else(|| {
-            (EXIT_USAGE, format!("unknown agent {id:?} (claude | codex)"))
+            (
+                EXIT_USAGE,
+                format!(
+                    "unknown agent {id:?} ({})",
+                    muxterm::agent::ids().join(" | ")
+                ),
+            )
         })?,
         None => agent,
     };

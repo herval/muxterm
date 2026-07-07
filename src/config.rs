@@ -14,18 +14,29 @@ use muxterm::agent::{self, Agent};
 
 use crate::theme::{self, UiTheme};
 
-const DEFAULT_CONFIG: &str = r##"# muxterm configuration - edits apply live while the app is running.
+/// The commented seed config written on first run. A function, not a const:
+/// the agent list and default are formatted from agent::AGENTS so the seed
+/// can't drift from the registry when agents are added.
+fn default_config() -> String {
+    let agents = agent::AGENTS
+        .iter()
+        .map(|a| format!("\"{}\" ({})", a.id, a.label))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let default = agent::default_agent().id;
+    format!(
+        r##"# muxterm configuration - edits apply live while the app is running.
 
 # Built-in themes: "iterm-dark", "dracula", "solarized-dark", "gruvbox-dark",
 #                  "iterm-light", "solarized-light", "github-light"
 theme = "iterm-dark"
 
 # Agent CLI behind the "?" prompt line (type "?" at an empty shell
-# prompt to ask): "claude" (Claude Code) or "codex".
-agent = "claude"
+# prompt to ask), one of: {agents}.
+agent = "{default}"
 
-# Model passed to the agent as --model. Empty picks a fast default
-# ("haiku" for claude); set e.g. "sonnet" to trade speed for depth.
+# Model passed to the agent as --model. Empty picks the agent's fast
+# default; set one of its larger models to trade speed for depth.
 # agent_model = ""
 
 # Lines of pane scrollback sent to the agent as context (0 = none).
@@ -67,13 +78,15 @@ size = 14.0
 # accent = "#4a90d9"        # focused-pane border + tab highlight
 # black = "#000000"         # also: red green yellow blue magenta cyan white
 # bright_black = "#686868"  # also: bright_red ... bright_white
-"##;
+"##
+    )
+}
 
 #[derive(Deserialize, Debug)]
 #[serde(default)]
 pub struct ConfigFile {
     pub theme: String,
-    /// Agent CLI behind the "?" prompt line: "claude" or "codex".
+    /// Agent CLI behind the "?" prompt line: one of agent::AGENTS' ids.
     /// (`agent_model` also lives in the file but is read by `mux ask`,
     /// not the GUI.)
     pub agent: String,
@@ -99,7 +112,7 @@ impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             theme: "iterm-dark".into(),
-            agent: "claude".into(),
+            agent: agent::default_agent().id.into(),
             agent_context_lines: 200,
             dim_inactive_panes: 0.12,
             pane_titles: true,
@@ -161,7 +174,7 @@ pub fn ensure_default_file() {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Err(e) = fs::write(&path, DEFAULT_CONFIG) {
+    if let Err(e) = fs::write(&path, default_config()) {
         log::warn!("could not write default config: {e:#}");
     }
 }
@@ -200,11 +213,7 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
         log::warn!(
             "unknown agent {:?} (available: {}), using {}",
             cfg.agent,
-            agent::AGENTS
-                .iter()
-                .map(|a| a.id)
-                .collect::<Vec<_>>()
-                .join(", "),
+            agent::ids().join(", "),
             agent::default_agent().id
         );
         agent::default_agent()
@@ -551,8 +560,9 @@ mod tests {
         assert!(style.copy_on_select);
 
         // The default config file documents the real default.
-        let cfg: ConfigFile = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let cfg: ConfigFile = toml::from_str(&default_config()).unwrap();
         assert!(!cfg.copy_on_select);
+        assert_eq!(cfg.agent, agent::default_agent().id);
     }
 
     #[test]

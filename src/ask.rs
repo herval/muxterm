@@ -3,8 +3,9 @@
 //! The pane types only `mux ask '<question>' < <ctx-file>`; this module
 //! resolves agent + model from config.toml, spawns the agent CLI, and for
 //! claude renders its stream-json output live: text deltas as they arrive,
-//! tool calls as dim one-liners. (codex exec already streams its own
-//! progress and is spawned untouched.)
+//! tool calls as dim one-liners. (Exec-style agents - codex today - stream
+//! their own progress and are spawned untouched; the dispatch decision is
+//! the registry's `AskInvocation`.)
 
 use std::collections::HashMap;
 use std::fs;
@@ -68,20 +69,13 @@ pub fn run(
     let spawn_err =
         |e: io::Error| format!("failed to run {}: {e}", agent.bin);
 
-    if agent.id == "codex" {
+    if let agent::AskInvocation::Exec { args } = agent.ask {
         let mut cmd = Command::new(agent.bin);
-        cmd.arg("exec");
-        // Let the agent act: workspace-write permits running commands and
-        // editing files, confined to the pane's cwd (no network, no writes
-        // outside the workspace) - `exec`'s default read-only sandbox would
-        // block every change.
-        cmd.args(["--sandbox", "workspace-write"]);
-        if let Some(m) = model {
-            cmd.args(["--model", m]);
-        }
-        cmd.arg(query);
+        cmd.args(exec_argv(args, model, query));
         return Ok(cmd.status().map_err(spawn_err)?.code().unwrap_or(1));
     }
+
+    // agent::AskInvocation::ClaudeStream from here down.
 
     // The approver must outlive the whole stream: claude may ask for a tool
     // at any point. It removes its socket on drop, when `run` returns.
@@ -112,6 +106,21 @@ pub fn run(
         .wait()
         .map_err(|e| format!("waiting for {}: {e}", agent.bin))?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// The argv (after the binary) for an exec-style agent: the registry's
+/// leading args, an optional --model, then the query.
+fn exec_argv(
+    args: &[&str],
+    model: Option<&str>,
+    query: &str,
+) -> Vec<String> {
+    let mut argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    if let Some(m) = model {
+        argv.extend(["--model".into(), m.into()]);
+    }
+    argv.push(query.into());
+    argv
 }
 
 /// stream-json is the only print-mode format that exposes tool calls, and
@@ -516,9 +525,9 @@ mod tests {
     #[test]
     fn config_parses_agent_and_model() {
         let (agent, model) =
-            parse_config("agent = \"codex\"\nagent_model = \"gpt-5\"\n");
+            parse_config("agent = \"codex\"\nagent_model = \"gpt-5.5\"\n");
         assert_eq!(agent.id, "codex");
-        assert_eq!(model.as_deref(), Some("gpt-5"));
+        assert_eq!(model.as_deref(), Some("gpt-5.5"));
 
         let (agent, model) = parse_config("theme = \"dracula\"\n[font]\n");
         assert_eq!(agent.id, "claude");
@@ -526,6 +535,21 @@ mod tests {
 
         let (agent, _) = parse_config("not [ valid toml");
         assert_eq!(agent.id, "claude");
+    }
+
+    #[test]
+    fn exec_argv_composes_from_registry_args() {
+        assert_eq!(
+            exec_argv(
+                &["exec", "--sandbox", "workspace-write"],
+                Some("gpt-5.5"),
+                "fix it"
+            ),
+            ["exec", "--sandbox", "workspace-write", "--model", "gpt-5.5",
+             "fix it"]
+        );
+        // No leading args, no model: bare `bin '<query>'`.
+        assert_eq!(exec_argv(&[], None, "hi"), ["hi"]);
     }
 
     #[test]

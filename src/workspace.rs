@@ -31,7 +31,7 @@ pub struct Workspace {
     pub prompt: String,
     /// The dedicated git worktree, when "create worktree" was used.
     pub worktree: Option<Worktree>,
-    /// Agent id ("claude" | "codex") launched in the pane; None for bare.
+    /// Agent id (one of agent::AGENTS) launched in the pane; None for bare.
     pub agent: Option<&'static str>,
     pub model: Option<String>,
     pub created_at: u64,
@@ -276,15 +276,9 @@ pub fn spawn_name(
 
 fn generate(agent: &Agent, instruction: &str, body: &str) -> Option<String> {
     let full = format!("{instruction}\n\n{body}");
-    let cmdline = match agent.id {
-        // codex exec streams its own progress; the final assistant line is
-        // last, which `clean_title` picks up.
-        "codex" => format!("codex exec {}", agent::shell_quote(&full)),
-        _ => {
-            let model = agent.fast_model.unwrap_or("haiku");
-            format!("claude -p --model {model} {}", agent::shell_quote(&full))
-        },
-    };
+    // Exec-style CLIs stream their own progress; the final assistant line
+    // is last, which `clean_title` picks up.
+    let cmdline = agent::oneshot_command(agent, &full);
     // Through the interactive login shell so brew/npm PATH entries resolve the
     // agent binary exactly as a pane's shell would (see agent::binary_available).
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());

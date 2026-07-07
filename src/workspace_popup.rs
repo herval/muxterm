@@ -71,6 +71,7 @@ pub enum Outcome {
 pub fn show(
     ctx: &egui::Context,
     form: &mut NewWorkspaceForm,
+    agents: &[&'static Agent],
     th: &UiTheme,
     font: &FontId,
 ) -> Outcome {
@@ -156,7 +157,8 @@ pub fn show(
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
                 panel.seg(ui, " ", th.text_dim, false, false); // 1-cell indent
-                for a in agent::AGENTS {
+                // Pre-filtered by the caller to agents whose CLI is installed.
+                for a in agents {
                     let selected = form.agent == a.id;
                     let color = if selected { th.accent } else { th.text };
                     let marker = if selected { "> " } else { "  " };
@@ -449,8 +451,9 @@ mod tests {
             )),
             ..Default::default()
         };
+        let agents: Vec<_> = agent::AGENTS.iter().collect();
         let mut frame = |ctx: &egui::Context| {
-            let _ = show(ctx, &mut form, &ui_theme, &font);
+            let _ = show(ctx, &mut form, &agents, &ui_theme, &font);
         };
         // First frame sizes the window invisibly; the second paints for real.
         let _ = ctx.run(input.clone(), &mut frame);

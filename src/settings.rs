@@ -16,7 +16,7 @@ use egui::{
     Response, Sense, Shadow, Stroke, StrokeKind, TextFormat, Vec2,
 };
 
-use muxterm::agent::{self, Agent};
+use muxterm::agent::Agent;
 
 use crate::config;
 use crate::theme::{self, UiTheme};
@@ -45,6 +45,7 @@ pub fn show(
     font: &FontId,
     theme_name: &str,
     agent: &'static Agent,
+    agents: &[&'static Agent],
     copy_on_select: bool,
     pane_titles: bool,
     git_status: bool,
@@ -171,7 +172,8 @@ pub fn show(
             grid.hint(ui, "dock bounce + banner from background panes");
 
             grid.divider(ui, "AI agent", th.accent);
-            for a in agent::AGENTS {
+            // Pre-filtered by the caller to agents whose CLI is installed.
+            for a in agents {
                 let selected = agent.id == a.id;
                 let marker = if selected { "> " } else { "  " };
                 let color = if selected { th.accent } else { th.text };
@@ -451,6 +453,7 @@ impl Grid<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxterm::agent;
     use std::collections::HashMap;
 
     /// Render the panel headless and check the character grid: every text
@@ -471,6 +474,7 @@ mod tests {
             )),
             ..Default::default()
         };
+        let agents: Vec<_> = agent::AGENTS.iter().collect();
         let frame = |ctx: &egui::Context| {
             show(
                 ctx,
@@ -478,6 +482,7 @@ mod tests {
                 &font,
                 "iterm-dark",
                 agent::default_agent(),
+                &agents,
                 true,
                 true,
                 true,
@@ -566,6 +571,7 @@ mod tests {
             )),
             ..Default::default()
         };
+        let agents: Vec<_> = agent::AGENTS.iter().collect();
         let frame = |ctx: &egui::Context| {
             show(
                 ctx,
@@ -573,6 +579,7 @@ mod tests {
                 &font,
                 "iterm-dark",
                 agent::default_agent(),
+                &agents,
                 true,
                 true,
                 true,

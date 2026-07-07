@@ -1,8 +1,21 @@
 //! The AI agent CLIs behind the "?" prompt line, shared by the GUI
 //! (settings, probing, the typed command) and `mux ask` (the invocation).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+
+/// How `mux ask` (src/ask.rs) drives an agent's CLI.
+pub enum AskInvocation {
+    /// claude's print mode: stream-json output parsed live, mutating tools
+    /// gated through the PreToolUse approval hook. The machinery lives in
+    /// src/ask.rs; this variant is the dispatch decision.
+    ClaudeStream,
+    /// Spawn `bin` with these leading args, then `--model <m>` when a model
+    /// is set, then the query; the CLI streams its own progress to the
+    /// inherited stdio (codex exec today; the expected shape for new agents).
+    Exec { args: &'static [&'static str] },
+}
 
 /// A one-shot AI agent CLI that the "?" prompt line can drive.
 pub struct Agent {
@@ -20,6 +33,11 @@ pub struct Agent {
     /// every id the CLI accepts) - a bad pick just makes the CLI error; the
     /// first entry is the dropdown default.
     pub models: &'static [&'static str],
+    /// How `mux ask` invokes this CLI (see AskInvocation).
+    pub ask: AskInvocation,
+    /// Leading args for a quiet captured one-shot (title/name generation):
+    /// `{bin} {oneshot_args...} [--model {fast_model}] '<prompt>'`.
+    pub oneshot_args: &'static [&'static str],
 }
 
 pub const AGENTS: &[Agent] = &[
@@ -28,14 +46,23 @@ pub const AGENTS: &[Agent] = &[
         label: "Claude Code",
         bin: "claude",
         fast_model: Some("haiku"),
-        models: &["sonnet", "opus", "haiku"],
+        models: &["opus", "claude-fable-5", "sonnet", "haiku"],
+        ask: AskInvocation::ClaudeStream,
+        oneshot_args: &["-p"],
     },
     Agent {
         id: "codex",
         label: "Codex",
         bin: "codex",
-        fast_model: None,
-        models: &["gpt-5-codex", "gpt-5"],
+        fast_model: Some("gpt-5.4-mini"),
+        models: &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+        // The write sandbox is deliberate for asks: exec defaults to
+        // read-only, but the agent is expected to act on the answer.
+        // oneshot_args omits it - read-only is right for titling.
+        ask: AskInvocation::Exec {
+            args: &["exec", "--sandbox", "workspace-write"],
+        },
+        oneshot_args: &["exec"],
     },
 ];
 
@@ -45,6 +72,27 @@ pub fn by_id(id: &str) -> Option<&'static Agent> {
 
 pub fn default_agent() -> &'static Agent {
     &AGENTS[0]
+}
+
+/// Registered agent ids, for help text and error messages.
+pub fn ids() -> Vec<&'static str> {
+    AGENTS.iter().map(|a| a.id).collect()
+}
+
+/// The registry filtered by `binary_available` probe results (bin -> ok).
+/// Unprobed bins stay visible (the probe is async), and an all-missing
+/// result falls back to the full registry - an empty agent picker is never
+/// right, and `binary_available` itself fails open on spawn errors.
+pub fn installed(ok: &HashMap<&'static str, bool>) -> Vec<&'static Agent> {
+    let hits: Vec<&'static Agent> = AGENTS
+        .iter()
+        .filter(|a| ok.get(a.bin) != Some(&false))
+        .collect();
+    if hits.is_empty() {
+        AGENTS.iter().collect()
+    } else {
+        hits
+    }
 }
 
 /// The shell command a "?" submit types into the pane. Everything else -
@@ -71,6 +119,25 @@ pub fn launch_command(
 ) -> String {
     let mut cmd = agent.bin.to_string();
     if let Some(m) = model.filter(|m| !m.is_empty()) {
+        cmd.push_str(" --model ");
+        cmd.push_str(m);
+    }
+    cmd.push(' ');
+    cmd.push_str(&shell_quote(prompt));
+    cmd
+}
+
+/// The captured one-shot behind AI title/name generation (workspace.rs):
+/// non-interactive, fast model, plain-text stdout. Unlike `launch_command`
+/// (interactive, user-picked model), this always uses the registry's
+/// fast_model - a summary line doesn't need a flagship.
+pub fn oneshot_command(agent: &Agent, prompt: &str) -> String {
+    let mut cmd = agent.bin.to_string();
+    for arg in agent.oneshot_args {
+        cmd.push(' ');
+        cmd.push_str(arg);
+    }
+    if let Some(m) = agent.fast_model {
         cmd.push_str(" --model ");
         cmd.push_str(m);
     }
@@ -126,7 +193,51 @@ mod tests {
         assert!(by_id("gpt").is_none());
         assert_eq!(default_agent().id, "claude");
         assert_eq!(default_agent().fast_model, Some("haiku"));
-        assert_eq!(default_agent().models.first(), Some(&"sonnet"));
+        assert_eq!(default_agent().models.first(), Some(&"opus"));
+    }
+
+    #[test]
+    fn registry_entries_are_coherent() {
+        for a in AGENTS {
+            assert!(!a.models.is_empty(), "{} has no models", a.id);
+            if let Some(fast) = a.fast_model {
+                assert!(
+                    a.models.contains(&fast),
+                    "{}'s fast_model {fast:?} is not in its models list",
+                    a.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oneshot_command_composes() {
+        let claude = by_id("claude").unwrap();
+        assert_eq!(
+            oneshot_command(claude, "name this"),
+            "claude -p --model haiku 'name this'"
+        );
+        let codex = by_id("codex").unwrap();
+        assert_eq!(
+            oneshot_command(codex, "name this"),
+            "codex exec --model gpt-5.4-mini 'name this'"
+        );
+    }
+
+    #[test]
+    fn installed_filters_missing_bins_and_fails_open() {
+        // Unprobed bins stay visible.
+        let ok = HashMap::new();
+        assert_eq!(installed(&ok).len(), AGENTS.len());
+        // A bin probed as missing disappears.
+        let ok: HashMap<&'static str, bool> = [("codex", false)].into();
+        let hits = installed(&ok);
+        assert!(hits.iter().all(|a| a.id != "codex"));
+        assert!(!hits.is_empty());
+        // Everything missing falls back to the full registry.
+        let ok: HashMap<&'static str, bool> =
+            AGENTS.iter().map(|a| (a.bin, false)).collect();
+        assert_eq!(installed(&ok).len(), AGENTS.len());
     }
 
     #[test]
