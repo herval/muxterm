@@ -56,11 +56,18 @@ pub fn notify_dir() -> PathBuf {
     config_dir().join("notify")
 }
 
+/// Its own directory for the same reason as `notify_dir`: each drainer eats
+/// every json in its directory, so rename requests get their own spool.
+pub fn rename_dir() -> PathBuf {
+    config_dir().join("rename")
+}
+
 pub fn ensure_dirs() {
     let _ = fs::create_dir_all(inbox_dir());
     let _ = fs::create_dir_all(ctx_dir());
     let _ = fs::create_dir_all(requests_dir());
     let _ = fs::create_dir_all(notify_dir());
+    let _ = fs::create_dir_all(rename_dir());
 }
 
 pub fn now() -> u64 {
@@ -324,6 +331,73 @@ pub fn clear_notify_requests() {
     }
 }
 
+/// `mux rename`: a pane relabelling the workspace (tab) it lives in when the
+/// objective drifts from what the workspace was created for. Display-only -
+/// touches the workspace title/description, never the git branch or worktree.
+/// Fire-and-forget like a notify: the GUI drains the spool on its poll tick,
+/// resolves the caller's session to its tab, and updates that workspace.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RenameRequest {
+    pub v: u32,
+    /// Session of the pane asking to relabel its workspace.
+    pub from: String,
+    /// New display name; None leaves the title unchanged.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// New one-line description; None leaves it unchanged.
+    #[serde(default)]
+    pub description: Option<String>,
+    pub ts: u64,
+}
+
+pub fn write_rename_request(req: &RenameRequest) -> anyhow::Result<()> {
+    fs::create_dir_all(rename_dir())?;
+    // Same collision-proof naming as notify: session + ts + pid.
+    let path = rename_dir().join(format!(
+        "{}-{}-{}.json",
+        req.from,
+        req.ts,
+        std::process::id()
+    ));
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(req)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Drain pending rename requests, oldest first; each file is removed as it is
+/// read (`.json.tmp` staging files are skipped, as with splits/notifies).
+pub fn take_rename_requests() -> Vec<RenameRequest> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(rename_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let _ = fs::remove_file(&path);
+        if let Ok(req) = serde_json::from_str::<RenameRequest>(&text) {
+            out.push(req);
+        }
+    }
+    out.sort_by_key(|req| req.ts);
+    out
+}
+
+/// A rename spooled while the GUI was closed is stale by the next launch.
+pub fn clear_rename_requests() {
+    if let Ok(entries) = fs::read_dir(rename_dir()) {
+        for entry in entries.flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Deregister a session and drop its inbox artifacts (pane closed).
 pub fn remove_session(session: &str) {
     let mut reg = load_registry();
@@ -527,5 +601,27 @@ mod tests {
         let bare: NotifyRequest =
             serde_json::from_str(r#"{"v":1,"from":"mux-a","ts":1}"#).unwrap();
         assert!(bare.message.is_none());
+    }
+
+    #[test]
+    fn rename_request_round_trip() {
+        let req = RenameRequest {
+            v: 1,
+            from: "mux-aaaa".into(),
+            title: Some("Fix auth".into()),
+            description: Some("reworking the login flow".into()),
+            ts: 42,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: RenameRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.from, "mux-aaaa");
+        assert_eq!(back.title.as_deref(), Some("Fix auth"));
+        assert_eq!(back.description.as_deref(), Some("reworking the login flow"));
+        assert_eq!(back.ts, 42);
+        // title and description are both optional on the wire.
+        let bare: RenameRequest =
+            serde_json::from_str(r#"{"v":1,"from":"mux-a","ts":1}"#).unwrap();
+        assert!(bare.title.is_none());
+        assert!(bare.description.is_none());
     }
 }

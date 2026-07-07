@@ -35,6 +35,11 @@ pub struct Workspace {
     pub agent: Option<&'static str>,
     pub model: Option<String>,
     pub created_at: u64,
+    /// Set once a human (cmd+n prompt) or an agent (`mux rename`) has given
+    /// this workspace a deliberate name, so a late-arriving auto-generated
+    /// title/name can't clobber it. GUI-only, not persisted: on restore the
+    /// title is no longer the generic default, so auto-naming never re-fires.
+    pub named: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +62,7 @@ impl Workspace {
             agent: None,
             model: None,
             created_at: mesh::now(),
+            named: false,
         }
     }
 
@@ -91,6 +97,9 @@ impl Workspace {
             agent: s.agent.as_deref().and_then(agent::by_id).map(|a| a.id),
             model: s.model,
             created_at: s.created_at,
+            // Not persisted; only guards against a same-session auto-name
+            // race, and auto-naming is separately gated on title == default.
+            named: false,
         }
     }
 }
@@ -363,6 +372,7 @@ mod tests {
             agent: Some("claude"),
             model: Some("sonnet".into()),
             created_at: 7,
+            named: false,
         };
         let back = Workspace::from_state(ws.to_state());
         assert_eq!(back.agent, Some("claude"));

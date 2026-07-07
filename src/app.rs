@@ -249,6 +249,7 @@ impl App {
         // and spooled raises are stale by the next launch.
         mesh::clear_split_requests();
         mesh::clear_notify_requests();
+        mesh::clear_rename_requests();
 
         app
     }
@@ -366,6 +367,9 @@ impl App {
             agent: agent.map(|a| a.id),
             model: model.clone(),
             created_at: mesh::now(),
+            // false even for a rich workspace: the one-shot `spawn_title`
+            // below still needs to land. `mux rename` is what sets this.
+            named: false,
         };
 
         self.tabs.push(Tab {
@@ -648,6 +652,36 @@ impl App {
                 None => format!("{name} raised a hand"),
             };
             self.fire_alert(ctx, &body);
+        }
+    }
+
+    /// `mux rename`: a pane relabelling the workspace it lives in. We resolve
+    /// the requester's session to its tab (as splits do) and update that
+    /// workspace's title/description - display-only, the git branch/worktree
+    /// are untouched. `named` is set so a late auto-generated title can't
+    /// clobber the deliberate one.
+    fn drain_rename_requests(&mut self) {
+        for req in mesh::take_rename_requests() {
+            if req.v != 1 {
+                log::warn!("unsupported rename request version {}", req.v);
+                continue;
+            }
+            let found = self.tabs.iter_mut().find(|tab| {
+                tab.panes.values().any(|p| p.session == req.from)
+            });
+            let Some(tab) = found else {
+                log::debug!("rename from {}: not a muxterm pane", req.from);
+                continue;
+            };
+            if let Some(title) = req.title {
+                tab.workspace.title = title;
+            }
+            if let Some(description) = req.description {
+                tab.workspace.description = Some(description);
+            }
+            tab.workspace.named = true;
+            self.naming.remove(&tab.tab_id);
+            self.dirty = true;
         }
     }
 
@@ -1397,6 +1431,7 @@ impl eframe::App for App {
             }
             self.drain_split_requests(ctx);
             self.drain_notify_requests(ctx);
+            self.drain_rename_requests();
             self.maybe_generate_names(ctx);
         }
 
@@ -1466,6 +1501,10 @@ impl eframe::App for App {
             if let Some(tab) =
                 self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
             {
+                // A deliberate `mux rename` wins over a late auto-title.
+                if tab.workspace.named {
+                    continue;
+                }
                 tab.workspace.title = title.clone();
                 tab.workspace.description = Some(title);
                 self.dirty = true;

@@ -33,6 +33,7 @@ const EXIT_REFUSED: i32 = 8;
 const TELL_MAX: usize = 64 * 1024;
 const POST_MAX: usize = 16 * 1024;
 const NOTIFY_MAX: usize = 1024;
+const RENAME_MAX: usize = 256;
 
 const USAGE: &str = "\
 mux - agent mesh for muxterm panes (team = the panes of one tab)
@@ -65,6 +66,10 @@ usage: mux [--as <session>] [--json] <command> [args]
   post <peer> [msg...]         queue a message in their inbox (+1 notify)
   notify [msg...]              raise your tab's attention badge in the
                                muxterm UI (banner when it is unfocused)
+  rename [--desc <text>] [name...]
+                               relabel this workspace when the objective
+                               changes (display-only: name and/or --desc;
+                               never touches the git branch or worktree)
   inbox [--consume]            read your queued messages
   ctx set <k> <v...> | get [k] | del <k>
                                shared per-tab key-value scratchpad
@@ -126,6 +131,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "tell" => cmd_tell(as_session, rest),
         "post" => cmd_post(as_session, rest),
         "notify" => cmd_notify(as_session, rest),
+        "rename" => cmd_rename(as_session, rest),
         "inbox" => cmd_inbox(as_session, rest, json),
         "ctx" => cmd_ctx(as_session, rest, json),
         "brief" => cmd_brief(as_session),
@@ -1233,6 +1239,47 @@ fn cmd_notify(as_session: Option<String>, args: Vec<String>) -> CmdResult {
     Ok(())
 }
 
+/// Relabel the workspace (tab) this pane lives in - for an agent whose task
+/// has drifted from what the workspace was created for. Positional args are
+/// the new name; `--desc` sets the one-line description; at least one is
+/// required. Display-only: the GUI updates the workspace title/description
+/// and never touches the git branch or worktree. Fire-and-forget, like notify.
+fn cmd_rename(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
+    let usage = || {
+        (
+            EXIT_USAGE,
+            "usage: mux rename [--desc <text>] [name...]  (name and/or --desc)"
+                .to_string(),
+        )
+    };
+    let description = take_opt(&mut args, "--desc")?;
+    let title = (!args.is_empty()).then(|| args.join(" "));
+    if title.is_none() && description.is_none() {
+        return Err(usage());
+    }
+    for (what, val) in [("name", &title), ("description", &description)] {
+        if val.as_ref().is_some_and(|v| v.len() > RENAME_MAX) {
+            return Err((
+                EXIT_USAGE,
+                format!("{what} too long ({RENAME_MAX} chars max)"),
+            ));
+        }
+    }
+
+    let tmux = Tmux::new()?;
+    let sc = scope(&tmux, as_session)?;
+    mesh::write_rename_request(&mesh::RenameRequest {
+        v: 1,
+        from: sc.session,
+        title,
+        description,
+        ts: mesh::now(),
+    })
+    .map_err(|e| (EXIT_TMUX, format!("spooling rename: {e}")))?;
+    println!("renamed");
+    Ok(())
+}
+
 fn cmd_inbox(
     as_session: Option<String>,
     mut args: Vec<String>,
@@ -1493,6 +1540,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux tell <name> <text>` - type directly into their terminal (immediate but can interleave)");
     let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
     let _ = writeln!(out, "- `mux split [right|down] [--run <cmd>]` - add a pane beside yours for a new teammate; prints its session name");
+    let _ = writeln!(out, "- `mux rename [--desc <text>] <name>` - relabel this workspace if the objective shifts (updates the sidebar/tab; not the git branch)");
     let _ = writeln!(out);
     let _ = write!(
         out,
