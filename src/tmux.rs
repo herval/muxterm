@@ -27,6 +27,16 @@ set -as terminal-overrides ',xterm*:Ms=\E]52;%p1%s;%p2%s\007'
 set -g focus-events on
 setw -g aggressive-resize on
 bind -n S-PPage copy-mode -u
+# A left click is forwarded here as a mouse report (egui_term reports every
+# click while tmux `mouse on` keeps the client in mouse mode). tmux's default
+# MouseDown/Up binding then `send -M`s it into the pane unconditionally, which
+# a plain shell mishandles - the click lands as input and mangles the prompt
+# line. muxterm is one pane per session, so the default's select-pane is moot;
+# only forward the click when the app actually asked for the mouse
+# (mouse_any_flag), so at a shell a click is simply ignored. Drag-select and
+# wheel-scroll use their own bindings and are unaffected.
+bind -n MouseDown1Pane if -F '#{mouse_any_flag}' 'send -M'
+bind -n MouseUp1Pane if -F '#{mouse_any_flag}' 'send -M'
 "##;
 
 /// Theme-derived colors for tmux's copy-mode search highlight, built by
@@ -564,6 +574,14 @@ mod tests {
         for text in [&on, &off] {
             assert!(text.contains("set -g mouse on"));
             assert!(text.contains("set -s set-clipboard on"));
+            // Clicks only reach the app when it wants the mouse, so a plain
+            // shell isn't disturbed by a click.
+            assert!(text.contains(
+                "bind -n MouseDown1Pane if -F '#{mouse_any_flag}' 'send -M'"
+            ));
+            assert!(text.contains(
+                "bind -n MouseUp1Pane if -F '#{mouse_any_flag}' 'send -M'"
+            ));
         }
     }
 
