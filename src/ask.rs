@@ -550,6 +550,11 @@ mod tests {
         );
         // No leading args, no model: bare `bin '<query>'`.
         assert_eq!(exec_argv(&[], None, "hi"), ["hi"]);
+        // pi's print mode: `pi -p [--model m] '<query>'`.
+        assert_eq!(
+            exec_argv(&["-p"], Some("sonnet"), "hi"),
+            ["-p", "--model", "sonnet", "hi"]
+        );
     }
 
     #[test]

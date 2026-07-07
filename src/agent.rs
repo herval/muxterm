@@ -64,6 +64,24 @@ pub const AGENTS: &[Agent] = &[
         },
         oneshot_args: &["exec"],
     },
+    Agent {
+        id: "pi",
+        label: "Pi",
+        bin: "pi",
+        // Cheap model for one-shot title/name generation. Must be a member
+        // of `models` (enforced by registry_entries_are_coherent).
+        fast_model: Some("haiku"),
+        // Curated pi model patterns; first = dropdown default. pi is BYOK
+        // multi-provider, so these are Claude-family shorthands (the provider
+        // this app is used with) - adjust freely, a bad pick just errors.
+        models: &["sonnet", "opus", "haiku"],
+        // Print mode acts on its own (runs bash/edit/write) and merges piped
+        // stdin into the prompt - exactly the `mux ask` contract. pi has no
+        // Claude-style PreToolUse hook, so it runs like codex: autonomous and
+        // ungated. Print mode is unrestricted, so no sandbox flag is needed.
+        ask: AskInvocation::Exec { args: &["-p"] },
+        oneshot_args: &["-p"],
+    },
 ];
 
 pub fn by_id(id: &str) -> Option<&'static Agent> {
@@ -222,6 +240,11 @@ mod tests {
             oneshot_command(codex, "name this"),
             "codex exec --model gpt-5.4-mini 'name this'"
         );
+        let pi = by_id("pi").unwrap();
+        assert_eq!(
+            oneshot_command(pi, "name this"),
+            "pi -p --model haiku 'name this'"
+        );
     }
 
     #[test]
@@ -255,6 +278,12 @@ mod tests {
         assert_eq!(
             launch_command(claude, Some(""), "hi"),
             "claude 'hi'"
+        );
+        // pi launches interactively with a bare prompt, same as the others.
+        let pi = by_id("pi").unwrap();
+        assert_eq!(
+            launch_command(pi, Some("sonnet"), "fix it"),
+            "pi --model sonnet 'fix it'"
         );
     }
 }
