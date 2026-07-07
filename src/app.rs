@@ -130,8 +130,9 @@ pub struct App {
     /// non-shell foreground means the pane is running *something*.
     fg_cmds: HashMap<String, String>,
     /// tab_id -> worktree result, streamed in by `workspace::spawn_worktree`.
-    /// The checkout runs off the UI thread; when it lands we cd the pane in
-    /// and launch the agent, so a big/lfs repo never freezes the window.
+    /// The checkout runs off the UI thread into the pre-claimed directory the
+    /// pane already sits in; when it lands we launch the agent, so a big/lfs
+    /// repo never freezes the window.
     worktree_tx: Sender<(String, Result<Worktree, String>)>,
     worktree_rx: Receiver<(String, Result<Worktree, String>)>,
 }
@@ -340,22 +341,35 @@ impl App {
         }
     }
 
-    /// cmd+n: build a workspace from the creation popup's form. The pane opens
-    /// immediately in the root folder so the window never blocks; if a worktree
-    /// was requested it is created off the UI thread (see `drain_worktrees`),
-    /// and the agent launch is deferred until the pane can cd into it. Without
-    /// a worktree the agent launches straight away.
+    /// cmd+n: build a workspace from the creation popup's form. If a worktree
+    /// was requested its directory is claimed synchronously (cheap - a name
+    /// pick and a mkdir) so the pane opens directly inside it and no `cd` is
+    /// ever typed; the slow checkout populates it off the UI thread (see
+    /// `drain_worktrees`), which is also what defers the agent launch until
+    /// the files exist. Without a worktree the agent launches straight away.
     fn create_workspace(&mut self, ctx: &egui::Context, form: NewWorkspaceForm) {
         let root = expand_dir(&form.folder);
         let prompt = form.prompt.trim().to_string();
         let agent = muxterm::agent::by_id(form.agent);
         let model = (!form.model.is_empty()).then(|| form.model.clone());
 
-        // A worktree only happens for a git repo; the (possibly slow) checkout
-        // is done in the background, so the pane starts in the root either way.
+        // A worktree only happens for a git repo; a failed claim falls back
+        // to a plain workspace in the root.
         let want_worktree =
             form.create_worktree && root.as_deref().is_some_and(workspace::is_git_repo);
-        let start_dir = root.as_ref().map(|p| p.display().to_string());
+        let claim = want_worktree
+            .then(|| {
+                let repo = root.as_deref().expect("want_worktree implies a root");
+                workspace::claim_worktree(repo, &prompt)
+                    .map_err(|e| log::warn!("worktree claim failed: {e:#}"))
+                    .ok()
+            })
+            .flatten();
+        let start_dir = claim
+            .as_ref()
+            .map(|w| w.path.clone())
+            .or_else(|| root.clone())
+            .map(|p| p.display().to_string());
 
         let pane = match self.create_pane(ctx, None, start_dir) {
             Ok(p) => p,
@@ -390,13 +404,13 @@ impl App {
         });
         self.active = self.tabs.len() - 1;
 
-        if want_worktree {
-            // Defer the agent launch until the worktree exists (drain_worktrees
-            // cd's in and launches). The checkout runs off the UI thread.
+        if let Some(claim) = claim {
+            // The pane is already sitting in the claimed directory; the agent
+            // launch waits for the checkout to land (drain_worktrees).
             workspace::spawn_worktree(
                 tab_id,
-                root.clone().expect("want_worktree implies a root"),
-                prompt,
+                root.clone().expect("a claim implies a root"),
+                claim,
                 self.worktree_tx.clone(),
                 ctx.clone(),
             );
@@ -412,10 +426,10 @@ impl App {
     }
 
     /// Type the agent's launch command into a workspace's pane, optionally
-    /// prefixed with a `cd` into its worktree. Used both for the immediate
-    /// (no-worktree) launch and the deferred one after the checkout lands.
-    /// A prompt-less workspace with a worktree still cd's in; an empty one is
-    /// left as a plain shell.
+    /// prefixed with a `cd`. The pane normally spawns where it belongs (root
+    /// or claimed worktree), so `cd` is only for the failed-checkout fallback
+    /// that walks the pane back to the root. A prompt-less workspace is left
+    /// as a plain shell.
     fn launch_agent(&mut self, tab_id: &str, cd: Option<&std::path::Path>) {
         let Some(tab) = self.tabs.iter().find(|t| t.tab_id == tab_id) else {
             return;
@@ -453,24 +467,29 @@ impl App {
         }
     }
 
-    /// Apply finished worktree checkouts: record the worktree, then cd the
-    /// pane in and launch the agent. A failed checkout falls back to running
-    /// the agent in the root, so the workspace still works.
+    /// Apply finished worktree checkouts: the pane opened inside the claimed
+    /// directory, so success just records the worktree and launches the agent
+    /// in place. A failed checkout (the claimed dir is gone) cd's the pane
+    /// back to the root and launches there, so the workspace still works.
     fn drain_worktrees(&mut self) {
         while let Ok((tab_id, result)) = self.worktree_rx.try_recv() {
             match result {
                 Ok(wt) => {
-                    let path = wt.path.clone();
                     if let Some(tab) =
                         self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
                     {
                         tab.workspace.worktree = Some(wt);
                     }
-                    self.launch_agent(&tab_id, Some(&path));
+                    self.launch_agent(&tab_id, None);
                 },
                 Err(e) => {
                     log::warn!("worktree creation failed: {e}");
-                    self.launch_agent(&tab_id, None);
+                    let root = self
+                        .tabs
+                        .iter()
+                        .find(|t| t.tab_id == tab_id)
+                        .and_then(|t| t.workspace.root.clone());
+                    self.launch_agent(&tab_id, root.as_deref());
                 },
             }
             self.dirty = true;
@@ -1467,7 +1486,7 @@ impl eframe::App for App {
         while let Ok((bin, ok)) = self.probe_rx.try_recv() {
             self.agent_ok.insert(bin, ok);
         }
-        // Finished worktree checkouts: cd the pane in and launch the agent.
+        // Finished worktree checkouts: launch the agent in the waiting pane.
         self.drain_worktrees();
 
         if ctx.input(|i| i.viewport().close_requested()) {

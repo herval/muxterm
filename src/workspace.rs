@@ -163,11 +163,14 @@ pub fn slug(prompt: &str) -> String {
         .join("-")
 }
 
-/// Create a git worktree for `root` under `~/.muxterm/worktrees/`, on a fresh
-/// branch derived from the prompt. On a name collision (branch or directory
-/// already taken) a numeric suffix is appended until one is free. Returns the
-/// worktree so the pane can start there.
-pub fn create_worktree(root: &Path, prompt: &str) -> anyhow::Result<Worktree> {
+/// Reserve a worktree for `root` under `~/.muxterm/worktrees/`: pick a free
+/// name derived from the prompt (a numeric suffix on a branch or directory
+/// collision) and create the - still empty - directory. Synchronous and
+/// cheap, so the pane can open directly inside it and never has to `cd`;
+/// `spawn_worktree` then runs the slow checkout into it off the UI thread
+/// (`git worktree add` accepts an existing empty directory). The mkdir *is*
+/// the claim: it atomically settles racing name picks.
+pub fn claim_worktree(root: &Path, prompt: &str) -> anyhow::Result<Worktree> {
     let base = {
         let s = slug(prompt);
         if s.is_empty() {
@@ -185,41 +188,57 @@ pub fn create_worktree(root: &Path, prompt: &str) -> anyhow::Result<Worktree> {
         } else {
             format!("{base}-{attempt}")
         };
-        let path = dir.join(&name);
-        if path.exists() || branch_exists(root, &name) {
+        if branch_exists(root, &name) {
             continue;
         }
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["worktree", "add"])
-            .arg(&path)
-            .args(["-b", &name])
-            .output()?;
-        if out.status.success() {
-            return Ok(Worktree { path, branch: name });
-        }
-        let err = String::from_utf8_lossy(&out.stderr);
-        // A racing name loses to the next suffix; any other failure is real.
-        if !err.contains("already exists") {
-            anyhow::bail!("git worktree add failed: {}", err.trim());
+        let path = dir.join(&name);
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(Worktree { path, branch: name }),
+            // A taken directory loses to the next suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(e) => return Err(e.into()),
         }
     }
     anyhow::bail!("no free worktree name for {base}")
 }
 
-/// Run `create_worktree` off the UI thread - the checkout can be slow on a
+/// The slow half of `claim_worktree`: check `root` out into the claimed
+/// directory, on the claimed branch.
+fn populate_worktree(root: &Path, wt: &Worktree) -> anyhow::Result<()> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "add"])
+        .arg(&wt.path)
+        .args(["-b", &wt.branch])
+        .output()?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("git worktree add failed: {}", err.trim());
+    }
+    Ok(())
+}
+
+/// Run `populate_worktree` off the UI thread - the checkout can be slow on a
 /// large or lfs-heavy repo - and stream the result back to the App by tab id.
-/// Same channel + repaint wiring as the pr_status/git_status pollers.
+/// A failed checkout gives the claimed directory back (`remove_dir` refuses
+/// non-empty, so a partial checkout is never deleted). Same channel + repaint
+/// wiring as the pr_status/git_status pollers.
 pub fn spawn_worktree(
     tab_id: String,
     root: PathBuf,
-    prompt: String,
+    worktree: Worktree,
     tx: Sender<(String, Result<Worktree, String>)>,
     ctx: egui::Context,
 ) {
     thread::spawn(move || {
-        let res = create_worktree(&root, &prompt).map_err(|e| format!("{e:#}"));
+        let res = match populate_worktree(&root, &worktree) {
+            Ok(()) => Ok(worktree),
+            Err(e) => {
+                let _ = fs::remove_dir(&worktree.path);
+                Err(format!("{e:#}"))
+            },
+        };
         let _ = tx.send((tab_id, res));
         ctx.request_repaint();
     });
