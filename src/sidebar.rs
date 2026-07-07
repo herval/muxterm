@@ -18,6 +18,17 @@ pub enum SidebarAction {
     ToggleSidebar,
 }
 
+/// The status-light state of a workspace's leading dot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    /// No agent, or an agent that has gone quiet: a static accent dot.
+    Idle,
+    /// An agent produced output recently: a pulsating green light.
+    Working,
+    /// An agent raised its hand / rang the bell and is waiting: steady red.
+    Blocked,
+}
+
 /// One row's render data. `tab_index` maps back to `App.tabs` so click order
 /// is independent of display order (the list is sorted newest-first).
 pub struct Row {
@@ -25,8 +36,8 @@ pub struct Row {
     pub title: String,
     pub subtitle: Option<String>,
     pub active: bool,
-    /// An agent in this workspace produced output recently - light the dot.
-    pub working: bool,
+    /// Drives the leading status dot (pulsating green / steady red / accent).
+    pub status: Status,
 }
 
 pub fn show(
@@ -89,6 +100,15 @@ pub fn show(
     actions
 }
 
+/// A breathing brightness for the "working" dot: a sine over `time` (seconds)
+/// eases the color between a dimmed-toward-background trough and the full
+/// status green. ~1.4s period reads as a calm pulse, not a blink.
+fn pulse(bright: Color32, bg: Color32, time: f64) -> Color32 {
+    let s = 0.5 + 0.5 * (time * 4.5).sin() as f32; // 0..1
+    let dim = theme::blend(bright, bg, 0.6);
+    theme::blend(dim, bright, s)
+}
+
 fn icon_button(ui: &mut egui::Ui, glyph: &str, t: &UiTheme) -> egui::Response {
     ui.add(
         egui::Button::new(
@@ -109,12 +129,18 @@ fn workspace_row(
     let title_color = if row.active { t.text } else { t.text_dim };
     let pad = Vec2::new(8.0, 5.0);
 
-    // The leading dot doubles as the status light: theme green while an agent
-    // is actively working, the accent otherwise.
-    let (dot_color, dot_scale) = if row.working {
-        (t.status_ok, 0.72)
-    } else {
-        (t.accent, 0.6)
+    // The leading dot doubles as the status light: a pulsating green while an
+    // agent is working, steady red while one is blocked waiting, else a quiet
+    // accent dot. Working keeps repainting so the pulse stays smooth (and so
+    // the light goes out promptly once output stops).
+    let (dot_color, dot_scale) = match row.status {
+        Status::Working => {
+            ui.ctx().request_repaint();
+            let phase = ui.input(|i| i.time);
+            (pulse(t.status_ok, t.bg, phase), 0.72)
+        },
+        Status::Blocked => (t.status_err, 0.72),
+        Status::Idle => (t.accent, 0.6),
     };
     let mut job = LayoutJob::default();
     job.wrap.max_width = (ui.available_width() - pad.x * 2.0).max(1.0);

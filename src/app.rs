@@ -1574,6 +1574,8 @@ impl eframe::App for App {
                     // "Working" = an agent tab (launched with an agent, or
                     // holding a mesh-registered pane) that produced output
                     // very recently - a live streaming signal, focus-independent.
+                    // "Blocked" = a pane raised its hand (bell / `mux notify`),
+                    // i.e. it stopped and is waiting; that outranks working.
                     let is_agent_tab = ws.agent.is_some()
                         || tab
                             .panes
@@ -1583,23 +1585,32 @@ impl eframe::App for App {
                         p.last_output
                             .is_some_and(|o| o.elapsed() < WORKING_WINDOW)
                     });
+                    let blocked = matches!(
+                        self.tab_attention(tab),
+                        Some((attention::Level::Attention, _))
+                    );
+                    let status = if blocked {
+                        sidebar::Status::Blocked
+                    } else if is_agent_tab && recent {
+                        sidebar::Status::Working
+                    } else {
+                        sidebar::Status::Idle
+                    };
                     sidebar::Row {
                         tab_index: i,
                         title: ws.title.clone(),
                         subtitle,
                         active: i == self.active,
-                        working: is_agent_tab && recent,
+                        status,
                     }
                 })
                 .collect();
             // Rows stay in tab order (top = tab 1), so the list matches
             // cmd+1..9 and the tab-switch chords: NextTab (cmd+]) increments
             // the active index and moves the highlight *down*, PrevTab up.
-            // Keep the dots current: while anything is working, re-evaluate
-            // soon so a finished agent's light goes out promptly.
-            if rows.iter().any(|r| r.working) {
-                ctx.request_repaint_after(Duration::from_millis(600));
-            }
+            // A "working" row self-drives its pulse repaint from the sidebar;
+            // that same per-frame repaint also re-evaluates status, so a
+            // finished agent's light goes out promptly without a timer here.
             for action in sidebar::show(ctx, &rows, &self.font, &self.ui_theme) {
                 match action {
                     SidebarAction::Select(i) => {
