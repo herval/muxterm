@@ -10,6 +10,8 @@ pub enum Action {
     NewWorkspace,
     /// cmd+\: show/collapse the workspace sidebar.
     ToggleSidebar,
+    /// cmd+k: clear the focused pane's screen and scrollback (iTerm-style).
+    ClearScreen,
     ClosePane,
     Split(SplitAxis),
     PrevTab,
@@ -62,6 +64,7 @@ pub fn drain_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         consume(cmd, Key::T, Action::NewTab);
         consume(cmd, Key::N, Action::NewWorkspace);
         consume(cmd, Key::Backslash, Action::ToggleSidebar);
+        consume(cmd, Key::K, Action::ClearScreen);
         consume(cmd, Key::W, Action::ClosePane);
         // shift+[ arrives as the logical key `{` on US-like layouts, but as
         // `[` wherever shift+[ produces something else — bind both.

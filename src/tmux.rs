@@ -278,6 +278,26 @@ impl TmuxCtl {
             .output();
     }
 
+    /// iTerm-style cmd+k: clear the pane's visible screen and its scrollback.
+    /// Ctrl-L makes the shell clear and redraw its prompt at the top; tmux
+    /// scrolls the cleared screen into its history, so a beat later
+    /// `clear-history` wipes that. The short delay makes the ordering
+    /// deterministic - run before C-l's history push settles, clear-history
+    /// leaves the pushed lines behind - so it runs on a detached thread rather
+    /// than blocking the UI. Whatever the pane runs, C-l is just a redraw.
+    pub fn clear(&self, session: &str) {
+        let bin = self.bin.clone();
+        let target = format!("={session}:");
+        std::thread::spawn(move || {
+            let run = |args: &[&str]| {
+                let _ = Command::new(&bin).args(args).output();
+            };
+            run(&["-L", SOCKET, "send-keys", "-t", target.as_str(), "C-l"]);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            run(&["-L", SOCKET, "clear-history", "-t", target.as_str()]);
+        });
+    }
+
     /// One tmux invocation per cmd+f edit: (re)enter copy-mode, jump to
     /// the bottom of history so the newest match wins, run the plain-text
     /// search, and read the match counters back on the same round trip.

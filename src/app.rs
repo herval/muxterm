@@ -933,6 +933,16 @@ impl App {
                 self.sidebar_open = !self.sidebar_open;
                 self.dirty = true;
             },
+            Action::ClearScreen => {
+                let session = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.panes.get(&t.focused))
+                    .map(|p| p.session.clone());
+                if let Some(session) = session {
+                    self.tmux.clear(&session);
+                }
+            },
             Action::ClosePane => {
                 if let Some(tab) = self.tabs.get(self.active) {
                     let focused = tab.focused;
