@@ -38,8 +38,8 @@ agent = "claude"
 # pane_titles = true
 
 # Copy mouse selections straight to the clipboard (iTerm's "copy on
-# select"). When off, select then copy explicitly with cmd+c.
-copy_on_select = true
+# select"). Off by default: select, then copy explicitly with cmd+c.
+copy_on_select = false
 
 # Show the pane's git branch beside the tab title with dirty/ahead-behind
 # markers (● branch *changed ↑ahead ↓behind). Local git only, no network.
@@ -103,7 +103,7 @@ impl Default for ConfigFile {
             agent_context_lines: 200,
             dim_inactive_panes: 0.12,
             pane_titles: true,
-            copy_on_select: true,
+            copy_on_select: false,
             git_status: true,
             pr_status: true,
             notifications: true,
@@ -543,16 +543,16 @@ mod tests {
     }
 
     #[test]
-    fn copy_on_select_defaults_on_and_parses() {
-        assert!(ConfigFile::default().copy_on_select);
-        let cfg: ConfigFile = toml::from_str("copy_on_select = false").unwrap();
-        assert!(!cfg.copy_on_select);
+    fn copy_on_select_defaults_off_and_parses() {
+        assert!(!ConfigFile::default().copy_on_select);
+        let cfg: ConfigFile = toml::from_str("copy_on_select = true").unwrap();
+        assert!(cfg.copy_on_select);
         let (style, _) = resolve(&cfg);
-        assert!(!style.copy_on_select);
+        assert!(style.copy_on_select);
 
         // The default config file documents the real default.
         let cfg: ConfigFile = toml::from_str(DEFAULT_CONFIG).unwrap();
-        assert!(cfg.copy_on_select);
+        assert!(!cfg.copy_on_select);
     }
 
     #[test]
