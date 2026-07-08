@@ -203,6 +203,26 @@ pub fn retarget(
     Some(toplevel(cwds[0]).unwrap_or_else(|| cwds[0].to_path_buf()))
 }
 
+/// Where a new tab/workspace opened from this one should start: normally the
+/// focused pane's `cwd`, but when that sits inside the tab's own `worktree`,
+/// its parent repo (`root`) instead - so new work opens in the real project,
+/// not nested in the throwaway checkout. Everything else passes through. No
+/// canonicalization: a muxterm worktree path is always machine-generated under
+/// the real home, and tmux reports real cwds, so neither side has the
+/// `/tmp`-vs-`/private/tmp` divergence `retarget` has to guard against.
+pub fn escape_worktree(
+    cwd: &Path,
+    worktree: Option<&Path>,
+    root: Option<&Path>,
+) -> PathBuf {
+    if let (Some(wt), Some(root)) = (worktree, root) {
+        if cwd.starts_with(wt) {
+            return root.to_path_buf();
+        }
+    }
+    cwd.to_path_buf()
+}
+
 /// The label shown before the AI title lands - and the fallback if it never
 /// does (no agent CLI, offline): the first words of the task prompt, else
 /// "workspace".
@@ -449,6 +469,19 @@ mod tests {
     fn retarget_needs_homes_and_cwds() {
         assert_eq!(retarget(&[], &[Path::new("/x")], |_: &Path| None), None);
         assert_eq!(retarget(&[Path::new("/x")], &[], |_: &Path| None), None);
+    }
+
+    #[test]
+    fn escape_worktree_redirects_only_from_inside_the_worktree() {
+        let wt = Path::new("/home/u/.muxterm/worktrees/brisk-otter");
+        let root = Path::new("/home/u/dev/proj");
+        // Inside the worktree -> parent repo.
+        assert_eq!(escape_worktree(&wt.join("src"), Some(wt), Some(root)), root);
+        // Outside it -> unchanged.
+        let other = Path::new("/tmp/scratch");
+        assert_eq!(escape_worktree(other, Some(wt), Some(root)), other);
+        // No worktree link on the tab -> unchanged.
+        assert_eq!(escape_worktree(other, None, Some(root)), other);
     }
 
     #[test]

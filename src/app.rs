@@ -340,8 +340,25 @@ impl App {
         self.tmux.pane_current_path(&pane.session)
     }
 
+    /// The cwd to seed a new tab/workspace with: the focused pane's cwd, unless
+    /// it sits inside this tab's own worktree - then the worktree's parent repo,
+    /// so new work opens in the real project (see `workspace::escape_worktree`).
+    fn new_tab_cwd(&self) -> Option<String> {
+        let cwd = self.focused_cwd()?;
+        let ws = &self.tabs.get(self.active)?.workspace;
+        Some(
+            workspace::escape_worktree(
+                Path::new(&cwd),
+                ws.worktree.as_ref().map(|w| w.path.as_path()),
+                ws.root.as_deref(),
+            )
+            .display()
+            .to_string(),
+        )
+    }
+
     fn new_tab(&mut self, ctx: &egui::Context, session: Option<String>) {
-        let start_dir = self.focused_cwd();
+        let start_dir = self.new_tab_cwd();
         let workspace =
             Workspace::bare(start_dir.as_ref().map(PathBuf::from));
         match self.create_pane(ctx, session, start_dir) {
@@ -1050,7 +1067,7 @@ impl App {
                     let prefill = self
                         .last_workspace_dir
                         .clone()
-                        .or_else(|| self.focused_cwd())
+                        .or_else(|| self.new_tab_cwd())
                         .unwrap_or_default();
                     // Seed with the configured agent unless its CLI is
                     // missing; then the first installed one.
