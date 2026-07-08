@@ -22,6 +22,14 @@ use crate::types::Size;
 
 const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 
+// muxterm patch P17: inset the grid a few px from the pane's top-left so
+// column 0 / row 0 aren't drawn flush against (and clipped by) the pane
+// edge. The grid size is computed from the inset-reduced area (see resize)
+// so the right/bottom edges never overflow; the floor-division remainder
+// becomes the right/bottom gutter. Draw origin, mouse->grid mapping, and
+// the resize all share this offset so they stay aligned.
+const GRID_INSET: Vec2 = Vec2::new(6.0, 3.0);
+
 #[derive(Debug, Clone)]
 enum InputAction {
     BackendCall(BackendCommand),
@@ -144,8 +152,11 @@ impl<'a> TerminalView<'a> {
     }
 
     fn resize(self, layout: &Response) -> Self {
+        // P17: size the grid to the area left of the inset so the last
+        // column/row lands inside the pane rather than under its edge.
+        let usable = (layout.rect.size() - GRID_INSET).max(Vec2::ZERO);
         self.backend.process_command(BackendCommand::Resize(
-            Size::from(layout.rect.size()),
+            Size::from(usable),
             self.font.font_measure(&layout.ctx),
         ));
 
@@ -312,6 +323,10 @@ impl<'a> TerminalView<'a> {
         let content = self.backend.sync();
         let layout_min = layout.rect.min;
         let layout_max = layout.rect.max;
+        // P17: glyphs, cursor, and hover underlines hang off this inset
+        // origin; the background rect below still fills the whole pane so
+        // the gutter is painted, not left blank.
+        let origin = layout_min + GRID_INSET;
         let cell_height = content.terminal_size.cell_height;
         let cell_width = content.terminal_size.cell_width;
         let font_id = self.font.font_type();
@@ -374,8 +389,8 @@ impl<'a> TerminalView<'a> {
 
             let column = indexed.point.column.0;
             let line_num = indexed.point.line.0 + display_offset;
-            let x = layout_min.x + (cell_width * column as f32);
-            let y = layout_min.y + (cell_height * line_num as f32);
+            let x = origin.x + (cell_width * column as f32);
+            let y = origin.y + (cell_height * line_num as f32);
 
             let mut fg = self.theme.get_color(indexed.fg);
             let mut bg = self.theme.get_color(indexed.bg);
@@ -909,8 +924,8 @@ fn build_start_select_command(
 
     BackendCommand::SelectStart(
         selection_type,
-        cursor_position.x - layout.rect.min.x,
-        cursor_position.y - layout.rect.min.y,
+        cursor_position.x - layout.rect.min.x - GRID_INSET.x,
+        cursor_position.y - layout.rect.min.y - GRID_INSET.y,
     )
 }
 
@@ -922,8 +937,10 @@ fn process_mouse_move(
     modifiers: &Modifiers,
 ) -> Vec<InputAction> {
     let terminal_content = backend.last_content();
-    let cursor_x = position.x - layout.rect.min.x;
-    let cursor_y = position.y - layout.rect.min.y;
+    // P17: shift into grid space past the top-left inset before mapping to
+    // a cell; selection_point clamps the negative gutter region to cell 0.
+    let cursor_x = position.x - layout.rect.min.x - GRID_INSET.x;
+    let cursor_y = position.y - layout.rect.min.y - GRID_INSET.y;
     state.current_mouse_position_on_grid = TerminalBackend::selection_point(
         cursor_x,
         cursor_y,

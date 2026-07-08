@@ -132,3 +132,15 @@ tmux-backed design. Local patches:
   covers what the mouse is for: click anchors quietly, drag selects (P8
   copy-on-select), double/triple selects word/line (P14). The wheel is
   still reported (P2) - that is how tmux scrollback works.
+- **P17** (`src/view.rs`, `resize`, `show`, `process_mouse_move`,
+  `build_start_select_command`): inset the grid from the pane's top-left
+  corner (`GRID_INSET`). Upstream drew column 0 / row 0 at exactly
+  `rect.min`, so the first cell's glyphs rendered flush against - and were
+  clipped by - the pane edge (the floor-division remainder already left a
+  gutter on the right/bottom, so only the top-left touched). Three call
+  sites share one offset: `resize` computes cols/rows from the
+  inset-reduced area so the far edges still land inside the pane, `show`
+  hangs glyphs/cursor/underlines off `layout_min + GRID_INSET` (the
+  background rect still fills the whole pane so the gutter is painted), and
+  the mouse->grid mapping subtracts the same inset before locating a cell
+  (`selection_point` clamps a click in the gutter to cell 0).
