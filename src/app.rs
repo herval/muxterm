@@ -1688,7 +1688,7 @@ impl eframe::App for App {
         }
 
         // The workspace sidebar (a left panel) must be added before the
-        // CentralPanel. Rows are newest-first; `tab_index` maps a click back
+        // CentralPanel. Rows are in tab order; `tab_index` maps a click back
         // to the real tab regardless of display order.
         if self.sidebar_open {
             let rows: Vec<sidebar::Row> = self

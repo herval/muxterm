@@ -1,5 +1,5 @@
 //! The workspace sidebar: a collapsible, resizable left panel listing every
-//! tab as a workspace (Conductor-style), newest first. Styled to read like
+//! tab as a workspace (Conductor-style), in tab order. Styled to read like
 //! terminal content - the terminal background and the pane's monospace font,
 //! not a native gray panel - so it sits flush with the panes beside it.
 //! Display-only, like `tabbar`: it returns a vec of actions the App applies.
@@ -30,7 +30,7 @@ pub enum Status {
 }
 
 /// One row's render data. `tab_index` maps back to `App.tabs` so click order
-/// is independent of display order (the list is sorted newest-first).
+/// is independent of display order.
 pub struct Row {
     pub tab_index: usize,
     pub title: String,
