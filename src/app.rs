@@ -120,6 +120,13 @@ pub struct App {
     new_workspace: Option<NewWorkspaceForm>,
     /// Folder the creation popup pre-fills - the last one a workspace used.
     last_workspace_dir: Option<String>,
+    /// tab_id -> AI-generated title, streamed in by `workspace::spawn_title`.
+    title_tx: Sender<(String, String)>,
+    title_rx: Receiver<(String, String)>,
+    /// tab_ids with a title generation in flight. A drained title only lands
+    /// while its tab is still here; `mux rename` removes it, so a deliberate
+    /// name can't be clobbered by a late auto-title.
+    naming: HashSet<String>,
     /// session -> foreground command + cwd, refreshed once a second (one
     /// `list-panes -a` round trip). The command is liveness for the
     /// agent-state files (a pane whose foreground returned to a shell has no
@@ -169,6 +176,7 @@ impl App {
         let (git_tx, git_rx) = mpsc::channel();
         let git_enabled = Arc::new(AtomicBool::new(style.git_status));
         git_status::spawn(cc.egui_ctx.clone(), git_tx, git_enabled.clone());
+        let (title_tx, title_rx) = mpsc::channel();
         let (worktree_tx, worktree_rx) = mpsc::channel();
         let (probe_tx, probe_rx) = mpsc::channel();
         // Pre-warm the binary probes for every registry agent so the
@@ -217,6 +225,9 @@ impl App {
             sidebar_open: true,
             new_workspace: None,
             last_workspace_dir: None,
+            title_tx,
+            title_rx,
+            naming: HashSet::new(),
             pane_snap: HashMap::new(),
             agent_states: std::collections::BTreeMap::new(),
             worktree_tx,
@@ -372,7 +383,7 @@ impl App {
         let claim = want_worktree
             .then(|| {
                 let repo = root.as_deref().expect("want_worktree implies a root");
-                workspace::claim_worktree(repo, &prompt)
+                workspace::claim_worktree(repo)
                     .map_err(|e| log::warn!("worktree claim failed: {e:#}"))
                     .ok()
             })
@@ -395,8 +406,16 @@ impl App {
         panes.insert(id, pane);
         let tab_id = mesh::new_tab_id();
 
+        // A prompt-derived placeholder shows instantly; the AI title upgrades
+        // it out of band (spawn_title below). A prompt-less workspace has
+        // nothing to summarize, so it keeps a random codename like a bare tab.
+        let title = if prompt.is_empty() {
+            workspace::random_title()
+        } else {
+            workspace::placeholder_title(&prompt)
+        };
         let workspace = Workspace {
-            title: workspace::random_title(),
+            title,
             root: root.clone(),
             description: None,
             prompt: prompt.clone(),
@@ -415,6 +434,20 @@ impl App {
             workspace,
         });
         self.active = self.tabs.len() - 1;
+
+        // The AI title only needs the prompt, so it can start now regardless
+        // of the worktree checkout. Best-effort: no agent or a failed call
+        // leaves the placeholder title in place.
+        if let (Some(agent), false) = (agent, prompt.is_empty()) {
+            self.naming.insert(tab_id.clone());
+            workspace::spawn_title(
+                tab_id.clone(),
+                prompt.clone(),
+                agent,
+                self.title_tx.clone(),
+                ctx.clone(),
+            );
+        }
 
         if let Some(claim) = claim {
             // The pane is already sitting in the claimed directory; the agent
@@ -720,7 +753,8 @@ impl App {
     /// `mux rename`: a pane relabelling the workspace it lives in. We resolve
     /// the requester's session to its tab (as splits do) and update that
     /// workspace's title/description - display-only, the git branch/worktree
-    /// are untouched.
+    /// are untouched. Drops the tab from `naming` so a still-in-flight
+    /// auto-title can't clobber the deliberate name.
     fn drain_rename_requests(&mut self) {
         for req in mesh::take_rename_requests() {
             if req.v != 1 {
@@ -734,12 +768,16 @@ impl App {
                 log::debug!("rename from {}: not a muxterm pane", req.from);
                 continue;
             };
+            let tab_id = tab.tab_id.clone();
             if let Some(title) = req.title {
                 tab.workspace.title = title;
             }
             if let Some(description) = req.description {
                 tab.workspace.description = Some(description);
             }
+            // A deliberate rename ends any pending auto-title for this tab, so
+            // a late one can't clobber the name the agent just chose.
+            self.naming.remove(&tab_id);
             self.dirty = true;
         }
     }
@@ -1597,6 +1635,19 @@ impl eframe::App for App {
         }
         while let Ok((bin, ok)) = self.probe_rx.try_recv() {
             self.agent_ok.insert(bin, ok);
+        }
+        // AI titles arrive out of band; upgrade the workspace's label. A tab
+        // dropped from `naming` (killed, or renamed via `mux rename`) means the
+        // title is no longer up for grabs, so a late arrival is ignored.
+        while let Ok((tab_id, title)) = self.title_rx.try_recv() {
+            if !self.naming.remove(&tab_id) {
+                continue;
+            }
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
+            {
+                tab.workspace.title = title;
+                self.dirty = true;
+            }
         }
         // Finished worktree checkouts: launch the agent in the waiting pane.
         self.drain_worktrees();

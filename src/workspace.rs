@@ -1,9 +1,9 @@
 //! Workspaces: a tab's sense of what it is *for*. Every tab carries a
 //! `Workspace` - bare for a plain cmd+t shell tab, rich for a cmd+n workspace
 //! (a project folder, an optional git worktree, the task prompt, the agent,
-//! and a random two-word codename as its title). The layout's source of truth
-//! is `state::WorkspaceState`; this is the live GUI-side value plus the git
-//! and naming helpers.
+//! and a short AI-generated title). The layout's source of truth is
+//! `state::WorkspaceState`; this is the live GUI-side value plus the git and
+//! title-generation helpers.
 //!
 //! Worktrees live under `~/.muxterm/worktrees/` - outside their repos - so the
 //! repo's own `git status` stays clean and no `.gitignore` handling is needed.
@@ -14,7 +14,7 @@ use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::thread;
 
-use muxterm::agent;
+use muxterm::agent::{self, Agent};
 use muxterm::mesh;
 use muxterm::state::{self, WorkspaceState, WorktreeState};
 
@@ -25,8 +25,9 @@ pub struct Workspace {
     /// when every pane leaves it (and its repo), the App's root sync
     /// repoints it at where they went (`retarget`).
     pub root: Option<PathBuf>,
-    /// Display label: a random two-word codename, until a human or an agent
-    /// renames it (`mux rename`).
+    /// Display label: a prompt-derived placeholder at first, upgraded to a
+    /// short AI title (`spawn_title`), until a human or an agent renames it
+    /// (`mux rename`). Bare tabs keep a random codename.
     pub title: String,
     /// One-line summary; only `mux rename --desc` sets it.
     pub description: Option<String>,
@@ -119,11 +120,11 @@ const ANIMALS: &[&str] = &[
     "sparrow", "stoat", "swan", "tapir", "toucan", "walrus", "wombat", "wren",
 ];
 
-/// A random adjective-animal codename ("brisk-otter"): every workspace's
-/// birth name. Random rather than AI-generated: instant, needs no agent CLI,
-/// and two words tell tabs apart - the sidebar subtitle carries the
-/// folder/branch. Randomness comes from uuid v4 bytes (the crate's one
-/// existing entropy source; no rand dependency).
+/// A random adjective-animal codename ("brisk-otter"): the name of a
+/// workspace's git worktree/branch, and a bare cmd+t tab's title. Random
+/// rather than derived from the prompt: instant, needs no agent CLI, git-safe,
+/// and keeps the task's words out of the branch. Randomness comes from uuid v4
+/// bytes (the crate's one existing entropy source; no rand dependency).
 pub fn random_title() -> String {
     let b = uuid::Uuid::new_v4().into_bytes();
     let adj = ADJECTIVES[usize::from(b[0]) % ADJECTIVES.len()];
@@ -202,40 +203,26 @@ pub fn retarget(
     Some(toplevel(cwds[0]).unwrap_or_else(|| cwds[0].to_path_buf()))
 }
 
-/// A git-branch-safe slug from the task prompt: the first few words,
-/// lowercased with non-alphanumerics stripped, joined by '-'. May be empty
-/// (all punctuation / no prompt) - the caller supplies the fallback.
-pub fn slug(prompt: &str) -> String {
-    prompt
-        .split_whitespace()
-        .map(|w| {
-            w.chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .map(|c| c.to_ascii_lowercase())
-                .collect::<String>()
-        })
-        .filter(|w| !w.is_empty())
-        .take(6)
-        .collect::<Vec<_>>()
-        .join("-")
+/// The label shown before the AI title lands - and the fallback if it never
+/// does (no agent CLI, offline): the first words of the task prompt, else
+/// "workspace".
+pub fn placeholder_title(prompt: &str) -> String {
+    let p = prompt.trim();
+    if p.is_empty() {
+        return "workspace".to_string();
+    }
+    p.split_whitespace().take(6).collect::<Vec<_>>().join(" ")
 }
 
 /// Reserve a worktree for `root` under `~/.muxterm/worktrees/`: pick a free
-/// name derived from the prompt (a numeric suffix on a branch or directory
+/// name (a random codename, with a numeric suffix on a branch or directory
 /// collision) and create the - still empty - directory. Synchronous and
 /// cheap, so the pane can open directly inside it and never has to `cd`;
 /// `spawn_worktree` then runs the slow checkout into it off the UI thread
 /// (`git worktree add` accepts an existing empty directory). The mkdir *is*
 /// the claim: it atomically settles racing name picks.
-pub fn claim_worktree(root: &Path, prompt: &str) -> anyhow::Result<Worktree> {
-    let base = {
-        let s = slug(prompt);
-        if s.is_empty() {
-            "workspace".to_string()
-        } else {
-            s
-        }
-    };
+pub fn claim_worktree(root: &Path) -> anyhow::Result<Worktree> {
+    let base = random_title();
     let dir = state::worktrees_dir();
     fs::create_dir_all(&dir)?;
 
@@ -312,20 +299,86 @@ fn branch_exists(root: &Path, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
+const TITLE_INSTRUCTION: &str =
+    "Summarize this coding task as a short, descriptive title of 2 to 5 words \
+     capturing the intent. Reply with only the title: no quotes, no trailing \
+     punctuation.";
+
+/// Kick off a background one-shot small-model call that turns the task prompt
+/// into a short title, streamed back to the App keyed by tab id. Mirrors the
+/// pr_status/git_status poller wiring (an mpsc Sender plus an egui::Context to
+/// wake the UI). Best-effort: on any failure the workspace keeps its
+/// prompt-derived placeholder title.
+pub fn spawn_title(
+    tab_id: String,
+    prompt: String,
+    agent: &'static Agent,
+    tx: Sender<(String, String)>,
+    ctx: egui::Context,
+) {
+    thread::spawn(move || {
+        if let Some(title) =
+            generate(agent, TITLE_INSTRUCTION, &format!("Task: {prompt}"))
+        {
+            if tx.send((tab_id, title)).is_ok() {
+                ctx.request_repaint();
+            }
+        }
+    });
+}
+
+fn generate(agent: &Agent, instruction: &str, body: &str) -> Option<String> {
+    let full = format!("{instruction}\n\n{body}");
+    // Exec-style CLIs stream their own progress; the final assistant line
+    // is last, which `clean_title` picks up.
+    let cmdline = agent::oneshot_command(agent, &full);
+    // Through the interactive login shell so brew/npm PATH entries resolve the
+    // agent binary exactly as a pane's shell would (see agent::binary_available).
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let out = Command::new(shell).args(["-ilc", &cmdline]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let title = clean_title(&String::from_utf8_lossy(&out.stdout));
+    (!title.is_empty()).then_some(title)
+}
+
+/// Reduce a model reply to one tidy title line: the last non-empty line
+/// (codex prints its answer last; claude prints only the answer), unquoted and
+/// clipped to a few words.
+fn clean_title(raw: &str) -> String {
+    let line = raw
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`');
+    line.split_whitespace().take(8).collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn slug_from_prompt() {
-        assert_eq!(slug("Wire up OAuth login"), "wire-up-oauth-login");
-        assert_eq!(slug("  fix   the build!! "), "fix-the-build");
-        assert_eq!(slug("C++ & Rust: interop"), "c-rust-interop");
-        assert_eq!(slug(""), "");
-        assert_eq!(slug("---"), "");
-        // Long prompts are capped without a trailing dash.
-        assert!(slug(&"word ".repeat(40)).len() <= 40);
-        assert!(!slug(&"word ".repeat(40)).ends_with('-'));
+    fn placeholder_title_from_prompt() {
+        assert_eq!(
+            placeholder_title("add a settings sidebar to the app now"),
+            "add a settings sidebar to the"
+        );
+        assert_eq!(placeholder_title("  "), "workspace");
+        assert_eq!(placeholder_title(""), "workspace");
+    }
+
+    #[test]
+    fn clean_title_takes_last_line_unquoted() {
+        assert_eq!(clean_title("\"Fix the flaky test\""), "Fix the flaky test");
+        assert_eq!(
+            clean_title("thinking...\nrunning\nAdd auth to API"),
+            "Add auth to API"
+        );
+        assert_eq!(clean_title("   \n  \n"), "");
     }
 
     #[test]
