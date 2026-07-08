@@ -59,6 +59,10 @@ pub struct TerminalView<'a> {
     // muxterm patch P8: finishing a local mouse selection copies it to the
     // clipboard (iTerm's "copy on select"). Off by default.
     copy_on_select: bool,
+    // muxterm patch P18: when false, the view renders but ignores all input
+    // (keyboard, pointer, link hover) - a read-only preview, e.g. a peeked
+    // archived workspace. On by default.
+    interactive: bool,
 }
 
 impl Widget for TerminalView<'_> {
@@ -99,6 +103,7 @@ impl<'a> TerminalView<'a> {
             theme: TerminalTheme::default(),
             bindings_layout: BindingsLayout::new(),
             copy_on_select: false,
+            interactive: true,
         }
     }
 
@@ -129,6 +134,14 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_copy_on_select(mut self, copy_on_select: bool) -> Self {
         self.copy_on_select = copy_on_select;
+        self
+    }
+
+    /// muxterm patch P18: render the terminal but ignore all input - a
+    /// read-only preview. On by default.
+    #[inline]
+    pub fn set_interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
         self
     }
 
@@ -168,6 +181,11 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         state: &mut TerminalViewState,
     ) -> Self {
+        // muxterm patch P18: a non-interactive view is a read-only preview -
+        // skip keyboard, pointer, and link-hover entirely (it still renders).
+        if !self.interactive {
+            return self;
+        }
         // muxterm patch P1: upstream required focus AND pointer-over to process
         // any input, which kills typing in split panes whenever the mouse
         // rests over another pane. Gate keyboard events on focus and pointer

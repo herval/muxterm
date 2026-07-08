@@ -16,17 +16,26 @@ use egui::{
 use muxterm::agent::{self, Agent};
 
 use crate::theme::{self, UiTheme};
+use crate::workspace::{Branch, BranchChoice};
 
 /// Live state of the open popup, owned by the App as `Option<NewWorkspaceForm>`.
 pub struct NewWorkspaceForm {
     pub folder: String,
     pub create_worktree: bool,
+    /// The branch typeahead's text: empty = a fresh codename branch; an
+    /// existing branch checks it out; an unknown name creates it. Resolved
+    /// against `branches` by `branch_choice`.
+    pub branch: String,
     pub prompt: String,
     pub agent: &'static str,
     pub model: String,
     /// Cached `is_git_repo` for `folder`, refreshed only when the folder text
     /// settles on an existing directory (so we don't spawn `git` per keystroke).
     is_repo: bool,
+    /// Branches of `folder`'s repo, newest commit first; empty when not a
+    /// repo. Refreshed together with `is_repo` (same `checked` guard), so it
+    /// can never go stale against the folder.
+    branches: Vec<Branch>,
     checked: String,
 }
 
@@ -35,10 +44,12 @@ impl NewWorkspaceForm {
         let mut form = Self {
             folder,
             create_worktree: false,
+            branch: String::new(),
             prompt: String::new(),
             agent,
             model,
             is_repo: false,
+            branches: Vec::new(),
             checked: String::from("\0"), // force a first check
         };
         form.refresh_repo();
@@ -47,8 +58,9 @@ impl NewWorkspaceForm {
         form
     }
 
-    /// Re-run the git-repo probe when the folder changed to an existing dir.
-    /// Non-dirs (mid-typing paths) skip the subprocess and read as non-repos.
+    /// Re-run the git-repo probe (and the branch listing) when the folder
+    /// changed to an existing dir. Non-dirs (mid-typing paths) skip the
+    /// subprocess and read as non-repos.
     fn refresh_repo(&mut self) {
         if self.folder == self.checked {
             return;
@@ -59,6 +71,16 @@ impl NewWorkspaceForm {
         if !self.is_repo {
             self.create_worktree = false;
         }
+        self.branches = if self.is_repo {
+            crate::workspace::list_branches(path)
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// What the branch field means, resolved against the enumerated list.
+    pub fn branch_choice(&self) -> BranchChoice {
+        crate::workspace::resolve_branch(&self.branch, &self.branches)
     }
 }
 
@@ -141,6 +163,9 @@ pub fn show(
                     );
                 }
             }
+            if form.is_repo && form.create_worktree {
+                branch_picker(ui, form, &panel, th);
+            }
             ui.add_space(6.0);
 
             panel.divider(ui, "What do you want to work on?", th.accent);
@@ -222,6 +247,95 @@ pub fn show(
         outcome = Outcome::Create;
     }
     outcome
+}
+
+/// The suggestion list's slot count cap: enough to surface the newest
+/// branches without dwarfing the rest of the form.
+const MAX_SUGGESTIONS: usize = 6;
+
+/// The worktree branch typeahead: a text field over a short suggestion list,
+/// closed by a caption row spelling out what Create will do with the field
+/// as it stands. The slot count depends only on the enumerated list - never
+/// on the filter - so typing cannot resize the auto-sized, center-anchored
+/// window under the cursor; filtered-out slots paint as blank rows.
+fn branch_picker(
+    ui: &mut egui::Ui,
+    form: &mut NewWorkspaceForm,
+    panel: &Panel<'_>,
+    th: &UiTheme,
+) {
+    ui.add(
+        egui::TextEdit::singleline(&mut form.branch)
+            .hint_text("branch: random codename - type to search or create")
+            .desired_width(f32::INFINITY),
+    );
+    let slots = form.branches.len().min(MAX_SUGGESTIONS);
+    let matches = filter_branches(&form.branches, &form.branch);
+    let mut pick: Option<String> = None;
+    for i in 0..slots {
+        match matches.get(i) {
+            Some(b) => {
+                let note = match (&b.remote, b.in_use) {
+                    (Some(remote), _) => format!("({remote})"),
+                    (None, true) => "(checked out)".to_string(),
+                    (None, false) => String::new(),
+                };
+                let selected = form.branch.trim() == b.name;
+                if panel
+                    .option(ui, &b.name, &note, !b.in_use, selected)
+                    .clicked()
+                {
+                    pick = Some(b.name.clone());
+                }
+            },
+            None => {
+                panel.row(ui, vec![], false);
+            },
+        }
+    }
+    if let Some(name) = pick {
+        form.branch = name;
+    }
+    let (caption, color) = match form.branch_choice() {
+        BranchChoice::Codename => (
+            "-> new branch, named by codename".to_string(),
+            th.text_dim,
+        ),
+        BranchChoice::Existing(name) => {
+            let in_use = form
+                .branches
+                .iter()
+                .any(|b| b.remote.is_none() && b.in_use && b.name == name);
+            if in_use {
+                // Pickable rows are already dimmed; this catches a typed-in
+                // name. Creation will fail into the walk-back-to-root path.
+                (
+                    format!("-> '{name}' is checked out elsewhere"),
+                    th.status_warn,
+                )
+            } else {
+                ("-> check out existing branch".to_string(), th.text_dim)
+            }
+        },
+        BranchChoice::Track { name, remote } => {
+            (format!("-> track {remote}/{name}"), th.text_dim)
+        },
+        BranchChoice::New(name) => {
+            (format!("-> create branch '{name}'"), th.text_dim)
+        },
+    };
+    panel.row(ui, vec![(caption, color)], false);
+}
+
+/// Case-insensitive substring filter over branch names, order-preserving
+/// (the list arrives newest-first). An empty query keeps everything: the
+/// top slots double as discovery of recent branches.
+fn filter_branches<'a>(branches: &'a [Branch], query: &str) -> Vec<&'a Branch> {
+    let q = query.trim().to_lowercase();
+    branches
+        .iter()
+        .filter(|b| q.is_empty() || b.name.to_lowercase().contains(&q))
+        .collect()
 }
 
 /// Character-cell geometry and painters shared by the popup's rows, mirroring
@@ -317,6 +431,74 @@ impl Panel<'_> {
             self.th.text,
         );
         if clickable {
+            resp.on_hover_cursor(CursorIcon::PointingHand)
+        } else {
+            resp
+        }
+    }
+
+    /// One branch-typeahead suggestion row: `> name  (note)`, marker on hover
+    /// or selection; dimmed and inert when disabled (the branch is checked
+    /// out elsewhere, so picking it could only fail).
+    fn option(
+        &self,
+        ui: &mut egui::Ui,
+        name: &str,
+        note: &str,
+        enabled: bool,
+        selected: bool,
+    ) -> Response {
+        let w = ui.available_width();
+        let sense = if enabled { Sense::click() } else { Sense::hover() };
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(w, self.row_h), sense);
+        let wash = if selected {
+            Some(theme::blend(self.th.bg, self.th.accent, 0.22))
+        } else if enabled && resp.hovered() {
+            Some(theme::blend(self.th.bg, self.th.accent, 0.10))
+        } else {
+            None
+        };
+        if let Some(c) = wash {
+            ui.painter().rect_filled(rect, CornerRadius::ZERO, c);
+        }
+        let marker = if selected || (enabled && resp.hovered()) {
+            "> "
+        } else {
+            "  "
+        };
+        let name_color = if selected {
+            self.th.accent
+        } else if enabled {
+            self.th.text
+        } else {
+            self.th.text_dim
+        };
+        let mut job = LayoutJob::default();
+        job.append(
+            marker,
+            0.0,
+            TextFormat::simple(self.font.clone(), self.th.accent),
+        );
+        job.append(
+            name,
+            0.0,
+            TextFormat::simple(self.font.clone(), name_color),
+        );
+        if !note.is_empty() {
+            job.append(
+                &format!("  {note}"),
+                0.0,
+                TextFormat::simple(self.font.clone(), self.th.text_dim),
+            );
+        }
+        let galley = ui.fonts(|f| f.layout_job(job));
+        ui.painter().galley(
+            rect.min + Vec2::new(self.char_w, 0.0),
+            galley,
+            self.th.text,
+        );
+        if enabled {
             resp.on_hover_cursor(CursorIcon::PointingHand)
         } else {
             resp
@@ -494,5 +676,132 @@ mod tests {
             },
             _ => {},
         }
+    }
+
+    fn branch(name: &str, remote: Option<&str>, in_use: bool) -> Branch {
+        Branch {
+            name: name.into(),
+            remote: remote.map(str::to_string),
+            in_use,
+        }
+    }
+
+    #[test]
+    fn filter_branches_substring_case_insensitive() {
+        let bs = vec![
+            branch("Feature/Login", None, false),
+            branch("main", None, true),
+            branch("fix-log-rotation", Some("origin"), false),
+        ];
+        let names = |v: Vec<&Branch>| {
+            v.iter().map(|b| b.name.clone()).collect::<Vec<_>>()
+        };
+        // Empty keeps everything, order preserved.
+        assert_eq!(
+            names(filter_branches(&bs, "")),
+            vec!["Feature/Login", "main", "fix-log-rotation"]
+        );
+        assert_eq!(
+            names(filter_branches(&bs, "LOG")),
+            vec!["Feature/Login", "fix-log-rotation"]
+        );
+        assert!(filter_branches(&bs, "nope").is_empty());
+    }
+
+    /// The branch typeahead renders: field, suggestions with their notes,
+    /// and the caption row - all ASCII (same constraint as the base render
+    /// test: fallback-font glyphs break the char-cell math).
+    #[test]
+    fn popup_renders_branch_picker() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, ui_theme) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let mut form =
+            NewWorkspaceForm::new(String::new(), "claude", "opus".into());
+        // Poke the private fields directly: an empty folder keeps
+        // refresh_repo subprocess-free, and the fixture stands in for a repo.
+        form.is_repo = true;
+        form.create_worktree = true;
+        form.branches = vec![
+            branch("main", None, true),
+            branch("feat/api-gateway", None, false),
+            branch("review/x", Some("origin"), false),
+        ];
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let agents: Vec<_> = agent::AGENTS.iter().collect();
+        let mut render = |form: &mut NewWorkspaceForm| {
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(ctx, form, &agents, &ui_theme, &font);
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let output = ctx.run(input.clone(), &mut frame);
+            let mut texts: Vec<String> = Vec::new();
+            for clipped in &output.shapes {
+                collect_texts(&clipped.shape, &mut texts);
+            }
+            for run in &texts {
+                assert!(run.is_ascii(), "non-ASCII painted run: {run:?}");
+            }
+            texts
+        };
+
+        // Empty field: every branch is suggested, notes and all, and the
+        // caption promises the codename default.
+        let texts = render(&mut form);
+        let joined = texts.join("\u{1}");
+        for needle in [
+            "main",
+            "(checked out)",
+            "feat/api-gateway",
+            "review/x",
+            "(origin)",
+            "-> new branch, named by codename",
+        ] {
+            assert!(
+                joined.contains(needle),
+                "missing {needle:?} in painted runs: {texts:?}"
+            );
+        }
+
+        // Typing filters the list and the caption tracks the resolution.
+        form.branch = "review/x".into();
+        let texts = render(&mut form);
+        let joined = texts.join("\u{1}");
+        assert!(joined.contains("-> track origin/review/x"));
+        assert!(
+            !joined.contains("feat/api-gateway"),
+            "filtered-out branch still painted: {texts:?}"
+        );
+
+        // cmd+Enter submits, and the form hands create_workspace the same
+        // resolution the caption promised.
+        let mut submit = input.clone();
+        submit.events.push(egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let mut outcome = Outcome::None;
+        let _ = ctx.run(submit, |ctx| {
+            outcome = show(ctx, &mut form, &agents, &ui_theme, &font);
+        });
+        assert!(matches!(outcome, Outcome::Create));
+        assert_eq!(
+            form.branch_choice(),
+            BranchChoice::Track {
+                name: "review/x".into(),
+                remote: "origin".into(),
+            }
+        );
     }
 }

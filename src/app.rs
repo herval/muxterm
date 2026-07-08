@@ -381,6 +381,67 @@ impl App {
         }
     }
 
+    /// Indices into `self.tabs` of the visible (non-archived) tabs, in tab
+    /// order. Archived tabs stay in `self.tabs` - so their tmux sessions ride
+    /// through GC and restore untouched - but drop out of the tab bar and the
+    /// cmd+1..9 / next-prev flow, which walk this list instead of raw indices.
+    fn visible_tab_indices(&self) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.workspace.is_archived())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Step the active tab through the visible list by `delta` with wraparound
+    /// (cmd+shift+[ / ]). When the active tab is archived (a peek, so it isn't
+    /// in the list), Next lands on the first visible tab and Prev on the last.
+    fn step_visible(&mut self, delta: isize) {
+        let visible = self.visible_tab_indices();
+        if let Some(target) = step_visible_target(&visible, self.active, delta) {
+            if target != self.active {
+                self.active = target;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Park a workspace in the sidebar's archived pile. Never touches its tmux
+    /// session - the tab stays in `self.tabs`, just hidden from the active
+    /// flow. Archiving the active tab moves focus off it to the nearest
+    /// remaining visible tab, spawning a fresh bare tab if it was the last one.
+    fn archive_tab(&mut self, ctx: &egui::Context, i: usize) {
+        match self.tabs.get_mut(i) {
+            Some(tab) if !tab.workspace.is_archived() => {
+                tab.workspace.archived_at = Some(mesh::now());
+            },
+            _ => return,
+        }
+        if i == self.active {
+            // `visible` already excludes the tab just archived above.
+            let visible = self.visible_tab_indices();
+            match nearest_visible(&visible, i) {
+                Some(next) => self.active = next,
+                None => self.new_tab(ctx, None), // sets active to the new tab
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Pull a workspace back out of the archived pile and bring it to the
+    /// foreground.
+    fn unarchive_tab(&mut self, i: usize) {
+        match self.tabs.get_mut(i) {
+            Some(tab) if tab.workspace.is_archived() => {
+                tab.workspace.archived_at = None;
+            },
+            _ => return,
+        }
+        self.active = i;
+        self.dirty = true;
+    }
+
     /// cmd+n: build a workspace from the creation popup's form. If a worktree
     /// was requested its directory is claimed synchronously (cheap - a name
     /// pick and a mkdir) so the pane opens directly inside it and no `cd` is
@@ -397,10 +458,11 @@ impl App {
         // to a plain workspace in the root.
         let want_worktree =
             form.create_worktree && root.as_deref().is_some_and(workspace::is_git_repo);
+        let branch_choice = form.branch_choice();
         let claim = want_worktree
             .then(|| {
                 let repo = root.as_deref().expect("want_worktree implies a root");
-                workspace::claim_worktree(repo)
+                workspace::claim_worktree(repo, &branch_choice)
                     .map_err(|e| log::warn!("worktree claim failed: {e:#}"))
                     .ok()
             })
@@ -440,6 +502,7 @@ impl App {
             agent: agent.map(|a| a.id),
             model: model.clone(),
             created_at: mesh::now(),
+            archived_at: None,
         };
 
         self.tabs.push(Tab {
@@ -474,6 +537,7 @@ impl App {
                 tab_id,
                 root.clone().expect("a claim implies a root"),
                 claim,
+                branch_choice,
                 self.worktree_tx.clone(),
                 ctx.clone(),
             );
@@ -880,9 +944,8 @@ impl App {
         match tab.tree.remove(pane_id) {
             Removal::BecameEmpty => {
                 self.tabs.remove(tab_idx);
-                if self.active >= self.tabs.len() {
-                    self.active = self.tabs.len().saturating_sub(1);
-                }
+                self.active =
+                    active_after_removal(self.active, tab_idx, self.tabs.len());
                 if self.tabs.is_empty() {
                     self.save_state();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1105,26 +1168,24 @@ impl App {
                 }
             },
             Action::Split(axis) => self.split_focused(ctx, axis),
-            Action::PrevTab => {
-                let n = self.tabs.len();
-                if n > 1 {
-                    self.active = (self.active + n - 1) % n;
-                    self.dirty = true;
-                }
-            },
-            Action::NextTab => {
-                let n = self.tabs.len();
-                if n > 1 {
-                    self.active = (self.active + 1) % n;
-                    self.dirty = true;
-                }
-            },
+            Action::PrevTab => self.step_visible(-1),
+            Action::NextTab => self.step_visible(1),
             Action::GotoTab(i) => {
                 if i < self.tabs.len() && i != self.active {
                     self.active = i;
                     self.dirty = true;
                 }
             },
+            Action::GotoVisibleTab(n) => {
+                if let Some(&i) = self.visible_tab_indices().get(n) {
+                    if i != self.active {
+                        self.active = i;
+                        self.dirty = true;
+                    }
+                }
+            },
+            Action::Archive(i) => self.archive_tab(ctx, i),
+            Action::Unarchive(i) => self.unarchive_tab(i),
             Action::Focus(dir) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     if let Some(next) =
@@ -1365,6 +1426,12 @@ impl App {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
+        // A peeked archived workspace is read-only: the "?" prompt must not
+        // arm or type `mux ask` into it.
+        if tab.workspace.is_archived() {
+            self.ai.cancel();
+            return;
+        }
         let focused = tab.focused;
         self.ai.sync(focused, tab.panes.contains_key(&focused));
         let Some(pane) = tab.panes.get(&focused) else {
@@ -1676,10 +1743,15 @@ impl eframe::App for App {
             return;
         }
 
-        let labels: Vec<tabbar::TabInfo> = self
-            .tabs
+        // The tab bar shows only visible (non-archived) tabs; its indices are
+        // positions in that filtered list, remapped through `visible` on the
+        // way back. `active` is passed as the active tab's visible position, or
+        // an out-of-range sentinel while peeking an archived tab (no highlight).
+        let visible = self.visible_tab_indices();
+        let labels: Vec<tabbar::TabInfo> = visible
             .iter()
-            .map(|tab| {
+            .map(|&i| {
+                let tab = &self.tabs[i];
                 let pane = tab.panes.get(&tab.focused);
                 let label = tab_label(
                     pane.and_then(|p| self.agents.get(&p.session)),
@@ -1689,11 +1761,17 @@ impl eframe::App for App {
                 (label, attn)
             })
             .collect();
+        let active_pos = visible
+            .iter()
+            .position(|&i| i == self.active)
+            .unwrap_or(usize::MAX);
         for action in
-            tabbar::show(ctx, &labels, self.active, self.sidebar_open, &self.ui_theme)
+            tabbar::show(ctx, &labels, active_pos, self.sidebar_open, &self.ui_theme)
         {
             match action {
-                TabBarAction::Select(i) => actions.push(Action::GotoTab(i)),
+                TabBarAction::Select(pos) => {
+                    actions.push(Action::GotoVisibleTab(pos))
+                },
                 TabBarAction::NewTab => actions.push(Action::NewTab),
                 TabBarAction::OpenSettings => {
                     actions.push(Action::ToggleSettings)
@@ -1708,7 +1786,7 @@ impl eframe::App for App {
         // CentralPanel. Rows are in tab order; `tab_index` maps a click back
         // to the real tab regardless of display order.
         if self.sidebar_open {
-            let rows: Vec<sidebar::Row> = self
+            let mut rows: Vec<sidebar::Row> = self
                 .tabs
                 .iter()
                 .enumerate()
@@ -1758,19 +1836,38 @@ impl eframe::App for App {
                         subtitle,
                         active: i == self.active,
                         status,
+                        archived: ws.is_archived(),
                     }
                 })
                 .collect();
-            // Rows stay in tab order (top = tab 1), so the list matches
-            // cmd+1..9 and the tab-switch chords: NextTab (cmd+]) increments
-            // the active index and moves the highlight *down*, PrevTab up.
-            // A "working" row self-drives its pulse repaint from the sidebar;
-            // that same per-frame repaint also re-evaluates status, so a
-            // finished agent's light goes out promptly without a timer here.
+            // Visible rows stay in tab order (top = cmd+1); archived rows sink
+            // to the bottom pile newest-archived-first. `sort_by` is stable, so
+            // two visible rows keep their tab order. `sidebar::show` splits the
+            // two piles by the `archived` flag, preserving this order in each.
+            rows.sort_by(|a, b| match (a.archived, b.archived) {
+                (false, false) => std::cmp::Ordering::Equal,
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                (true, true) => {
+                    let at =
+                        self.tabs[a.tab_index].workspace.archived_at.unwrap_or(0);
+                    let bt =
+                        self.tabs[b.tab_index].workspace.archived_at.unwrap_or(0);
+                    bt.cmp(&at)
+                },
+            });
             for action in sidebar::show(ctx, &rows, &self.font, &self.ui_theme) {
                 match action {
+                    // A row body-click selects; for an archived row that is the
+                    // peek (GotoTab just sets `active`, archived or not).
                     SidebarAction::Select(i) => {
                         actions.push(Action::GotoTab(i))
+                    },
+                    SidebarAction::Archive(i) => {
+                        actions.push(Action::Archive(i))
+                    },
+                    SidebarAction::Unarchive(i) => {
+                        actions.push(Action::Unarchive(i))
                     },
                     SidebarAction::NewWorkspace => {
                         actions.push(Action::NewWorkspace)
@@ -1800,10 +1897,14 @@ impl eframe::App for App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
                     let mut rects = HashMap::new();
+                    // A peeked archived workspace is a read-only preview: no
+                    // pane is interactive and none holds keyboard focus.
+                    let archived = tab.workspace.is_archived();
                     // While settings, the "?" compose line, or the search
                     // bar own the keyboard, the sentinel matches no pane,
                     // so the terminal stops re-grabbing focus every frame.
-                    let focused = if self.settings_open
+                    let focused = if archived
+                        || self.settings_open
                         || self.new_workspace.is_some()
                         || self.ai.composing()
                         || self.search.active()
@@ -1823,11 +1924,16 @@ impl eframe::App for App {
                         &self.term_theme,
                         &self.ui_theme,
                         self.copy_on_select,
+                        !archived,
                         &mut rects,
                         &mut ui_actions,
                     );
                     if tab.panes.len() > 1 {
-                        if let Some(focused_rect) = rects.get(&tab.focused) {
+                        // No focus ring on a read-only preview - nothing there
+                        // is focused.
+                        if let Some(focused_rect) =
+                            (!archived).then(|| rects.get(&tab.focused)).flatten()
+                        {
                             ui.painter().rect_stroke(
                                 focused_rect.expand(1.0),
                                 CornerRadius::same(2),
@@ -2386,6 +2492,9 @@ fn show_node(
     term_theme: &TerminalTheme,
     ui_theme: &UiTheme,
     copy_on_select: bool,
+    // False for a peeked archived workspace: panes render as a dimmed,
+    // read-only preview - no input, no divider drag, no focus ring.
+    interactive: bool,
     rects: &mut HashMap<PaneId, Rect>,
     ui_actions: &mut Vec<UiAction>,
 ) {
@@ -2404,21 +2513,30 @@ fn show_node(
                     font_type: font.clone(),
                 }))
                 .set_theme(term_theme.clone())
-                .set_copy_on_select(copy_on_select);
+                .set_copy_on_select(copy_on_select)
+                .set_interactive(interactive);
             let response = child.add(view);
-            // Wash unfocused panes toward the background, like iTerm's
-            // "dim inactive split panes".
-            if *id != focused
+            if !interactive {
+                // A peeked archived workspace: wash every pane heavily so the
+                // whole thing reads as a parked, read-only preview.
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::ZERO,
+                    ui_theme.archived_overlay,
+                );
+            } else if *id != focused
                 && panes.len() > 1
                 && ui_theme.dim_overlay.a() > 0
             {
+                // Wash unfocused panes toward the background, like iTerm's
+                // "dim inactive split panes".
                 ui.painter().rect_filled(
                     rect,
                     CornerRadius::ZERO,
                     ui_theme.dim_overlay,
                 );
             }
-            if response.clicked() {
+            if interactive && response.clicked() {
                 ui_actions.push(UiAction::FocusPane(*id));
             }
         },
@@ -2428,34 +2546,43 @@ fn show_node(
             first,
             second,
         } => {
-            let (_, divider, _) =
-                layout::split_rect(rect, *axis, *ratio, PANE_GAP);
-            let hit = match axis {
-                SplitAxis::SideBySide => divider.expand2(Vec2::new(2.0, 0.0)),
-                SplitAxis::Stacked => divider.expand2(Vec2::new(0.0, 2.0)),
-            };
-            let divider_id = ui.id().with(("divider", path));
-            let response = ui
-                .interact(hit, divider_id, egui::Sense::drag())
-                .on_hover_cursor(match axis {
-                    SplitAxis::SideBySide => egui::CursorIcon::ResizeHorizontal,
-                    SplitAxis::Stacked => egui::CursorIcon::ResizeVertical,
-                });
-            if response.dragged() {
-                let delta = match axis {
+            // A read-only preview freezes its layout too - no draggable
+            // divider (its cursor hint would invite an interaction that does
+            // nothing).
+            if interactive {
+                let (_, divider, _) =
+                    layout::split_rect(rect, *axis, *ratio, PANE_GAP);
+                let hit = match axis {
                     SplitAxis::SideBySide => {
-                        response.drag_delta().x
-                            / (rect.width() - PANE_GAP).max(1.0)
+                        divider.expand2(Vec2::new(2.0, 0.0))
                     },
-                    SplitAxis::Stacked => {
-                        response.drag_delta().y
-                            / (rect.height() - PANE_GAP).max(1.0)
-                    },
+                    SplitAxis::Stacked => divider.expand2(Vec2::new(0.0, 2.0)),
                 };
-                *ratio = (*ratio + delta).clamp(0.1, 0.9);
-            }
-            if response.drag_stopped() {
-                ui_actions.push(UiAction::LayoutChanged);
+                let divider_id = ui.id().with(("divider", path));
+                let response = ui
+                    .interact(hit, divider_id, egui::Sense::drag())
+                    .on_hover_cursor(match axis {
+                        SplitAxis::SideBySide => {
+                            egui::CursorIcon::ResizeHorizontal
+                        },
+                        SplitAxis::Stacked => egui::CursorIcon::ResizeVertical,
+                    });
+                if response.dragged() {
+                    let delta = match axis {
+                        SplitAxis::SideBySide => {
+                            response.drag_delta().x
+                                / (rect.width() - PANE_GAP).max(1.0)
+                        },
+                        SplitAxis::Stacked => {
+                            response.drag_delta().y
+                                / (rect.height() - PANE_GAP).max(1.0)
+                        },
+                    };
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                }
+                if response.drag_stopped() {
+                    ui_actions.push(UiAction::LayoutChanged);
+                }
             }
 
             // Recompute with the possibly-updated ratio so drags track live.
@@ -2468,7 +2595,8 @@ fn show_node(
             );
             show_node(
                 ui, first, first_rect, path << 1, panes, focused, font,
-                term_theme, ui_theme, copy_on_select, rects, ui_actions,
+                term_theme, ui_theme, copy_on_select, interactive, rects,
+                ui_actions,
             );
             show_node(
                 ui,
@@ -2481,6 +2609,7 @@ fn show_node(
                 term_theme,
                 ui_theme,
                 copy_on_select,
+                interactive,
                 rects,
                 ui_actions,
             );
@@ -2490,6 +2619,50 @@ fn show_node(
 
 /// Tab label: registered agents show as `● name · role`, everything else
 /// falls back to the pane's OSC title.
+/// The visible tab to focus after archiving the tab at `removed`: the nearest
+/// visible index to its left, else the nearest to its right, else None (it was
+/// the last visible tab, so the caller spawns a fresh one). `visible` is the
+/// post-archive visible list — ascending and not containing `removed`.
+fn nearest_visible(visible: &[usize], removed: usize) -> Option<usize> {
+    visible
+        .iter()
+        .rev()
+        .find(|&&v| v < removed)
+        .or_else(|| visible.iter().find(|&&v| v > removed))
+        .copied()
+}
+
+/// The active index after the tab at `removed` is deleted from `tabs` (now
+/// `new_len` long). A removal below the active tab shifts it down by one;
+/// removing the active tab (or the last one) can leave it past the end, so
+/// clamp. Fixes a latent off-by-one that archived background tabs — whose
+/// shells can exit at a lower index — would otherwise expose.
+fn active_after_removal(active: usize, removed: usize, new_len: usize) -> usize {
+    let shifted = if removed < active { active - 1 } else { active };
+    shifted.min(new_len.saturating_sub(1))
+}
+
+/// The visible index to activate when stepping `delta` (±1) from `active` with
+/// wraparound. If `active` isn't in `visible` (peeking an archived tab), a
+/// forward step lands on the first entry and a backward step on the last.
+/// None when nothing is visible.
+fn step_visible_target(
+    visible: &[usize],
+    active: usize,
+    delta: isize,
+) -> Option<usize> {
+    if visible.is_empty() {
+        return None;
+    }
+    let n = visible.len() as isize;
+    let pos = match visible.iter().position(|&i| i == active) {
+        Some(p) => (p as isize + delta).rem_euclid(n),
+        None if delta > 0 => 0,
+        None => n - 1,
+    };
+    Some(visible[pos as usize])
+}
+
 fn tab_label(agent: Option<&mesh::AgentInfo>, title: &str) -> String {
     match agent {
         Some(info) => match &info.role {
@@ -2539,5 +2712,49 @@ mod tests {
         assert_eq!(elide("● alice · reviewer", 8), "● alice…");
         assert_eq!(elide("abcdef", 1), "…");
         assert_eq!(elide("abcdef", 0), "");
+    }
+
+    #[test]
+    fn nearest_visible_prefers_left_then_right() {
+        // tabs 0..4, tab 2 just archived -> visible = [0,1,3,4].
+        let visible = [0, 1, 3, 4];
+        assert_eq!(nearest_visible(&visible, 2), Some(1)); // left neighbor
+        // Archiving the leftmost visible tab -> fall through to the right.
+        let visible = [1, 2, 3];
+        assert_eq!(nearest_visible(&visible, 0), Some(1));
+        // Archiving the rightmost -> left neighbor.
+        let visible = [0, 1];
+        assert_eq!(nearest_visible(&visible, 2), Some(1));
+        // Nothing else visible -> caller must spawn a fresh tab.
+        assert_eq!(nearest_visible(&[], 0), None);
+    }
+
+    #[test]
+    fn active_after_removal_follows_the_active_tab() {
+        // Remove a tab below the active one: active shifts down with it.
+        assert_eq!(active_after_removal(3, 1, 4), 2);
+        // Remove a tab above the active one: active unchanged.
+        assert_eq!(active_after_removal(1, 3, 4), 1);
+        // Remove the active tab when it was last: clamp to the new end.
+        assert_eq!(active_after_removal(4, 4, 4), 3);
+        // Remove the active tab mid-list: same index, now the next tab.
+        assert_eq!(active_after_removal(2, 2, 4), 2);
+        // Last tab overall removed: clamps to 0 (caller then quits).
+        assert_eq!(active_after_removal(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn step_visible_target_wraps_and_handles_peek() {
+        let visible = [0, 2, 3]; // tab 1 archived
+        // Forward from tab 0 -> 2, wrap from 3 -> 0.
+        assert_eq!(step_visible_target(&visible, 0, 1), Some(2));
+        assert_eq!(step_visible_target(&visible, 3, 1), Some(0));
+        // Backward from tab 0 wraps to the last visible.
+        assert_eq!(step_visible_target(&visible, 0, -1), Some(3));
+        // Peeking an archived tab (1, not in the list): Next -> first, Prev -> last.
+        assert_eq!(step_visible_target(&visible, 1, 1), Some(0));
+        assert_eq!(step_visible_target(&visible, 1, -1), Some(3));
+        // Nothing visible.
+        assert_eq!(step_visible_target(&[], 0, 1), None);
     }
 }

@@ -144,3 +144,10 @@ tmux-backed design. Local patches:
   background rect still fills the whole pane so the gutter is painted), and
   the mouse->grid mapping subtracts the same inset before locating a cell
   (`selection_point` clamps a click in the gutter to cell 0).
+- **P18** (`src/view.rs`, `TerminalView::interactive` + `set_interactive` +
+  `process_input`): a read-only mode. When `interactive` is false the view
+  still renders (resize + show run) but `process_input` early-returns, so
+  keyboard, pointer, and cmd-link-hover are all ignored. muxterm uses it to
+  make a peeked *archived* workspace a look-but-don't-touch preview; the pane
+  is also washed with `archived_overlay` and denied focus (the
+  `PaneId(u64::MAX)` sentinel) at the call site. On by default.

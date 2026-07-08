@@ -66,6 +66,11 @@ pub struct WorkspaceState {
     pub model: Option<String>,
     #[serde(default)]
     pub created_at: u64,
+    /// When the workspace was archived, or None while active. Additive with
+    /// `#[serde(default)]`, so pre-archive state files load with all tabs
+    /// visible - no VERSION bump needed.
+    #[serde(default)]
+    pub archived_at: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -268,6 +273,7 @@ mod tests {
                             agent: Some("claude".into()),
                             model: Some("sonnet".into()),
                             created_at: 123,
+                            archived_at: None,
                         }),
                     },
                 ],

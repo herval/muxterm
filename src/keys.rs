@@ -16,7 +16,16 @@ pub enum Action {
     Split(SplitAxis),
     PrevTab,
     NextTab,
+    /// Activate a tab by its raw index in `App.tabs` (sidebar clicks, which
+    /// carry the real index so display order can differ from tab order).
     GotoTab(usize),
+    /// Activate the Nth *visible* (non-archived) tab: cmd+1..9 and tab-bar
+    /// clicks, which count only the tabs shown in the active flow.
+    GotoVisibleTab(usize),
+    /// Park a workspace in the sidebar's archived pile (raw `App.tabs` index).
+    Archive(usize),
+    /// Pull a workspace back out of the archived pile (raw `App.tabs` index).
+    Unarchive(usize),
     Focus(Dir),
     /// Cycle focus through the tab's panes in tree order (+1 / -1).
     /// Window managers like Rectangle often own cmd+opt+arrows globally,
@@ -79,7 +88,7 @@ pub fn drain_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         consume(cmd | Modifiers::SHIFT, Key::G, Action::SearchPrev);
         consume(cmd, Key::G, Action::SearchNext);
         for (n, key) in TAB_KEYS.iter().enumerate() {
-            consume(cmd, *key, Action::GotoTab(n));
+            consume(cmd, *key, Action::GotoVisibleTab(n));
         }
         for (key, dir) in [
             (Key::ArrowLeft, Dir::Left),

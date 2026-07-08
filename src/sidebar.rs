@@ -5,13 +5,20 @@
 //! Display-only, like `tabbar`: it returns a vec of actions the App applies.
 
 use egui::text::LayoutJob;
-use egui::{Color32, CornerRadius, FontId, Margin, TextFormat, Vec2};
+use egui::{
+    Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, TextFormat, Vec2,
+};
 
 use crate::theme::{self, UiTheme};
 
 pub enum SidebarAction {
-    /// Activate the tab at this index.
+    /// Activate the tab at this index. For an archived row this is the "peek":
+    /// it comes to the foreground while staying in the archived pile.
     Select(usize),
+    /// Park the tab at this index in the archived pile (the row's archive icon).
+    Archive(usize),
+    /// Pull the tab at this index back out of the archived pile (restore icon).
+    Unarchive(usize),
     /// Open the creation popup (the header "+").
     NewWorkspace,
     /// Collapse the sidebar (the header "‹").
@@ -38,6 +45,9 @@ pub struct Row {
     pub active: bool,
     /// Drives the leading status dot (pulsating green / steady red / accent).
     pub status: Status,
+    /// Whether this workspace is archived: it renders in the bottom pile and
+    /// its hover icon restores rather than archives.
+    pub archived: bool,
 }
 
 pub fn show(
@@ -90,14 +100,58 @@ pub fn show(
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
-                for row in rows {
-                    if workspace_row(ui, row, font, t).clicked() {
-                        actions.push(SidebarAction::Select(row.tab_index));
+                // Active pile: the workspaces in the tab flow.
+                for row in rows.iter().filter(|r| !r.archived) {
+                    let (resp, icon_clicked) = workspace_row(ui, row, font, t);
+                    if let Some(a) = row_action(resp.clicked(), icon_clicked, row)
+                    {
+                        actions.push(a);
+                    }
+                }
+                // Archived pile at the bottom, under a dim header. Rows arrive
+                // already ordered newest-first by the caller.
+                if rows.iter().any(|r| r.archived) {
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("Archived")
+                            .font(head_font.clone())
+                            .color(t.text_dim),
+                    );
+                    ui.add_space(4.0);
+                    for row in rows.iter().filter(|r| r.archived) {
+                        let (resp, icon_clicked) =
+                            workspace_row(ui, row, font, t);
+                        if let Some(a) =
+                            row_action(resp.clicked(), icon_clicked, row)
+                        {
+                            actions.push(a);
+                        }
                     }
                 }
             });
         });
     actions
+}
+
+/// Map a row's body-click / icon-click into the action it means. The icon
+/// wins over a body click (they overlap): on an active row it archives, on an
+/// archived row it restores; a plain body click selects (a peek for archived).
+fn row_action(
+    clicked: bool,
+    icon_clicked: bool,
+    row: &Row,
+) -> Option<SidebarAction> {
+    if icon_clicked {
+        Some(if row.archived {
+            SidebarAction::Unarchive(row.tab_index)
+        } else {
+            SidebarAction::Archive(row.tab_index)
+        })
+    } else if clicked {
+        Some(SidebarAction::Select(row.tab_index))
+    } else {
+        None
+    }
 }
 
 /// A breathing brightness for the "working" dot: a sine over `time` (seconds)
@@ -120,12 +174,19 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, t: &UiTheme) -> egui::Response {
     )
 }
 
+/// Width reserved on the right of every row for the hover archive/restore
+/// icon, so a long title wraps before it instead of running underneath.
+const ICON_W: f32 = 16.0;
+
+/// Renders one row and returns `(body response, icon_clicked)`. The icon is a
+/// separate interact rect overlaid on the right, so `show` can archive/restore
+/// on the icon and select on the body without the two colliding.
 fn workspace_row(
     ui: &mut egui::Ui,
     row: &Row,
     font: &FontId,
     t: &UiTheme,
-) -> egui::Response {
+) -> (egui::Response, bool) {
     let title_color = if row.active { t.text } else { t.text_dim };
     let pad = Vec2::new(8.0, 5.0);
 
@@ -143,7 +204,8 @@ fn workspace_row(
         Status::Idle => (t.accent, 0.6),
     };
     let mut job = LayoutJob::default();
-    job.wrap.max_width = (ui.available_width() - pad.x * 2.0).max(1.0);
+    // Reserve the icon's width so wrapping never collides with it.
+    job.wrap.max_width = (ui.available_width() - pad.x * 2.0 - ICON_W).max(1.0);
     job.append(
         "● ",
         0.0,
@@ -167,6 +229,29 @@ fn workspace_row(
 
     let size = Vec2::new(ui.available_width(), galley.size().y + pad.y * 2.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    // The hover-revealed archive/restore affordance: its own interact rect on
+    // the right, registered after the row so it wins the click there. Created
+    // before painting so its hover can also light the row background.
+    let (glyph, hint) = if row.archived {
+        ("↑", "Restore workspace")
+    } else {
+        ("↓", "Archive workspace")
+    };
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.max.x - pad.x - ICON_W / 2.0, rect.center().y),
+        Vec2::splat(ICON_W),
+    );
+    let icon_resp = ui
+        .interact(
+            icon_rect,
+            ui.id().with(("ws_row_icon", row.tab_index)),
+            egui::Sense::click(),
+        )
+        .on_hover_text(hint)
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hovered = resp.hovered() || icon_resp.hovered();
+
     // Background first, then text on top - a tinted selection (bg blended
     // toward accent) reads as terminal chrome, not a flat gray box.
     if row.active {
@@ -175,7 +260,7 @@ fn workspace_row(
             CornerRadius::same(4),
             theme::blend(t.bg, t.accent, 0.14),
         );
-    } else if resp.hovered() {
+    } else if hovered {
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(4),
@@ -183,5 +268,14 @@ fn workspace_row(
         );
     }
     ui.painter().galley(rect.min + pad, galley, title_color);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    if hovered {
+        ui.painter().text(
+            icon_rect.center(),
+            Align2::CENTER_CENTER,
+            glyph,
+            FontId::new(font.size * 0.95, font.family.clone()),
+            if icon_resp.hovered() { t.text } else { t.text_dim },
+        );
+    }
+    (resp.on_hover_cursor(egui::CursorIcon::PointingHand), icon_resp.clicked())
 }

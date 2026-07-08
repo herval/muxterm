@@ -16,6 +16,10 @@ pub struct UiTheme {
     pub accent: Color32,
     /// Translucent wash painted over unfocused panes (bg at some alpha).
     pub dim_overlay: Color32,
+    /// Heavier wash over every pane of a peeked *archived* workspace, marking
+    /// it a read-only preview. Fixed alpha, independent of `dim_inactive_panes`
+    /// (which can be 0), so the gray-out is always visible.
+    pub archived_overlay: Color32,
     /// PR-status chip colors, straight from the palette's ANSI slots so
     /// they follow the theme like the rest of the chrome.
     pub status_ok: Color32,
@@ -283,6 +287,18 @@ pub fn build(
         dim_overlay: {
             let a = dim_inactive.clamp(0.0, 0.8);
             let a = if light { a } else { (a * 5.0).min(0.9) };
+            Color32::from_rgba_unmultiplied(
+                bg.r(),
+                bg.g(),
+                bg.b(),
+                (a * 255.0) as u8,
+            )
+        },
+        // A firm, fixed pour - stronger than the inactive-pane wash and never
+        // zero - so a peeked archived workspace clearly reads as parked. Same
+        // dark-needs-heavier asymmetry as dim_overlay.
+        archived_overlay: {
+            let a = if light { 0.35 } else { 0.62 };
             Color32::from_rgba_unmultiplied(
                 bg.r(),
                 bg.g(),
