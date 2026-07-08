@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -120,11 +120,12 @@ pub struct App {
     new_workspace: Option<NewWorkspaceForm>,
     /// Folder the creation popup pre-fills - the last one a workspace used.
     last_workspace_dir: Option<String>,
-    /// session -> foreground command, refreshed once a second (one
-    /// `list-panes -a` round trip). Liveness for the agent-state files: a
-    /// pane whose foreground returned to a shell has no live agent, however
-    /// its hooks died.
-    fg_cmds: HashMap<String, String>,
+    /// session -> foreground command + cwd, refreshed once a second (one
+    /// `list-panes -a` round trip). The command is liveness for the
+    /// agent-state files (a pane whose foreground returned to a shell has no
+    /// live agent, however its hooks died); the cwd feeds the workspace-root
+    /// sync.
+    pane_snap: HashMap<String, tmux::PaneSnap>,
     /// session -> hook-reported agent state (working/idle/attention), read
     /// from ~/.muxterm/agent-state on the poll tick. The sole driver of the
     /// sidebar's working/attention dot: agents report themselves through
@@ -137,6 +138,10 @@ pub struct App {
     /// repo never freezes the window.
     worktree_tx: Sender<(String, Result<Worktree, String>)>,
     worktree_rx: Receiver<(String, Result<Worktree, String>)>,
+    /// Tabs whose worktree checkout is still in flight: their pane sits in a
+    /// claimed directory the workspace doesn't reference yet, so the root
+    /// sync must not read that as "the panes left".
+    pending_worktrees: HashSet<String>,
 }
 
 impl App {
@@ -212,10 +217,11 @@ impl App {
             sidebar_open: true,
             new_workspace: None,
             last_workspace_dir: None,
-            fg_cmds: HashMap::new(),
+            pane_snap: HashMap::new(),
             agent_states: std::collections::BTreeMap::new(),
             worktree_tx,
             worktree_rx,
+            pending_worktrees: HashSet::new(),
         };
 
         // Wire the agents' lifecycle hooks to `mux agent-event` (the sidebar
@@ -413,6 +419,7 @@ impl App {
         if let Some(claim) = claim {
             // The pane is already sitting in the claimed directory; the agent
             // launch waits for the checkout to land (drain_worktrees).
+            self.pending_worktrees.insert(tab_id.clone());
             workspace::spawn_worktree(
                 tab_id,
                 root.clone().expect("a claim implies a root"),
@@ -479,6 +486,7 @@ impl App {
     /// back to the root and launches there, so the workspace still works.
     fn drain_worktrees(&mut self) {
         while let Ok((tab_id, result)) = self.worktree_rx.try_recv() {
+            self.pending_worktrees.remove(&tab_id);
             match result {
                 Ok(wt) => {
                     if let Some(tab) =
@@ -498,6 +506,88 @@ impl App {
                     self.launch_agent(&tab_id, root.as_deref());
                 },
             }
+            self.dirty = true;
+        }
+    }
+
+    /// Follow the panes when a workspace's displayed folder goes stale (the
+    /// user cd'd everywhere else): once *no* pane in the tab is left under
+    /// the root or worktree - or anywhere in their git repo - repoint the
+    /// root at the focused pane's repo (or bare cwd), so the sidebar names
+    /// where work actually happens. One pane still inside pins the reference
+    /// (the decision is `workspace::retarget`, pure and tested there). Rides
+    /// the per-second `list-panes` snapshot the liveness check already pays
+    /// for; a pane with no known cwd (mid-teardown) skips its tab for the
+    /// tick rather than guess.
+    fn sync_workspace_roots(&mut self) {
+        // Memoize `git rev-parse --show-toplevel` per path: only consulted
+        // on ticks where a tab's panes all wandered off, but then cwds
+        // repeat across panes and tabs.
+        let mut tops: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+        let mut toplevel = |p: &Path| {
+            tops.entry(p.to_path_buf())
+                .or_insert_with(|| workspace::repo_toplevel(p))
+                .clone()
+        };
+        let snap = &self.pane_snap;
+        let pending = &self.pending_worktrees;
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            // A checkout still populating its claimed worktree directory
+            // would read as "the pane left" - the workspace doesn't
+            // reference the claimed dir until drain_worktrees records it.
+            if pending.contains(&tab.tab_id) {
+                continue;
+            }
+            let ws = &tab.workspace;
+            let mut homes: Vec<PathBuf> = Vec::new();
+            homes.extend(ws.root.as_deref().map(canon));
+            homes.extend(ws.worktree.as_ref().map(|w| canon(&w.path)));
+            if homes.is_empty() {
+                continue; // nothing displayed, nothing to go stale
+            }
+            // Focused pane first: it picks the new root if all have left.
+            let mut panes: Vec<&Pane> = tab.panes.values().collect();
+            panes.sort_by_key(|p| p.id != tab.focused);
+            let cwds: Vec<PathBuf> = panes
+                .iter()
+                .filter_map(|p| {
+                    snap.get(&p.session)
+                        .and_then(|s| s.cwd.as_deref())
+                        .map(canon)
+                })
+                .collect();
+            if cwds.len() != panes.len() {
+                continue; // an unknown cwd makes "none left" unprovable
+            }
+            let homes: Vec<&Path> =
+                homes.iter().map(PathBuf::as_path).collect();
+            let cwds: Vec<&Path> = cwds.iter().map(PathBuf::as_path).collect();
+            let Some(root) = workspace::retarget(&homes, &cwds, &mut toplevel)
+            else {
+                continue;
+            };
+            // Belt-and-braces against a same-root re-fire marking the state
+            // dirty every tick.
+            if ws.root.as_deref() == Some(root.as_path())
+                && ws.worktree.is_none()
+            {
+                continue;
+            }
+            log::info!(
+                "workspace '{}' followed its panes: {} -> {}",
+                ws.title,
+                homes[0].display(),
+                root.display(),
+            );
+            tab.workspace.root = Some(root);
+            // The sidebar subtitle prefers the worktree branch; keeping a
+            // worktree every pane abandoned would name it forever. The
+            // worktree itself stays on disk untouched.
+            tab.workspace.worktree = None;
+            changed = true;
+        }
+        if changed {
             self.dirty = true;
         }
     }
@@ -1424,7 +1514,7 @@ impl eframe::App for App {
             self.drain_split_requests(ctx);
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
-            self.fg_cmds = self.tmux.foreground_commands();
+            self.pane_snap = self.tmux.pane_snapshot();
             // Hook-reported agent states, pruned against liveness: a session
             // whose foreground returned to a shell (or vanished) has no live
             // agent - it exited or was killed without firing its end hook.
@@ -1433,15 +1523,16 @@ impl eframe::App for App {
             self.agent_states = mesh::read_agent_states();
             self.agent_states.retain(|session, state| {
                 let live = self
-                    .fg_cmds
+                    .pane_snap
                     .get(session)
-                    .is_some_and(|cmd| !tmux::is_shell(cmd));
+                    .is_some_and(|snap| !tmux::is_shell(&snap.cmd));
                 if !live && mesh::now().saturating_sub(state.ts) > 5 {
                     mesh::remove_agent_state(session);
                     return false;
                 }
                 true
             });
+            self.sync_workspace_roots();
         }
 
         if log::log_enabled!(log::Level::Debug) {
@@ -1839,6 +1930,13 @@ fn expand_dir(input: &str) -> Option<PathBuf> {
         }
     }
     Some(PathBuf::from(s))
+}
+
+/// Resolve symlinks so tmux's kernel-real cwds (`/private/tmp`) compare
+/// equal to user-typed workspace roots (`/tmp`); a vanished path keeps its
+/// spelling.
+fn canon(p: &Path) -> PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Write the captured scrollback where the agent command's stdin

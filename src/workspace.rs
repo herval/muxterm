@@ -20,8 +20,10 @@ use muxterm::state::{self, WorkspaceState, WorktreeState};
 
 #[derive(Clone, Debug)]
 pub struct Workspace {
-    /// The folder the workspace was created in; None for a bare shell tab
-    /// with no chosen folder.
+    /// The folder the workspace lives in; None for a bare shell tab with no
+    /// chosen folder. Starts as the creation folder, then follows the panes:
+    /// when every pane leaves it (and its repo), the App's root sync
+    /// repoints it at where they went (`retarget`).
     pub root: Option<PathBuf>,
     /// Display label: a random two-word codename, until a human or an agent
     /// renames it (`mux rename`).
@@ -143,6 +145,61 @@ pub fn is_git_repo(root: &Path) -> bool {
                 && String::from_utf8_lossy(&o.stdout).trim() == "true"
         })
         .unwrap_or(false)
+}
+
+/// The git work-tree root containing `path`, if any (`git rev-parse
+/// --show-toplevel`). Same bare-`git` reasoning as `is_git_repo`.
+pub fn repo_toplevel(path: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let top = stdout.trim();
+    (!top.is_empty()).then(|| PathBuf::from(top))
+}
+
+/// The workspace-root sync's decision: given where the sidebar says a
+/// workspace lives (`homes`: the root, plus the worktree when there is one)
+/// and where its panes actually are (`cwds`, focused pane first), is the
+/// displayed reference stale? A single pane still under any home - or
+/// anywhere in the same git repo, per `toplevel` (from a root that is a
+/// repo subfolder, `cd ..` within the repo is not leaving) - pins it and
+/// nothing changes. Only when *every* pane has left does this return the
+/// new root: the focused pane's repo toplevel, or its bare cwd outside a
+/// repo. Pure; the caller injects `toplevel` (the App memoizes
+/// `repo_toplevel`), which also keeps the common pinned-by-path case free
+/// of git calls.
+pub fn retarget(
+    homes: &[&Path],
+    cwds: &[&Path],
+    mut toplevel: impl FnMut(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if homes.is_empty() || cwds.is_empty() {
+        return None;
+    }
+    if cwds
+        .iter()
+        .any(|cwd| homes.iter().any(|home| cwd.starts_with(home)))
+    {
+        return None;
+    }
+    // No pane sits under a home by path; ask git before concluding - a cwd
+    // elsewhere in the same repo still counts as "on it".
+    let home_tops: Vec<PathBuf> =
+        homes.iter().filter_map(|home| toplevel(home)).collect();
+    if cwds
+        .iter()
+        .any(|cwd| toplevel(cwd).is_some_and(|top| home_tops.contains(&top)))
+    {
+        return None;
+    }
+    Some(toplevel(cwds[0]).unwrap_or_else(|| cwds[0].to_path_buf()))
 }
 
 /// A git-branch-safe slug from the task prompt: the first few words,
@@ -282,6 +339,63 @@ mod tests {
             assert!(ADJECTIVES.contains(&adj), "unknown adjective in {t}");
             assert!(ANIMALS.contains(&animal), "unknown animal in {t}");
         }
+    }
+
+    #[test]
+    fn retarget_pinned_by_any_pane_under_a_home() {
+        // The second pane never left the root: no repo lookup, no move.
+        let homes = [Path::new("/repo")];
+        let cwds = [Path::new("/elsewhere"), Path::new("/repo/src/deep")];
+        let out = retarget(&homes, &cwds, |_| panic!("path pin needs no git"));
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn retarget_pinned_by_worktree_home() {
+        let homes =
+            [Path::new("/repo"), Path::new("/home/u/.muxterm/worktrees/x")];
+        let cwds = [Path::new("/home/u/.muxterm/worktrees/x/src")];
+        assert_eq!(retarget(&homes, &cwds, |_: &Path| None), None);
+    }
+
+    #[test]
+    fn retarget_pinned_by_same_repo() {
+        // The root is a subfolder; a pane at the repo top left the folder
+        // but not the repo.
+        let homes = [Path::new("/repo/crates/sub")];
+        let cwds = [Path::new("/repo")];
+        let top = |p: &Path| {
+            p.starts_with("/repo").then(|| PathBuf::from("/repo"))
+        };
+        assert_eq!(retarget(&homes, &cwds, top), None);
+    }
+
+    #[test]
+    fn retarget_follows_the_focused_pane_to_its_repo() {
+        // Every pane left /old; the new root is the *focused* (first) cwd's
+        // repo toplevel, not the raw subfolder it happens to sit in.
+        let homes = [Path::new("/old")];
+        let cwds = [Path::new("/new/app/src"), Path::new("/somewhere")];
+        let top = |p: &Path| {
+            p.starts_with("/new/app").then(|| PathBuf::from("/new/app"))
+        };
+        assert_eq!(retarget(&homes, &cwds, top), Some(PathBuf::from("/new/app")));
+    }
+
+    #[test]
+    fn retarget_outside_any_repo_adopts_the_cwd() {
+        let homes = [Path::new("/old")];
+        let cwds = [Path::new("/home/u/notes")];
+        assert_eq!(
+            retarget(&homes, &cwds, |_: &Path| None),
+            Some(PathBuf::from("/home/u/notes"))
+        );
+    }
+
+    #[test]
+    fn retarget_needs_homes_and_cwds() {
+        assert_eq!(retarget(&[], &[Path::new("/x")], |_: &Path| None), None);
+        assert_eq!(retarget(&[Path::new("/x")], &[], |_: &Path| None), None);
     }
 
     #[test]

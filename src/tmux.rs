@@ -221,11 +221,12 @@ impl TmuxCtl {
         (!cmd.is_empty()).then_some(cmd)
     }
 
-    /// Foreground process of every session's active pane in one tmux round
-    /// trip, for the sidebar's working-dot ("is something other than a shell
-    /// running?"). Polled once a second, so one subprocess covering all panes
-    /// matters - the per-session `pane_current_command` would be N.
-    pub fn foreground_commands(&self) -> HashMap<String, String> {
+    /// Foreground process + cwd of every session's active pane in one tmux
+    /// round trip. Polled once a second for the sidebar's working-dot ("is
+    /// something other than a shell running?") and the workspace-root sync
+    /// ("did every pane leave the workspace's folder?"), so one subprocess
+    /// covering all panes matters - the per-session getters would be N.
+    pub fn pane_snapshot(&self) -> HashMap<String, PaneSnap> {
         let out = Command::new(&self.bin)
             .args([
                 "-L",
@@ -233,14 +234,12 @@ impl TmuxCtl {
                 "list-panes",
                 "-a",
                 "-F",
-                "#{session_name} #{pane_current_command}",
+                "#{session_name}\t#{pane_current_command}\t#{pane_current_path}",
             ])
             .output();
         match out {
             Ok(out) if out.status.success() => {
-                parse_foreground_commands(&String::from_utf8_lossy(
-                    &out.stdout,
-                ))
+                parse_pane_snapshot(&String::from_utf8_lossy(&out.stdout))
             },
             _ => HashMap::new(),
         }
@@ -468,21 +467,41 @@ impl TmuxCtl {
     }
 }
 
-/// Is this pane_current_command a shell sitting at a prompt? Login shells
-/// report themselves with a leading dash ("-zsh").
-/// Parse `list-panes -a -F "#{session_name} #{pane_current_command}"` output.
-/// Session names are fixed-shape (`mux-<8hex>`, no spaces), so the first
-/// space splits; the command keeps any spaces a process title may carry.
-fn parse_foreground_commands(text: &str) -> HashMap<String, String> {
+/// One row of the per-second `list-panes -a` snapshot: the foreground
+/// process and the cwd of a session's active pane.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneSnap {
+    pub cmd: String,
+    /// None when tmux reported no path (a dying pane).
+    pub cwd: Option<PathBuf>,
+}
+
+/// Parse `list-panes -a` output shaped
+/// `#{session_name}\t#{pane_current_command}\t#{pane_current_path}`.
+/// Tab-separated: the command keeps any spaces a process title may carry,
+/// and paths routinely contain spaces; neither plausibly carries a tab.
+fn parse_pane_snapshot(text: &str) -> HashMap<String, PaneSnap> {
     text.lines()
         .filter_map(|line| {
-            let (session, cmd) = line.split_once(' ')?;
-            (!session.is_empty() && !cmd.is_empty())
-                .then(|| (session.to_string(), cmd.trim().to_string()))
+            let mut fields = line.splitn(3, '\t');
+            let session = fields.next()?;
+            let cmd = fields.next()?.trim();
+            let cwd = fields.next().map(str::trim).filter(|p| !p.is_empty());
+            (!session.is_empty() && !cmd.is_empty()).then(|| {
+                (
+                    session.to_string(),
+                    PaneSnap {
+                        cmd: cmd.to_string(),
+                        cwd: cwd.map(PathBuf::from),
+                    },
+                )
+            })
         })
         .collect()
 }
 
+/// Is this pane_current_command a shell sitting at a prompt? Login shells
+/// report themselves with a leading dash ("-zsh").
 pub fn is_shell(cmd: &str) -> bool {
     matches!(
         cmd.trim_start_matches('-'),
@@ -556,18 +575,31 @@ mod tests {
     }
 
     #[test]
-    fn foreground_commands_parse() {
-        // Claude Code's process title is its version string; commands may
-        // carry spaces; blank/malformed lines are dropped.
-        let map = parse_foreground_commands(
-            "mux-aaaa1111 zsh\nmux-bbbb2222 2.1.202\nmux-cccc3333 git log\n\nbroken\n",
+    fn pane_snapshot_parse() {
+        // Claude Code's process title is its version string; commands and
+        // paths may carry spaces; blank/malformed lines are dropped and a
+        // missing path becomes None rather than an empty cwd.
+        let map = parse_pane_snapshot(
+            "mux-aaaa1111\tzsh\t/Users/u/dev\n\
+             mux-bbbb2222\t2.1.202\t/Users/u/my repo\n\
+             mux-cccc3333\tgit log\t\n\
+             \nbroken\n",
         );
         assert_eq!(map.len(), 3);
-        assert_eq!(map["mux-aaaa1111"], "zsh");
-        assert_eq!(map["mux-bbbb2222"], "2.1.202");
-        assert_eq!(map["mux-cccc3333"], "git log");
-        assert!(is_shell(&map["mux-aaaa1111"]));
-        assert!(!is_shell(&map["mux-bbbb2222"]));
+        assert_eq!(map["mux-aaaa1111"].cmd, "zsh");
+        assert_eq!(
+            map["mux-aaaa1111"].cwd.as_deref(),
+            Some(Path::new("/Users/u/dev"))
+        );
+        assert_eq!(map["mux-bbbb2222"].cmd, "2.1.202");
+        assert_eq!(
+            map["mux-bbbb2222"].cwd.as_deref(),
+            Some(Path::new("/Users/u/my repo"))
+        );
+        assert_eq!(map["mux-cccc3333"].cmd, "git log");
+        assert!(map["mux-cccc3333"].cwd.is_none());
+        assert!(is_shell(&map["mux-aaaa1111"].cmd));
+        assert!(!is_shell(&map["mux-bbbb2222"].cmd));
     }
 
     #[test]
