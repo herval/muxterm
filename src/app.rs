@@ -1927,19 +1927,13 @@ impl eframe::App for App {
         }
 
         let mut ui_actions = Vec::new();
-        // A small left gutter separates the panes from the sidebar's resize
-        // edge; none when the sidebar is hidden so panes stay flush.
-        let content_margin = if self.sidebar_open {
-            egui::Margin { left: 6, right: 0, top: 0, bottom: 0 }
-        } else {
-            egui::Margin::ZERO
-        };
+        // Panes sit flush against the sidebar, exactly like every other
+        // edge - the focus ring insets itself where it lacks outside room,
+        // the terminal grid carries its own left inset (egui_term), and the
+        // sidebar's resize separator draws its own line, so no gutter is
+        // needed to keep them apart.
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(self.ui_theme.bg)
-                    .inner_margin(content_margin),
-            )
+            .frame(egui::Frame::new().fill(self.ui_theme.bg))
             .show(ctx, |ui| {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
