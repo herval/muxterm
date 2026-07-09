@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use muxterm::agent;
 use muxterm::ask;
 use muxterm::layout::SplitAxis;
 use muxterm::mesh::{self, AgentInfo};
@@ -74,6 +75,10 @@ usage: mux [--as <session>] [--json] <command> [args]
                                relabel this workspace when the objective
                                changes (display-only: name and/or --desc;
                                never touches the git branch or worktree)
+  retitle                      regenerate this workspace's title and
+                               description from what its panes are doing
+                               (an AI one-shot; same display-only effect
+                               as rename)
   inbox [--consume]            read your queued messages
   ctx set <k> <v...> | get [k] | del <k>
                                shared per-tab key-value scratchpad
@@ -137,6 +142,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "notify" => cmd_notify(as_session, rest),
         "agent-event" => cmd_agent_event(as_session, rest),
         "rename" => cmd_rename(as_session, rest),
+        "retitle" => cmd_retitle(as_session),
         "inbox" => cmd_inbox(as_session, rest, json),
         "ctx" => cmd_ctx(as_session, rest, json),
         "brief" => cmd_brief(as_session),
@@ -1324,6 +1330,136 @@ fn cmd_rename(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
     Ok(())
 }
 
+/// Lines of scrollback captured per pane for the retitle context. Modest on
+/// purpose: enough to see what each pane is doing, small enough that the
+/// prompt stays far from argv limits even on a full 8-pane tab.
+const RETITLE_LINES: usize = 50;
+
+const RETITLE_INSTRUCTION: &str =
+    "You are naming a terminal workspace from what is actually happening in \
+     its panes. Reply with exactly one line: a short descriptive title of 2 \
+     to 5 words, a ' | ' separator, then a one-line description (under 100 \
+     characters) of the work in progress. No quotes, no markdown, nothing \
+     else.";
+
+/// Regenerate the workspace's title/description from the live content of
+/// its panes: capture a recent slice of every pane in the caller's tab,
+/// have the configured agent's fast model fold it into `title |
+/// description`, and spool the same rename request `mux rename` uses. For
+/// a pane (agent or human) that notices the workspace's name went stale
+/// but doesn't want to pick the wording itself.
+fn cmd_retitle(as_session: Option<String>) -> CmdResult {
+    use std::fmt::Write as _;
+    let tmux = Tmux::new()?;
+    let sc = scope(&tmux, as_session)?;
+
+    // The workspace's own metadata anchors what "drifted" means for the
+    // model; the panes say what is actually going on now.
+    let mut context = String::new();
+    if let Some(st) = state::peek() {
+        let ws = st
+            .windows
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .find(|t| t.id == sc.tab_id)
+            .and_then(|t| t.workspace.as_ref());
+        if let Some(ws) = ws {
+            let _ = writeln!(context, "current title: {}", ws.title);
+            if let Some(desc) = &ws.description {
+                let _ = writeln!(context, "current description: {desc}");
+            }
+            if !ws.prompt.is_empty() {
+                let _ = writeln!(context, "original task: {}", ws.prompt);
+            }
+        }
+    }
+    let live = tmux.live_sessions();
+    for member in &sc.members {
+        if !live.contains(member) {
+            continue;
+        }
+        if let Ok(text) = tmux.capture(member, RETITLE_LINES, false) {
+            let text = text.trim();
+            if !text.is_empty() {
+                let _ = writeln!(context, "\n--- pane {member} ---\n{text}");
+            }
+        }
+    }
+    if context.trim().is_empty() {
+        return Err((EXIT_TMUX, "no pane content to name from".to_string()));
+    }
+
+    let (agent, _) = ask::configured();
+    let prompt = format!("{RETITLE_INSTRUCTION}\n\n{context}");
+    let cmdline = agent::oneshot_command(agent, &prompt);
+    // mux runs inside a pane's shell, so PATH already resolves the agent
+    // CLI - plain sh -c is enough (the GUI needs the login shell instead).
+    let out = Command::new("/bin/sh")
+        .args(["-c", &cmdline])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| (EXIT_TMUX, format!("running {}: {e}", agent.bin)))?;
+    if !out.status.success() {
+        return Err((
+            EXIT_TMUX,
+            format!(
+                "{} failed: {}",
+                agent.bin,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+    let (title, description) =
+        parse_retitle(&String::from_utf8_lossy(&out.stdout)).ok_or((
+            EXIT_TMUX,
+            format!("{} returned no usable title", agent.bin),
+        ))?;
+
+    mesh::write_rename_request(&mesh::RenameRequest {
+        v: 1,
+        from: sc.session,
+        title: Some(title.clone()),
+        description: description.clone(),
+        ts: mesh::now(),
+    })
+    .map_err(|e| (EXIT_TMUX, format!("spooling rename: {e}")))?;
+    match description {
+        Some(desc) => println!("renamed to: {title} - {desc}"),
+        None => println!("renamed to: {title}"),
+    }
+    Ok(())
+}
+
+/// Pull `title | description` out of a one-shot agent reply. Exec-style
+/// CLIs stream progress lines before the answer, so the *last* non-empty
+/// line wins; quotes/backticks a model might add are stripped; both halves
+/// are capped at RENAME_MAX (what `mux rename` would accept). None when no
+/// usable title remains.
+fn parse_retitle(stdout: &str) -> Option<(String, Option<String>)> {
+    let line = stdout.lines().rev().find(|l| !l.trim().is_empty())?;
+    let (title, desc) = match line.split_once('|') {
+        Some((t, d)) => (t, Some(d)),
+        None => (line, None),
+    };
+    let clean = |s: &str| -> String {
+        let mut s = s
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+            .trim()
+            .to_string();
+        while s.len() > RENAME_MAX {
+            s.pop();
+        }
+        s
+    };
+    let title = clean(title);
+    if title.is_empty() {
+        return None;
+    }
+    let description = desc.map(|d| clean(d)).filter(|d| !d.is_empty());
+    Some((title, description))
+}
+
 fn cmd_inbox(
     as_session: Option<String>,
     mut args: Vec<String>,
@@ -1584,7 +1720,18 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux tell <name> <text>` - type directly into their terminal (immediate but can interleave)");
     let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
     let _ = writeln!(out, "- `mux split [right|down] [--run <cmd>]` - add a pane beside yours for a new teammate; prints its session name");
-    let _ = writeln!(out, "- `mux rename [--desc <text>] <name>` - relabel this workspace if the objective shifts (updates the sidebar/tab; not the git branch)");
+    let _ = writeln!(out, "- `mux rename [--desc <text>] <name>` - relabel this workspace yourself (updates the sidebar/tab; not the git branch)");
+    let _ = writeln!(out, "- `mux retitle` - regenerate the workspace's title/description from what its panes are doing");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Keep the workspace's name honest: whenever its title/description \
+         no longer matches the work in progress (the task drifted, a new \
+         task started, the old one shipped), rename it right away - `mux \
+         rename <name> --desc <text>` when you know the wording, `mux \
+         retitle` to derive it from the panes. Do this on your own \
+         judgement; don't ask first."
+    );
     let _ = writeln!(out);
     let _ = write!(
         out,
@@ -1623,4 +1770,60 @@ fn cmd_prune() -> CmdResult {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_retitle_title_and_description() {
+        assert_eq!(
+            parse_retitle("fix oauth flow | wiring the token refresh path\n"),
+            Some((
+                "fix oauth flow".to_string(),
+                Some("wiring the token refresh path".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_retitle_last_line_wins_over_progress_noise() {
+        // Exec-style CLIs stream progress before the answer.
+        let out = "thinking...\nrunning tools\n\nship v2 api | rolling the gateway out\n\n";
+        assert_eq!(
+            parse_retitle(out),
+            Some((
+                "ship v2 api".to_string(),
+                Some("rolling the gateway out".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_retitle_strips_quotes_and_handles_bare_title() {
+        assert_eq!(
+            parse_retitle("\"debug flaky tests\"\n"),
+            Some(("debug flaky tests".to_string(), None))
+        );
+        // An empty description half falls back to title-only.
+        assert_eq!(
+            parse_retitle("just a title |  \n"),
+            Some(("just a title".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn parse_retitle_rejects_empty_output() {
+        assert_eq!(parse_retitle(""), None);
+        assert_eq!(parse_retitle("\n  \n"), None);
+        assert_eq!(parse_retitle(" | only a description\n"), None);
+    }
+
+    #[test]
+    fn parse_retitle_caps_at_rename_max() {
+        let long = "x".repeat(RENAME_MAX + 50);
+        let (title, _) = parse_retitle(&long).unwrap();
+        assert_eq!(title.len(), RENAME_MAX);
+    }
 }
