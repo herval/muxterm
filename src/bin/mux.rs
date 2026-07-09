@@ -75,10 +75,11 @@ usage: mux [--as <session>] [--json] <command> [args]
                                relabel this workspace when the objective
                                changes (display-only: name and/or --desc;
                                never touches the git branch or worktree)
-  retitle                      regenerate this workspace's title and
+  retitle [--wait]             regenerate this workspace's title and
                                description from what its panes are doing
                                (an AI one-shot; same display-only effect
-                               as rename)
+                               as rename; returns immediately and applies
+                               in the background unless --wait)
   inbox [--consume]            read your queued messages
   ctx set <k> <v...> | get [k] | del <k>
                                shared per-tab key-value scratchpad
@@ -142,7 +143,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "notify" => cmd_notify(as_session, rest),
         "agent-event" => cmd_agent_event(as_session, rest),
         "rename" => cmd_rename(as_session, rest),
-        "retitle" => cmd_retitle(as_session),
+        "retitle" => cmd_retitle(as_session, rest),
         "inbox" => cmd_inbox(as_session, rest, json),
         "ctx" => cmd_ctx(as_session, rest, json),
         "brief" => cmd_brief(as_session),
@@ -1331,9 +1332,28 @@ fn cmd_rename(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
 }
 
 /// Lines of scrollback captured per pane for the retitle context. Modest on
-/// purpose: enough to see what each pane is doing, small enough that the
-/// prompt stays far from argv limits even on a full 8-pane tab.
-const RETITLE_LINES: usize = 50;
+/// purpose: enough to see what each pane is doing, and the one-shot's
+/// latency grows with prompt size (haiku is already the smallest model -
+/// the prompt is the only lever left).
+const RETITLE_LINES: usize = 25;
+
+/// Per-pane cap on captured bytes: capture's -J rejoins wrapped lines, so
+/// one pane with long output can dwarf everything else and double the
+/// model's prefill time. The newest content is at the end of the capture,
+/// so the tail is what survives.
+const RETITLE_PANE_BYTES: usize = 2048;
+
+/// The trailing `max` bytes of `s`, nudged forward to a char boundary.
+fn tail_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
 
 /// Hard deadline on the retitle one-shot: a stuck agent CLI must not hang
 /// the caller's pane forever.
@@ -1379,10 +1399,32 @@ const RETITLE_INSTRUCTION: &str =
 /// description`, and spool the same rename request `mux rename` uses. For
 /// a pane (agent or human) that notices the workspace's name went stale
 /// but doesn't want to pick the wording itself.
-fn cmd_retitle(as_session: Option<String>) -> CmdResult {
+///
+/// Detached by default: the model call takes 10-40s, and like rename the
+/// result lands through the GUI spool anyway - so the parent validates the
+/// scope, re-execs itself with `--wait`, and returns immediately. `--wait`
+/// is the actual worker (and lets a caller watch the outcome).
+fn cmd_retitle(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
     use std::fmt::Write as _;
+    let wait = take_flag(&mut args, "--wait");
     let tmux = Tmux::new()?;
     let sc = scope(&tmux, as_session)?;
+    if !wait {
+        let exe = env::current_exe()
+            .map_err(|e| (EXIT_TMUX, format!("resolving mux path: {e}")))?;
+        Command::new(exe)
+            .args(["--as", &sc.session, "retitle", "--wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| (EXIT_TMUX, format!("spawning worker: {e}")))?;
+        println!(
+            "retitling in the background - the workspace name updates when \
+             it lands (mux retitle --wait to watch)"
+        );
+        return Ok(());
+    }
 
     // The workspace's own metadata anchors what "drifted" means for the
     // model; the panes say what is actually going on now.
@@ -1410,7 +1452,7 @@ fn cmd_retitle(as_session: Option<String>) -> CmdResult {
             continue;
         }
         if let Ok(text) = tmux.capture(member, RETITLE_LINES, false) {
-            let text = text.trim();
+            let text = tail_bytes(text.trim(), RETITLE_PANE_BYTES);
             if !text.is_empty() {
                 let _ = writeln!(context, "\n--- pane {member} ---\n{text}");
             }
@@ -1767,7 +1809,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
     let _ = writeln!(out, "- `mux split [right|down] [--run <cmd>]` - add a pane beside yours for a new teammate; prints its session name");
     let _ = writeln!(out, "- `mux rename [--desc <text>] <name>` - relabel this workspace yourself (updates the sidebar/tab; not the git branch)");
-    let _ = writeln!(out, "- `mux retitle` - regenerate the workspace's title/description from what its panes are doing");
+    let _ = writeln!(out, "- `mux retitle` - regenerate the workspace's title/description from what its panes are doing (returns immediately; applies in the background)");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -1871,5 +1913,15 @@ mod tests {
         let long = "x".repeat(RENAME_MAX + 50);
         let (title, _) = parse_retitle(&long).unwrap();
         assert_eq!(title.len(), RENAME_MAX);
+    }
+
+    #[test]
+    fn tail_bytes_keeps_the_end_on_char_boundaries() {
+        assert_eq!(tail_bytes("short", 100), "short");
+        assert_eq!(tail_bytes("abcdef", 3), "def");
+        // A multi-byte char straddling the cut is dropped, not split.
+        let s = "aé"; // 'é' is 2 bytes
+        assert_eq!(tail_bytes(s, 1), "");
+        assert_eq!(tail_bytes(s, 2), "é");
     }
 }
