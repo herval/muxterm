@@ -6,7 +6,8 @@
 
 use egui::text::LayoutJob;
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, TextFormat, Vec2,
+    Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Stroke,
+    TextFormat, Vec2,
 };
 
 use crate::theme::{self, UiTheme};
@@ -43,7 +44,7 @@ pub struct Row {
     pub title: String,
     pub subtitle: Option<String>,
     pub active: bool,
-    /// Drives the leading status dot (pulsating green / steady red / accent).
+    /// Drives the leading status icon (`status_icon`: ring / play / `!`).
     pub status: Status,
     /// Whether this workspace is archived: it renders in the bottom pile and
     /// its hover icon restores rather than archives.
@@ -154,13 +155,63 @@ fn row_action(
     }
 }
 
-/// A breathing brightness for the "working" dot: a sine over `time` (seconds)
-/// eases the color between a dimmed-toward-background trough and the full
-/// status green. ~1.4s period reads as a calm pulse, not a blink.
+/// A breathing brightness for the "working" icon: a sine over `time`
+/// (seconds) eases the color between a dimmed-toward-background trough and
+/// the full status green. ~1.4s period reads as a calm pulse, not a blink.
 fn pulse(bright: Color32, bg: Color32, time: f64) -> Color32 {
     let s = 0.5 + 0.5 * (time * 4.5).sin() as f32; // 0..1
     let dim = theme::blend(bright, bg, 0.6);
     theme::blend(dim, bright, s)
+}
+
+/// The row's status icon, sized against the row font. One distinct shape
+/// per state - color alone must never be the only signal:
+/// - Idle: a hollow accent ring (nothing running).
+/// - Working: a filled play-triangle breathing green (`pulse`).
+/// - Blocked: a steady red exclamation mark (bar + dot).
+fn status_icon(
+    painter: &egui::Painter,
+    center: Pos2,
+    font_size: f32,
+    status: Status,
+    t: &UiTheme,
+    time: f64,
+) {
+    let r = font_size * 0.30;
+    match status {
+        Status::Idle => {
+            painter.circle_stroke(
+                center,
+                r * 0.72,
+                Stroke::new((font_size * 0.09).max(1.0), t.accent),
+            );
+        },
+        Status::Working => {
+            let points = vec![
+                Pos2::new(center.x - r * 0.62, center.y - r),
+                Pos2::new(center.x - r * 0.62, center.y + r),
+                Pos2::new(center.x + r * 0.9, center.y),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                pulse(t.status_ok, t.bg, time),
+                Stroke::NONE,
+            ));
+        },
+        Status::Blocked => {
+            let w = (font_size * 0.10).max(1.0);
+            let bar = Rect::from_min_max(
+                Pos2::new(center.x - w, center.y - r),
+                Pos2::new(center.x + w, center.y + r * 0.35),
+            );
+            painter.rect_filled(bar, CornerRadius::same(1), t.status_err);
+            painter.circle_filled(
+                Pos2::new(center.x, center.y + r * 0.85),
+                w * 1.2,
+                t.status_err,
+            );
+        },
+    }
 }
 
 fn icon_button(ui: &mut egui::Ui, glyph: &str, t: &UiTheme) -> egui::Response {
@@ -190,30 +241,21 @@ fn workspace_row(
     let title_color = if row.active { t.text } else { t.text_dim };
     let pad = Vec2::new(8.0, 5.0);
 
-    // The leading dot doubles as the status light: a pulsating green while an
-    // agent is working, steady red while one is blocked waiting, else a quiet
-    // accent dot. Working keeps repainting so the pulse stays smooth (and so
-    // the light goes out promptly once output stops).
-    let (dot_color, dot_scale) = match row.status {
-        Status::Working => {
-            ui.ctx().request_repaint();
-            let phase = ui.input(|i| i.time);
-            (pulse(t.status_ok, t.bg, phase), 0.72)
-        },
-        Status::Blocked => (t.status_err, 0.72),
-        Status::Idle => (t.accent, 0.6),
-    };
+    // The leading icon is the status light, and its *shape* carries the
+    // state as much as its color (so it reads without color vision): a
+    // quiet ring when idle, a breathing play-triangle while an agent works,
+    // a steady red exclamation while one is blocked waiting. Working keeps
+    // repainting so the motion stays smooth (and so the light goes out
+    // promptly once the agent stops). Painter-drawn, not a glyph: advance
+    // widths vary across terminal fonts/fallbacks, a fixed band doesn't.
+    if row.status == Status::Working {
+        ui.ctx().request_repaint();
+    }
+    let status_w = font.size * 1.1;
     let mut job = LayoutJob::default();
-    // Reserve the icon's width so wrapping never collides with it.
-    job.wrap.max_width = (ui.available_width() - pad.x * 2.0 - ICON_W).max(1.0);
-    job.append(
-        "● ",
-        0.0,
-        TextFormat::simple(
-            FontId::new(font.size * dot_scale, font.family.clone()),
-            dot_color,
-        ),
-    );
+    // Reserve both icons' widths so wrapping never collides with them.
+    job.wrap.max_width =
+        (ui.available_width() - pad.x * 2.0 - ICON_W - status_w).max(1.0);
     job.append(&row.title, 0.0, TextFormat::simple(font.clone(), title_color));
     if let Some(sub) = &row.subtitle {
         job.append(
@@ -267,7 +309,20 @@ fn workspace_row(
             theme::blend(t.bg, t.accent, 0.06),
         );
     }
-    ui.painter().galley(rect.min + pad, galley, title_color);
+    ui.painter()
+        .galley(rect.min + pad + Vec2::new(status_w, 0.0), galley, title_color);
+    // Centered on the title's first line, inside the reserved band.
+    status_icon(
+        ui.painter(),
+        Pos2::new(
+            rect.min.x + pad.x + status_w * 0.38,
+            rect.min.y + pad.y + ui.fonts(|f| f.row_height(font)) * 0.52,
+        ),
+        font.size,
+        row.status,
+        t,
+        ui.input(|i| i.time),
+    );
     if hovered {
         ui.painter().text(
             icon_rect.center(),
@@ -278,4 +333,101 @@ fn workspace_row(
         );
     }
     (resp.on_hover_cursor(egui::CursorIcon::PointingHand), icon_resp.clicked())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn collect(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+        if let egui::Shape::Vec(v) = shape {
+            for s in v {
+                collect(s, out);
+            }
+        } else {
+            out.push(shape.clone());
+        }
+    }
+
+    /// Render one row per status headlessly and check each state's shape
+    /// actually paints: idle's hollow ring (stroked, unfilled circle),
+    /// working's play-triangle (filled path), blocked's red exclamation
+    /// (a status_err-filled circle for its dot). Guards the "shape, not
+    /// just color" contract.
+    #[test]
+    fn sidebar_paints_distinct_status_shapes() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let rows = vec![
+            Row {
+                tab_index: 0,
+                title: "resting-ws".into(),
+                subtitle: None,
+                active: false,
+                status: Status::Idle,
+                archived: false,
+            },
+            Row {
+                tab_index: 1,
+                title: "busy-ws".into(),
+                subtitle: Some("feat/x".into()),
+                active: false,
+                status: Status::Working,
+                archived: false,
+            },
+            Row {
+                tab_index: 2,
+                title: "stuck-ws".into(),
+                subtitle: None,
+                active: false,
+                status: Status::Blocked,
+                archived: false,
+            },
+        ];
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut frame = |ctx: &egui::Context| {
+            let _ = show(ctx, &rows, &font, &th);
+        };
+        let _ = ctx.run(input.clone(), &mut frame);
+        let output = ctx.run(input, &mut frame);
+
+        let mut shapes = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut shapes);
+        }
+        let texts: String = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\u{1}");
+        for title in ["resting-ws", "busy-ws", "stuck-ws"] {
+            assert!(texts.contains(title), "missing {title:?} in {texts:?}");
+        }
+
+        let ring = shapes.iter().any(|s| {
+            matches!(s, egui::Shape::Circle(c)
+                if c.fill == Color32::TRANSPARENT && c.stroke.width > 0.0)
+        });
+        let triangle =
+            shapes.iter().any(|s| matches!(s, egui::Shape::Path(_)));
+        let bang_dot = shapes.iter().any(|s| {
+            matches!(s, egui::Shape::Circle(c) if c.fill == th.status_err)
+        });
+        assert!(ring, "idle ring not painted");
+        assert!(triangle, "working play-triangle not painted");
+        assert!(bang_dot, "blocked exclamation dot not painted");
+    }
 }
