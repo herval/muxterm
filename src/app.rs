@@ -442,12 +442,13 @@ impl App {
         self.dirty = true;
     }
 
-    /// cmd+n: build a workspace from the creation popup's form. If a worktree
-    /// was requested its directory is claimed synchronously (cheap - a name
-    /// pick and a mkdir) so the pane opens directly inside it and no `cd` is
-    /// ever typed; the slow checkout populates it off the UI thread (see
-    /// `drain_worktrees`), which is also what defers the agent launch until
-    /// the files exist. Without a worktree the agent launches straight away.
+    /// cmd+n: build a workspace from the creation popup's form, opening an
+    /// agent-pane/side-shell pair. If a worktree was requested its directory
+    /// is claimed synchronously (cheap - a name pick and a mkdir) so both
+    /// panes open directly inside it and no `cd` is ever typed; the slow
+    /// checkout populates it off the UI thread (see `drain_worktrees`),
+    /// which is also what defers the agent launch until the files exist.
+    /// Without a worktree the agent launches straight away.
     fn create_workspace(&mut self, ctx: &egui::Context, form: NewWorkspaceForm) {
         let root = expand_dir(&form.folder);
         let prompt = form.prompt.trim().to_string();
@@ -473,16 +474,39 @@ impl App {
             .or_else(|| root.clone())
             .map(|p| p.display().to_string());
 
-        let pane = match self.create_pane(ctx, None, start_dir) {
+        let pane = match self.create_pane(ctx, None, start_dir.clone()) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("failed to open workspace pane: {e:#}");
                 return;
             },
         };
+        // A workspace opens as a pair: the agent on the left, a free shell
+        // on the right, both in the same folder (the claimed worktree when
+        // there is one). The agent launch types into the tree's *first*
+        // leaf, so the agent pane must be `first`; focus starts there too.
+        // Best-effort - if the shell pane fails, the workspace still works
+        // single-pane.
+        let shell = self
+            .create_pane(ctx, None, start_dir)
+            .map_err(|e| log::warn!("failed to open workspace shell pane: {e:#}"))
+            .ok();
         let id = pane.id;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
+        let tree = match shell {
+            Some(shell) => {
+                let shell_id = shell.id;
+                panes.insert(shell_id, shell);
+                Node::Split {
+                    axis: SplitAxis::SideBySide,
+                    ratio: 0.5,
+                    first: Box::new(Node::Leaf(id)),
+                    second: Box::new(Node::Leaf(shell_id)),
+                }
+            },
+            None => Node::Leaf(id),
+        };
         let tab_id = mesh::new_tab_id();
 
         // A prompt-derived placeholder shows instantly; the AI title upgrades
@@ -507,7 +531,7 @@ impl App {
 
         self.tabs.push(Tab {
             tab_id: tab_id.clone(),
-            tree: Node::Leaf(id),
+            tree,
             panes,
             focused: id,
             last_rects: HashMap::new(),
@@ -618,6 +642,29 @@ impl App {
                         .find(|t| t.tab_id == tab_id)
                         .and_then(|t| t.workspace.root.clone());
                     self.launch_agent(&tab_id, root.as_deref());
+                    // The workspace's other panes (the side shell) sit in
+                    // the removed claim dir too; walk them back as well.
+                    if let (Some(root), Some(tab)) = (
+                        root.as_deref(),
+                        self.tabs.iter_mut().find(|t| t.tab_id == tab_id),
+                    ) {
+                        let agent_pane = tab.tree.first_leaf();
+                        let cd = format!(
+                            "cd {}\r",
+                            muxterm::agent::shell_quote(
+                                &root.display().to_string()
+                            )
+                        );
+                        for (pane_id, pane) in tab.panes.iter_mut() {
+                            if *pane_id != agent_pane {
+                                pane.backend.process_command(
+                                    BackendCommand::Write(
+                                        cd.clone().into_bytes(),
+                                    ),
+                                );
+                            }
+                        }
+                    }
                 },
             }
             self.dirty = true;
