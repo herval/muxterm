@@ -1335,6 +1335,37 @@ fn cmd_rename(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
 /// prompt stays far from argv limits even on a full 8-pane tab.
 const RETITLE_LINES: usize = 50;
 
+/// Hard deadline on the retitle one-shot: a stuck agent CLI must not hang
+/// the caller's pane forever.
+const RETITLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Run a command to completion under a deadline, killing it on expiry
+/// (None). Polls `try_wait` rather than blocking, which is what makes the
+/// kill possible; the expected output is one short line, so the pipes
+/// cannot fill up and stall the child before the deadline reaps it.
+fn output_with_timeout(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> io::Result<Option<std::process::Output>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 const RETITLE_INSTRUCTION: &str =
     "You are naming a terminal workspace from what is actually happening in \
      its panes. Reply with exactly one line: a short descriptive title of 2 \
@@ -1391,14 +1422,29 @@ fn cmd_retitle(as_session: Option<String>) -> CmdResult {
 
     let (agent, _) = ask::configured();
     let prompt = format!("{RETITLE_INSTRUCTION}\n\n{context}");
-    let cmdline = agent::oneshot_command(agent, &prompt);
-    // mux runs inside a pane's shell, so PATH already resolves the agent
-    // CLI - plain sh -c is enough (the GUI needs the login shell instead).
-    let out = Command::new("/bin/sh")
-        .args(["-c", &cmdline])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| (EXIT_TMUX, format!("running {}: {e}", agent.bin)))?;
+    // Say what is happening before the model call: 10-20 quiet seconds at
+    // a shell prompt read as a freeze otherwise.
+    eprintln!(
+        "summarizing {} pane(s) with {}... (typically 10-20s)",
+        sc.members.iter().filter(|m| live.contains(*m)).count(),
+        agent.bin,
+    );
+    // Spawned directly (argv, no shell): mux runs inside a pane's shell so
+    // PATH already resolves the agent CLI, and a timeout kill() must reach
+    // the agent itself, not a wrapper sh.
+    let argv = agent::oneshot_argv(agent, &prompt);
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    let out = output_with_timeout(&mut cmd, RETITLE_TIMEOUT)
+        .map_err(|e| (EXIT_TMUX, format!("running {}: {e}", agent.bin)))?
+        .ok_or((
+            EXIT_TMUX,
+            format!(
+                "{} timed out after {}s",
+                agent.bin,
+                RETITLE_TIMEOUT.as_secs()
+            ),
+        ))?;
     if !out.status.success() {
         return Err((
             EXIT_TMUX,

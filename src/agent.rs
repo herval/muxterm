@@ -48,7 +48,11 @@ pub const AGENTS: &[Agent] = &[
         fast_model: Some("haiku"),
         models: &["opus", "claude-fable-5", "sonnet", "haiku"],
         ask: AskInvocation::ClaudeStream,
-        oneshot_args: &["-p"],
+        // --max-turns 1: a title/summary needs exactly one model turn. In
+        // print mode a tool attempt has no TTY to approve through and can
+        // stall the whole one-shot; capping turns makes it return (possibly
+        // empty - the caller treats that as a clean failure) instead.
+        oneshot_args: &["-p", "--max-turns", "1"],
     },
     Agent {
         id: "codex",
@@ -145,23 +149,33 @@ pub fn launch_command(
     cmd
 }
 
-/// The captured one-shot behind AI workspace-title generation (workspace.rs):
-/// non-interactive, fast model, plain-text stdout. Unlike `launch_command`
-/// (interactive, user-picked model), this always uses the registry's
-/// fast_model - a summary line doesn't need a flagship.
-pub fn oneshot_command(agent: &Agent, prompt: &str) -> String {
-    let mut cmd = agent.bin.to_string();
-    for arg in agent.oneshot_args {
-        cmd.push(' ');
-        cmd.push_str(arg);
-    }
+/// The captured one-shot behind AI workspace-title generation (workspace.rs,
+/// `mux retitle`): non-interactive, fast model, plain-text stdout. Unlike
+/// `launch_command` (interactive, user-picked model), this always uses the
+/// registry's fast_model - a summary line doesn't need a flagship.
+///
+/// Argv form (bin first), for callers that spawn the process directly: no
+/// shell means no quoting surface and - load-bearing for `mux retitle`'s
+/// timeout - a `kill()` that reaches the agent instead of a wrapper sh.
+pub fn oneshot_argv(agent: &Agent, prompt: &str) -> Vec<String> {
+    let mut argv = vec![agent.bin.to_string()];
+    argv.extend(agent.oneshot_args.iter().map(|s| s.to_string()));
     if let Some(m) = agent.fast_model {
-        cmd.push_str(" --model ");
-        cmd.push_str(m);
+        argv.push("--model".to_string());
+        argv.push(m.to_string());
     }
-    cmd.push(' ');
-    cmd.push_str(&shell_quote(prompt));
-    cmd
+    argv.push(prompt.to_string());
+    argv
+}
+
+/// Shell-command form of `oneshot_argv`, for callers that must go through a
+/// shell (the GUI's title generation runs `$SHELL -ilc` to get the user's
+/// PATH). Only the prompt needs quoting - every other token is a fixed
+/// registry string.
+pub fn oneshot_command(agent: &Agent, prompt: &str) -> String {
+    let argv = oneshot_argv(agent, prompt);
+    let (prompt, fixed) = argv.split_last().expect("argv has bin + prompt");
+    format!("{} {}", fixed.join(" "), shell_quote(prompt))
 }
 
 /// POSIX single-quoting: wrap in '...', embedded ' becomes '\''.
@@ -249,7 +263,7 @@ mod tests {
         let claude = by_id("claude").unwrap();
         assert_eq!(
             oneshot_command(claude, "name this"),
-            "claude -p --model haiku 'name this'"
+            "claude -p --max-turns 1 --model haiku 'name this'"
         );
         let codex = by_id("codex").unwrap();
         assert_eq!(
@@ -260,6 +274,30 @@ mod tests {
         assert_eq!(
             oneshot_command(pi, "name this"),
             "pi -p --model haiku 'name this'"
+        );
+    }
+
+    #[test]
+    fn oneshot_argv_matches_command_form() {
+        let claude = by_id("claude").unwrap();
+        // Argv carries the prompt verbatim (no shell, no quoting), one
+        // token per arg.
+        assert_eq!(
+            oneshot_argv(claude, "it's a name"),
+            vec![
+                "claude",
+                "-p",
+                "--max-turns",
+                "1",
+                "--model",
+                "haiku",
+                "it's a name"
+            ]
+        );
+        // The command form is the same tokens with the prompt quoted.
+        assert_eq!(
+            oneshot_command(claude, "it's a name"),
+            "claude -p --max-turns 1 --model haiku 'it'\\''s a name'"
         );
     }
 
