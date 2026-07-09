@@ -1981,11 +1981,24 @@ impl eframe::App for App {
                         if let Some(focused_rect) =
                             (!archived).then(|| rects.get(&tab.focused)).flatten()
                         {
+                            // The ring hugs the pane from just outside - the
+                            // inter-pane gap and the sidebar gutter have room -
+                            // but clamped into the clip region and stroked
+                            // inward: an edge-flush pane would otherwise get
+                            // the stroke sliced away wherever it touches the
+                            // panel border (invisible top/bottom, a half-drawn
+                            // seam against the sidebar).
+                            let clip = ui.clip_rect();
+                            let ring = focused_rect.expand(1.0);
+                            let ring = Rect::from_min_max(
+                                ring.min.max(clip.min),
+                                ring.max.min(clip.max),
+                            );
                             ui.painter().rect_stroke(
-                                focused_rect.expand(1.0),
+                                ring,
                                 CornerRadius::same(2),
                                 Stroke::new(1.0, self.ui_theme.accent),
-                                StrokeKind::Outside,
+                                StrokeKind::Inside,
                             );
                         }
                         if self.pane_titles {
