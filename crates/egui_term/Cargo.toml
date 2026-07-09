@@ -13,3 +13,7 @@ egui = "0.31.0"
 alacritty_terminal = "0.25.0"
 anyhow = "1.0.96"
 open = "5.3.2"
+# muxterm patch P19: link detection reconstructs logical lines as strings and
+# matches with the `regex` crate (alacritty's grid search is WRAPLINE-gated and
+# tmux repaints soft-wraps as discrete rows). Already in the lock tree.
+regex = "1"

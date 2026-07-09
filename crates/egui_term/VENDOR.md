@@ -151,3 +151,19 @@ tmux-backed design. Local patches:
   make a peeked *archived* workspace a look-but-don't-touch preview; the pane
   is also washed with `archived_overlay` and denied focus (the
   `PaneId(u64::MAX)` sentinel) at the call site. On by default.
+- **P19** (`src/backend/mod.rs`, `Cargo.toml`): multi-row link detection. A
+  URL or path that soft-wraps onto the next row was only clickable up to the
+  wrap point. Alacritty's grid regex search breaks a match at any row boundary
+  whose last cell lacks the `WRAPLINE` flag (`regex_search_internal`'s
+  linebreak handling), and tmux repaints soft-wrapped output as discrete
+  cursor-addressed rows that carry no `WRAPLINE` - so the match always
+  truncated at the edge. Link detection no longer uses alacritty's search
+  (`RegexIter`/`RegexSearch`/`Match`, all `WRAPLINE`-gated). `link_match_at`
+  reconstructs the clicked point's *logical line* - the run of visually
+  continuous rows, joined when a row is `WRAPLINE`-flagged *or* its last column
+  holds a glyph (a full row, the tmux case) - into a string with a parallel
+  grid `Point` per char (wide-char spacer cells skipped), matches the URL/path
+  regexes over it, and maps the hit back to a `Point` span for hover + open.
+  The regexes moved from alacritty's `RegexSearch` to the `regex` crate (the
+  same patterns, `\u{..}` rewritten `\x{..}`; already in the lock tree). This
+  subsumes the old single-row and native-`WRAPLINE` paths (both still tested).

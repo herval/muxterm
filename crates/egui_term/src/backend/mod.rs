@@ -6,14 +6,16 @@ use alacritty_terminal::event::{
 };
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{
     Selection, SelectionRange, SelectionType as AlacrittySelectionType,
 };
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
-    self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
+    self,
+    cell::{Cell, Flags},
+    test::TermSize,
+    viewport_to_point, Term, TermMode,
 };
 use alacritty_terminal::{tty, Grid};
 use egui::Modifiers;
@@ -139,10 +141,10 @@ impl From<TerminalSize> for WindowSize {
 
 pub struct TerminalBackend {
     pub id: u64,
-    pub url_regex: RegexSearch,
+    pub url_regex: regex::Regex,
     // muxterm patch P10: file paths are links too (iTerm's semantic
     // history). Kept separate from url_regex so URLs win when both match.
-    pub path_regex: RegexSearch,
+    pub path_regex: regex::Regex,
     /// muxterm patch P10: where a cmd+clicked link's text goes. The app
     /// decides what "open" means (resolve relative paths against the pane's
     /// cwd, existence-check, pick an opener); without one, URLs and absolute
@@ -361,13 +363,8 @@ impl TerminalBackend {
     /// a cmd+click bypasses tmux mouse reporting.
     pub fn has_link_at(&self, point: Point) -> bool {
         let terminal = self.term.lock();
-        link_text_at(
-            &terminal,
-            point,
-            &mut self.url_regex.clone(),
-            &mut self.path_regex.clone(),
-        )
-        .is_some()
+        link_match_at(&terminal, point, &self.url_regex, &self.path_regex)
+            .is_some()
     }
 
     fn process_link_action(
@@ -380,14 +377,8 @@ impl TerminalBackend {
             LinkAction::Hover => {
                 // muxterm patch P10: paths hover like URLs, URLs win ties.
                 self.last_content.hovered_hyperlink =
-                    regex_match_at(terminal, point, &mut self.url_regex.clone())
-                        .or_else(|| {
-                            regex_match_at(
-                                terminal,
-                                point,
-                                &mut self.path_regex.clone(),
-                            )
-                        });
+                    link_match_at(terminal, point, &self.url_regex, &self.path_regex)
+                        .map(|(_, range)| range);
             },
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
@@ -397,12 +388,9 @@ impl TerminalBackend {
                 // from the live terminal instead of trusting the last hover
                 // (which may be stale or unset if the mouse never moved),
                 // and never panic on a failed open.
-                let text = link_text_at(
-                    terminal,
-                    point,
-                    &mut self.url_regex.clone(),
-                    &mut self.path_regex.clone(),
-                );
+                let text =
+                    link_match_at(terminal, point, &self.url_regex, &self.path_regex)
+                        .map(|(text, _)| text);
                 if let Some(text) = text {
                     match &self.link_opener {
                         Some(opener) => opener(&text),
@@ -603,9 +591,10 @@ impl TerminalBackend {
 
 }
 
-/// The URL detector, upstream's pattern unchanged.
-fn url_regex() -> RegexSearch {
-    RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap()
+/// The URL detector. Upstream's pattern, `\u{..}` rewritten as `\x{..}` for
+/// the `regex` crate (P19).
+fn url_regex() -> regex::Regex {
+    regex::Regex::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\x{0}-\x{1F}\x{7F}-\x{9F}<>"\s{-}\^⟨⟩`]+"#).unwrap()
 }
 
 /// muxterm patch P10: path-shaped tokens - absolute (`/x/y`), homedir
@@ -614,55 +603,101 @@ fn url_regex() -> RegexSearch {
 /// `:line` or `:line:col` suffix. Existence is deliberately not checked
 /// here (the grid has no cwd); the app-side opener filters false positives
 /// like `and/or` by only opening paths that exist.
-fn path_regex() -> RegexSearch {
-    RegexSearch::new(
+fn path_regex() -> regex::Regex {
+    regex::Regex::new(
         r#"(~|\.\.?|[A-Za-z0-9._@%+-]+)?(/[A-Za-z0-9._@%+-]+)+/?(:\d+(:\d+)?)?"#,
     )
     .unwrap()
 }
 
-/// Based on alacritty/src/display/hint.rs > regex_match_at
-/// Retrieve the match, if the specified point is inside the content matching the regex.
-/// muxterm patch P10: a free fn generic over the event listener (was a
-/// method hardcoded to EventProxy) so tests can use term::test::mock_term.
-fn regex_match_at<T: EventListener>(
-    terminal: &Term<T>,
-    point: Point,
-    regex: &mut RegexSearch,
-) -> Option<Match> {
-    visible_regex_match_iter(terminal, regex).find(|rm| rm.contains(&point))
+/// muxterm patch P19: a grid row wraps into the next when it carries the
+/// WRAPLINE flag (native alacritty soft-wrap) *or* its last column holds a
+/// glyph (a full row). tmux repaints soft-wrapped output as discrete
+/// cursor-positioned rows that drop WRAPLINE, so the full-row heuristic is
+/// what stitches a URL that ran off the right edge back together.
+fn row_wraps(grid: &Grid<Cell>, line: Line, last_col: Column) -> bool {
+    let cell = &grid[line][last_col];
+    cell.flags.contains(Flags::WRAPLINE) || cell.c != ' '
 }
 
-/// muxterm patch P10: the text of the link under a grid point, URLs
-/// winning over paths (every URL tail is also a path-shaped token).
-fn link_text_at<T: EventListener>(
-    terminal: &Term<T>,
-    point: Point,
-    url_regex: &mut RegexSearch,
-    path_regex: &mut RegexSearch,
-) -> Option<String> {
-    regex_match_at(terminal, point, url_regex)
-        .or_else(|| regex_match_at(terminal, point, path_regex))
-        .map(|m| terminal.bounds_to_string(*m.start(), *m.end()))
+/// muxterm patch P19: the logical line through `line` - the run of visually
+/// continuous rows around it (`row_wraps`), reconstructed as a string with a
+/// parallel grid `Point` per char (wide-char spacer cells skipped). Link
+/// detection runs the regexes over this so a match spans row boundaries even
+/// when tmux stripped WRAPLINE.
+fn logical_line<T: EventListener>(
+    term: &Term<T>,
+    line: Line,
+) -> (String, Vec<Point>) {
+    if term.columns() == 0 {
+        return (String::new(), Vec::new());
+    }
+    let grid = term.grid();
+    let last_col = Column(term.columns() - 1);
+    let top_bound = term.topmost_line();
+    let bottom_bound = term.bottommost_line();
+
+    // Walk up while the row above wraps into this one, down while this row
+    // wraps into the one below.
+    let mut top = line;
+    while top > top_bound && row_wraps(grid,top - 1i32, last_col) {
+        top -= 1i32;
+    }
+    let mut bottom = line;
+    while bottom < bottom_bound && row_wraps(grid,bottom, last_col) {
+        bottom += 1i32;
+    }
+
+    let mut text = String::new();
+    let mut points = Vec::new();
+    let mut l = top;
+    while l <= bottom {
+        for col in 0..term.columns() {
+            let point = Point::new(l, Column(col));
+            let cell = &grid[point];
+            // Skip the padding cells of a wide char so the string stays
+            // aligned with the columns the chars actually occupy.
+            if cell.flags.intersects(
+                Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER,
+            ) {
+                continue;
+            }
+            text.push(cell.c);
+            points.push(point);
+        }
+        l += 1i32;
+    }
+    (text, points)
 }
 
-/// Copied from alacritty/src/display/hint.rs:
-/// Iterate over all visible regex matches.
-fn visible_regex_match_iter<'a, T: EventListener>(
-    term: &'a Term<T>,
-    regex: &'a mut RegexSearch,
-) -> impl Iterator<Item = Match> + 'a {
-    let viewport_start = Line(-(term.grid().display_offset() as i32));
-    let viewport_end = viewport_start + term.bottommost_line();
-    let mut start =
-        term.line_search_left(Point::new(viewport_start, Column(0)));
-    let mut end = term.line_search_right(Point::new(viewport_end, Column(0)));
-    start.line = start.line.max(viewport_start - 100);
-    end.line = end.line.min(viewport_end + 100);
+/// muxterm patch P10/P19: the link under a grid point - its text and grid
+/// span - URLs winning over paths (every URL tail is also a path-shaped
+/// token). Reconstructs the clicked point's logical line and matches on it,
+/// so multi-row (soft-wrapped) links resolve whole.
+fn link_match_at<T: EventListener>(
+    term: &Term<T>,
+    point: Point,
+    url_regex: &regex::Regex,
+    path_regex: &regex::Regex,
+) -> Option<(String, RangeInclusive<Point>)> {
+    let (text, points) = logical_line(term, point.line);
+    // Char index of the clicked cell within the reconstructed line.
+    let click = points.iter().position(|p| *p == point)?;
 
-    RegexIter::new(start, end, Direction::Right, term, regex)
-        .skip_while(move |rm| rm.end().line < viewport_start)
-        .take_while(move |rm| rm.start().line <= viewport_end)
+    let hit = |re: &regex::Regex| -> Option<(String, RangeInclusive<Point>)> {
+        for m in re.find_iter(&text) {
+            let start = text[..m.start()].chars().count();
+            let end = text[..m.end()].chars().count(); // exclusive
+            if (start..end).contains(&click) {
+                return Some((
+                    m.as_str().to_string(),
+                    points[start]..=points[end - 1],
+                ));
+            }
+        }
+        None
+    };
+    hit(url_regex).or_else(|| hit(path_regex))
 }
 
 pub struct RenderableContent {
@@ -711,12 +746,13 @@ mod tests {
     /// The link text found when clicking (line, col) of `content`.
     fn link_at(content: &str, line: i32, col: usize) -> Option<String> {
         let term = mock_term(content);
-        link_text_at(
+        link_match_at(
             &term,
             Point::new(Line(line), Column(col)),
-            &mut url_regex(),
-            &mut path_regex(),
+            &url_regex(),
+            &path_regex(),
         )
+        .map(|(text, _)| text)
     }
 
     #[test]
@@ -786,5 +822,20 @@ mod tests {
         // extracted text must not contain a newline.
         let text = link_at("ls /private/tmp/some\nthing/deep.png", 1, 3);
         assert_eq!(text, Some("/private/tmp/something/deep.png".into()));
+    }
+
+    // muxterm patch P19: the real bug - tmux repaints a soft-wrapped URL as
+    // two discrete rows and drops WRAPLINE, so alacritty's search truncated
+    // the match at the row edge. mock_term's `\r` ends a row WITHOUT
+    // WRAPLINE; the first row still fills the width (it is the longest), so
+    // the full-row heuristic stitches the rows back into one URL.
+    #[test]
+    fn urls_wrap_across_rows_without_wrapline() {
+        let content = "https://ex.com/aaaaaaaa\r\nbb?y=2";
+        let whole = Some("https://ex.com/aaaaaaaabb?y=2".to_string());
+        // Clicking the first row (previously truncated at the edge)...
+        assert_eq!(link_at(content, 0, 5), whole);
+        // ...and clicking the continuation on the second row.
+        assert_eq!(link_at(content, 1, 1), whole);
     }
 }

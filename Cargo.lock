@@ -1107,6 +1107,7 @@ dependencies = [
  "anyhow",
  "egui",
  "open",
+ "regex",
 ]
 
 [[package]]
