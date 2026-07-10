@@ -360,6 +360,21 @@ impl App {
         mesh::clear_notify_requests();
         mesh::clear_rename_requests();
 
+        // Reclaim empty claim dirs that failed checkouts left behind
+        // (deleting them at failure time would yank a booting shell's cwd).
+        let snap = app.tmux.pane_snapshot();
+        let referenced: Vec<&Path> = app
+            .tabs
+            .iter()
+            .filter_map(|t| t.workspace.worktree.as_ref())
+            .map(|w| w.path.as_path())
+            .collect();
+        let cwds: Vec<&Path> = snap
+            .values()
+            .filter_map(|p| p.cwd.as_deref())
+            .collect();
+        workspace::sweep_stale_claims(&referenced, &cwds);
+
         app
     }
 
@@ -640,14 +655,14 @@ impl App {
             );
         }
 
-        if let Some(url) = clone {
+        if let Some(repo) = clone {
             // Repo project, first use: clone, then resolve the typed branch
             // against the fresh clone, then check out - all off-thread, the
             // agent launch waiting at the end (drain_worktrees).
             self.pending_worktrees.insert(tab_id.clone());
             workspace::spawn_clone_worktree(
                 tab_id,
-                url,
+                repo,
                 root.clone().expect("a clone implies a root"),
                 claim.expect("a clone always claims"),
                 form.branch.clone(),
@@ -670,7 +685,7 @@ impl App {
             );
         } else {
             // No worktree: run the agent straight away in the root.
-            self.launch_agent(&tab_id, None);
+            self.launch_agent(&tab_id, None, None);
         }
 
         // Project roots (often a ~/.muxterm/clones dest) would make a
@@ -682,13 +697,22 @@ impl App {
     }
 
     /// Type the workspace's boot sequence into its first pane: an optional
-    /// `cd`, the project's setup script, then the agent's launch command.
-    /// The pane normally spawns where it belongs (root or claimed worktree),
-    /// so `cd` is only for the failed-checkout fallback that walks the pane
-    /// back. Setup lines are typed as-is, one per line, exactly like a user
-    /// would - a slow or failed line delays but never blocks the launch. A
-    /// prompt-less workspace without setup is left as a plain shell.
-    fn launch_agent(&mut self, tab_id: &str, cd: Option<&std::path::Path>) {
+    /// failure notice (echoed so the user sees *why* they're not in a
+    /// worktree), an optional `cd`, the project's setup script, then the
+    /// agent's launch command. The pane normally spawns where it belongs
+    /// (root or claimed worktree), so `cd` is only for the failed-checkout
+    /// fallback that walks the pane back - and that fallback dir isn't the
+    /// project, so the setup script is skipped there (a `direnv allow` in
+    /// $HOME is pure noise). Setup lines are typed as-is, one per line,
+    /// exactly like a user would - a slow or failed line delays but never
+    /// blocks the launch. A prompt-less workspace without setup is left as
+    /// a plain shell.
+    fn launch_agent(
+        &mut self,
+        tab_id: &str,
+        cd: Option<&std::path::Path>,
+        notice: Option<&str>,
+    ) {
         let Some(tab) = self.tabs.iter().find(|t| t.tab_id == tab_id) else {
             return;
         };
@@ -699,13 +723,19 @@ impl App {
         let setup = tab.workspace.setup.clone();
 
         let mut lines: Vec<String> = Vec::new();
+        if let Some(n) = notice {
+            lines.push(format!(
+                "echo {}",
+                muxterm::agent::shell_quote(&format!("[muxterm] {n}"))
+            ));
+        }
         if let Some(p) = cd {
             lines.push(format!(
                 "cd {}",
                 muxterm::agent::shell_quote(&p.display().to_string())
             ));
         }
-        if let Some(setup) = &setup {
+        if let (Some(setup), None) = (&setup, cd) {
             lines.extend(
                 setup.lines().map(str::to_string).filter(|l| !l.is_empty()),
             );
@@ -735,8 +765,10 @@ impl App {
 
     /// Apply finished worktree checkouts: the pane opened inside the claimed
     /// directory, so success just records the worktree and launches the agent
-    /// in place. A failed checkout (the claimed dir is gone) cd's the pane
-    /// back to the root and launches there, so the workspace still works.
+    /// in place. A failed checkout cd's the pane back (root, or home when
+    /// even the root never materialized - a failed clone) and launches
+    /// there, echoing the failure so the user sees why - the workspace
+    /// still works, just degraded.
     fn drain_worktrees(&mut self) {
         while let Ok((tab_id, result)) = self.worktree_rx.try_recv() {
             self.pending_worktrees.remove(&tab_id);
@@ -747,7 +779,7 @@ impl App {
                     {
                         tab.workspace.worktree = Some(wt);
                     }
-                    self.launch_agent(&tab_id, None);
+                    self.launch_agent(&tab_id, None, None);
                 },
                 Err(e) => {
                     log::warn!("worktree creation failed: {e}");
@@ -775,9 +807,18 @@ impl App {
                             tab.workspace.root = fallback.clone();
                         }
                     }
-                    self.launch_agent(&tab_id, fallback.as_deref());
+                    // One readable line of why; the full error is in the log.
+                    let notice = format!(
+                        "worktree failed: {}",
+                        e.lines().next().unwrap_or("unknown error")
+                    );
+                    self.launch_agent(
+                        &tab_id,
+                        fallback.as_deref(),
+                        Some(&notice),
+                    );
                     // The workspace's other panes (the side shell) sit in
-                    // the removed claim dir too; walk them back as well.
+                    // the dead claim dir too; walk them back as well.
                     if let (Some(fallback), Some(tab)) = (
                         fallback.as_deref(),
                         self.tabs.iter_mut().find(|t| t.tab_id == tab_id),

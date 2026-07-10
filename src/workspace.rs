@@ -164,28 +164,72 @@ impl Project {
         }
     }
 
-    /// Some(clone URL) when this is a repo project whose local clone does
-    /// not exist yet - the cmd+shift+n submit path then clones before the
-    /// worktree checkout.
+    /// Some(repo) when this is a repo project whose local clone does not
+    /// exist yet - the cmd+shift+n submit path then clones (trying
+    /// `clone_candidates`) before the worktree checkout.
     pub fn needs_clone(&self) -> Option<String> {
         match (&self.path, &self.repo) {
             (None, Some(repo)) if !self.local_root().exists() => {
-                Some(clone_url(repo))
+                Some(repo.clone())
             },
             _ => None,
         }
     }
 }
 
-/// The `git clone` URL for a project's `repo` field: bare "owner/repo"
-/// shorthand becomes a GitHub https URL; anything already scheme'd or
-/// scp-style ("git@host:...") passes through untouched.
-pub fn clone_url(repo: &str) -> String {
+/// The URLs to try, in order, when cloning or probing a project's `repo`.
+/// GitHub speaks two protocols and a machine is usually set up for only
+/// one: https clones of private repos die without stored credentials
+/// (GIT_TERMINAL_PROMPT=0 - no prompt to type into), ssh dies without a
+/// key. So a github repo gets both forms - a stated https URL first as
+/// given, and bare "owner/repo" shorthand leads ssh (a public repo still
+/// falls through to anonymous https; private-repo machines are usually
+/// keyed). Anything else - scp-style remotes, other hosts, local paths -
+/// is tried exactly as given.
+pub fn clone_candidates(repo: &str) -> Vec<String> {
     let r = repo.trim();
-    if r.contains("://") || r.starts_with("git@") {
-        return r.to_string();
+    let pair_of =
+        |s: &str| s.trim_end_matches('/').trim_end_matches(".git").to_string();
+    if let Some(rest) = r
+        .strip_prefix("https://github.com/")
+        .or_else(|| r.strip_prefix("http://github.com/"))
+    {
+        return vec![
+            r.to_string(),
+            format!("git@github.com:{}.git", pair_of(rest)),
+        ];
     }
-    format!("https://github.com/{}.git", r.trim_end_matches(".git"))
+    if is_github_shorthand(r) {
+        let pair = pair_of(r);
+        return vec![
+            format!("git@github.com:{pair}.git"),
+            format!("https://github.com/{pair}.git"),
+        ];
+    }
+    vec![r.to_string()]
+}
+
+/// Bare "owner/repo": exactly one interior slash and no path-ish spelling
+/// (mirrors the settings form's location classification - anything that
+/// reads as a filesystem path is not shorthand).
+fn is_github_shorthand(s: &str) -> bool {
+    if s.contains("://")
+        || s.starts_with("git@")
+        || s.contains(char::is_whitespace)
+        || s.starts_with('/')
+        || s.starts_with('~')
+        || s.starts_with('.')
+    {
+        return false;
+    }
+    match s.split_once('/') {
+        Some((owner, name)) => {
+            !owner.is_empty()
+                && !name.trim_end_matches(".git").is_empty()
+                && !name.contains('/')
+        },
+        None => false,
+    }
 }
 
 /// Resolve typed folder text into a path: trim, expand a leading `~`, treat
@@ -426,23 +470,27 @@ pub fn parse_branches(out: &str) -> Vec<Branch> {
     branches
 }
 
-/// Branch names straight off an un-cloned remote (`git ls-remote --heads`),
-/// for the cmd+shift+n typeahead when a repo project has no clone yet - so
-/// picking a base branch works the same as against a local repo. Network;
-/// run via `spawn_remote_branches`, never on the UI thread. Failure (offline,
-/// no creds) is an empty list - the popup falls back to a plain field.
-pub fn list_remote_branches(url: &str) -> Vec<Branch> {
-    let out = Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(["ls-remote", "--heads"])
-        .arg(url)
-        .output();
-    match out {
-        Ok(out) if out.status.success() => {
-            parse_ls_remote(&String::from_utf8_lossy(&out.stdout))
-        },
-        _ => Vec::new(),
+/// Branch names straight off an un-cloned remote (`git ls-remote --heads`
+/// over each of `clone_candidates`, first answer wins), for the cmd+shift+n
+/// typeahead when a repo project has no clone yet - so picking a base
+/// branch works the same as against a local repo. Network; run via
+/// `spawn_remote_branches`, never on the UI thread. Failure (offline, no
+/// creds on any candidate) is an empty list - the popup falls back to a
+/// plain field.
+pub fn list_remote_branches(repo: &str) -> Vec<Branch> {
+    for url in clone_candidates(repo) {
+        let out = Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["ls-remote", "--heads"])
+            .arg(&url)
+            .output();
+        if let Ok(out) = out {
+            if out.status.success() {
+                return parse_ls_remote(&String::from_utf8_lossy(&out.stdout));
+            }
+        }
     }
+    Vec::new()
 }
 
 /// Fold `ls-remote --heads` output (`sha TAB refs/heads/name`) into the
@@ -660,11 +708,13 @@ fn populate_worktree(
 
 /// Run `populate_worktree` off the UI thread - the checkout can be slow on a
 /// large or lfs-heavy repo - and stream the result back to the App by tab id.
-/// A failed checkout gives the claimed directory back (`remove_dir` refuses
-/// non-empty, so a partial checkout is never deleted). Same channel + repaint
-/// wiring as the pr_status/git_status pollers. `fresh_base` (project mode)
-/// updates the base branch from its remote first - network latency lands on
-/// this thread, never the UI.
+/// Same channel + repaint wiring as the pr_status/git_status pollers.
+/// `fresh_base` (project mode) updates the base branch from its remote first
+/// - network latency lands on this thread, never the UI. A failed checkout
+/// leaves the claimed directory alone (the workspace's shells are booting
+/// inside it; deleting a live shell's cwd showers it with getcwd errors) -
+/// the App's walk-back cd's them out, and `sweep_stale_claims` reclaims the
+/// empty directory at the next launch.
 pub fn spawn_worktree(
     tab_id: String,
     root: PathBuf,
@@ -680,10 +730,7 @@ pub fn spawn_worktree(
         }
         let res = match populate_worktree(&root, &worktree, &choice) {
             Ok(()) => Ok(worktree),
-            Err(e) => {
-                let _ = fs::remove_dir(&worktree.path);
-                Err(format!("{e:#}"))
-            },
+            Err(e) => Err(format!("{e:#}")),
         };
         let _ = tx.send((tab_id, res));
         ctx.request_repaint();
@@ -691,13 +738,17 @@ pub fn spawn_worktree(
 }
 
 /// `spawn_worktree`'s sibling for a repo project with no local clone yet:
-/// clone first, then resolve the typed branch text against the *fresh*
-/// clone's branches (the popup had no list to offer), then populate. Same
-/// channel protocol, same claimed-dir give-back on failure. A fresh clone
-/// is up to date by definition, so no `refresh_base` here.
+/// clone first (trying each of `clone_candidates` - an ssh machine's
+/// private repo won't answer https, and vice versa), then resolve the typed
+/// branch text against the *fresh* clone's branches (the popup had no list
+/// to offer), then populate. Same channel protocol. On failure the claimed
+/// directory is deliberately left in place: the workspace's shells are
+/// booting inside it, and deleting a live shell's cwd showers it with
+/// getcwd errors - the App's walk-back cd's them out instead, and stray
+/// empty claims are swept at the next launch.
 pub fn spawn_clone_worktree(
     tab_id: String,
-    url: String,
+    repo: String,
     root: PathBuf,
     worktree: Worktree,
     branch_input: String,
@@ -705,14 +756,8 @@ pub fn spawn_clone_worktree(
     ctx: egui::Context,
 ) {
     thread::spawn(move || {
-        let res = match clone_and_populate(&url, &root, worktree, &branch_input)
-        {
-            Ok(wt) => Ok(wt),
-            Err((wt, e)) => {
-                let _ = fs::remove_dir(&wt.path);
-                Err(format!("{e:#}"))
-            },
-        };
+        let res = clone_and_populate(&repo, &root, worktree, &branch_input)
+            .map_err(|(_, e)| format!("{e:#}"));
         let _ = tx.send((tab_id, res));
         ctx.request_repaint();
     });
@@ -720,11 +765,13 @@ pub fn spawn_clone_worktree(
 
 /// The clone chain's body: `git clone` into the project's local root, then
 /// re-resolve the branch text and check out the worktree. Errors carry the
-/// claimed worktree back so the caller can return the directory. The clone
-/// runs with GIT_TERMINAL_PROMPT=0 - a private repo without ambient
-/// credentials fails fast instead of hanging a headless prompt.
+/// claimed worktree back so callers can still name the directory. Clones
+/// run with GIT_TERMINAL_PROMPT=0 - a private repo without ambient
+/// credentials fails fast instead of hanging a headless prompt - and each
+/// candidate URL gets a try; the last failure is the one reported (the ssh
+/// candidate's "Permission denied" beats https's generic credential noise).
 fn clone_and_populate(
-    url: &str,
+    repo: &str,
     root: &Path,
     worktree: Worktree,
     branch_input: &str,
@@ -732,22 +779,32 @@ fn clone_and_populate(
     if let Some(parent) = root.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let out = Command::new("git")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .arg("clone")
-        .arg(url)
-        .arg(root)
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {},
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr);
-            return Err((
-                worktree,
-                anyhow::anyhow!("git clone failed: {}", err.trim()),
-            ));
-        },
-        Err(e) => return Err((worktree, e.into())),
+    let mut last_err = String::from("no clone URL candidates");
+    let mut cloned = false;
+    for url in clone_candidates(repo) {
+        let out = Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("clone")
+            .arg(&url)
+            .arg(root)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                cloned = true;
+                break;
+            },
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                last_err = format!("{url}: {}", err.trim());
+            },
+            Err(e) => last_err = format!("{url}: {e}"),
+        }
+    }
+    if !cloned {
+        return Err((
+            worktree,
+            anyhow::anyhow!("git clone failed: {last_err}"),
+        ));
     }
     // The popup resolved against an empty branch list; now the branches
     // exist. A typed name may turn out Existing/Track - repoint the claimed
@@ -763,6 +820,31 @@ fn clone_and_populate(
     match populate_worktree(root, &wt, &choice) {
         Ok(()) => Ok(wt),
         Err(e) => Err((wt, e)),
+    }
+}
+
+/// Launch-time reclamation of stray worktree *claims*: empty directories
+/// under `~/.muxterm/worktrees/` that no workspace references and no live
+/// pane sits in. Failed checkouts leave their claimed dir behind rather
+/// than deleting it under a booting shell (see spawn_worktree); this is
+/// where those come back. `remove_dir` refuses non-empty directories, so a
+/// real checkout can never be lost here; the pane-cwd guard keeps a claim
+/// alive when a relaunch interrupted its checkout and the restored panes
+/// still sit inside.
+pub fn sweep_stale_claims(referenced: &[&Path], pane_cwds: &[&Path]) {
+    let Ok(entries) = fs::read_dir(state::worktrees_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if referenced.contains(&p.as_path())
+            || pane_cwds.iter().any(|c| c.starts_with(&p))
+        {
+            continue;
+        }
+        if fs::remove_dir(&p).is_ok() {
+            log::info!("swept stale worktree claim {}", p.display());
+        }
     }
 }
 
@@ -1081,23 +1163,47 @@ ffeedd refs/heads/
     }
 
     #[test]
-    fn clone_url_expands_github_shorthand() {
+    fn clone_candidates_cover_both_github_protocols() {
+        // Bare shorthand: ssh first (private repos on keyed machines),
+        // anonymous https as the fallback.
         assert_eq!(
-            clone_url("herval/dotfiles"),
-            "https://github.com/herval/dotfiles.git"
+            clone_candidates(" herval/dotfiles.git "),
+            vec![
+                "git@github.com:herval/dotfiles.git",
+                "https://github.com/herval/dotfiles.git",
+            ]
+        );
+        // A stated github https URL: as given, then the ssh form (the
+        // browser-copied URL of a private repo needs creds https rarely has).
+        assert_eq!(
+            clone_candidates("https://github.com/Telepatia-AI/monobloco"),
+            vec![
+                "https://github.com/Telepatia-AI/monobloco",
+                "git@github.com:Telepatia-AI/monobloco.git",
+            ]
+        );
+        // Everything else exactly as given, alone: scp-style, other hosts,
+        // local paths (which must never read as owner/repo shorthand).
+        assert_eq!(
+            clone_candidates("git@github.com:a/b.git"),
+            vec!["git@github.com:a/b.git"]
         );
         assert_eq!(
-            clone_url(" herval/dotfiles.git "),
-            "https://github.com/herval/dotfiles.git"
-        );
-        // Already-full URLs and scp-style remotes pass through untouched.
-        assert_eq!(
-            clone_url("https://gitlab.com/a/b.git"),
-            "https://gitlab.com/a/b.git"
+            clone_candidates("https://gitlab.com/a/b.git"),
+            vec!["https://gitlab.com/a/b.git"]
         );
         assert_eq!(
-            clone_url("git@github.com:a/b.git"),
-            "git@github.com:a/b.git"
+            clone_candidates("/tmp/scratch/origin"),
+            vec!["/tmp/scratch/origin"]
+        );
+        assert_eq!(
+            clone_candidates("~/dev/repo"),
+            vec!["~/dev/repo"]
+        );
+        assert_eq!(
+            clone_candidates("dev/foo/bar"),
+            vec!["dev/foo/bar"],
+            "deeper slashes are a path, not shorthand"
         );
     }
 
@@ -1137,11 +1243,9 @@ ffeedd refs/heads/
             repo.local_root(),
             state::clones_dir().join(name.replace('/', "-"))
         );
-        // An un-cloned repo project asks for its clone URL.
-        assert_eq!(
-            repo.needs_clone().as_deref(),
-            Some("https://github.com/herval/dotfiles.git")
-        );
+        // An un-cloned repo project asks for a clone, by its raw repo
+        // value (`clone_candidates` picks the URLs to try).
+        assert_eq!(repo.needs_clone().as_deref(), Some("herval/dotfiles"));
     }
 
     /// Real-git round trip for every BranchChoice variant. Git is a hard
@@ -1313,7 +1417,8 @@ ffeedd refs/heads/
         );
         assert!(root.join(".git").exists(), "clone landed");
 
-        // A bad URL: the error carries the claimed dir back untouched.
+        // A bad URL: the error carries the claimed dir, which survives
+        // (shells may be booting inside; the launch sweep reclaims it).
         let root2 = scratch.join("clone2");
         let claim2 = scratch.join("wt-bad");
         fs::create_dir(&claim2).unwrap();
@@ -1326,7 +1431,7 @@ ffeedd refs/heads/
         )
         .expect_err("clone must fail");
         assert_eq!(back.path, claim2);
-        assert!(claim2.exists(), "give-back is the caller's job");
+        assert!(claim2.exists(), "the claim outlives the failure");
 
         fs::remove_dir_all(&scratch).unwrap();
     }
