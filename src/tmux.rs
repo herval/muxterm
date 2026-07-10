@@ -27,15 +27,20 @@ set -as terminal-overrides ',xterm*:Ms=\E]52;%p1%s;%p2%s\007'
 set -g focus-events on
 setw -g aggressive-resize on
 bind -n S-PPage copy-mode -u
-# muxterm's own client never sends left-button mouse reports (egui_term P16:
-# clicks and drags drive the widget's local selection; only the wheel is
-# reported, for scrollback). These consume-bindings are belt-and-braces for
-# *other* clients attached to the socket: tmux's defaults `send -M` a click
-# into a mouse-mode app (the agent CLIs enable mouse tracking), moving its
-# cursor. select-pane is a no-op - muxterm is one pane per session - and
-# consuming beats `unbind`, which would pass the raw sequence through.
-bind -n MouseDown1Pane select-pane -t =
-bind -n MouseUp1Pane select-pane -t =
+# muxterm's own client keeps plain left-clicks local (egui_term P16: clicks
+# and drags drive the widget's local selection; the wheel is reported for
+# scrollback) and sends a left-button report only for a deliberate
+# option+click (egui_term P25, modifier bits stripped). Route those by what
+# the pane's app asked for: mouse-tracking apps (the agent CLIs) get the
+# click via `send -M`, which re-encodes it in the app's own protocol - one
+# pane per session, so client and pane coordinates are identical. Everything
+# else consumes it: select-pane is a no-op - muxterm is one pane per session
+# - and consuming beats `unbind`, which would pass the raw sequence through.
+# The consume arm also stays belt-and-braces for *other* clients attached to
+# the socket, whose selection clicks would otherwise `send -M` into a
+# mouse-mode app and move its cursor.
+bind -n MouseDown1Pane if -F '#{mouse_any_flag}' {send -M} {select-pane -t =}
+bind -n MouseUp1Pane if -F '#{mouse_any_flag}' {send -M} {select-pane -t =}
 "##;
 
 /// Theme-derived colors for tmux's copy-mode search highlight, built by
@@ -677,10 +682,15 @@ mod tests {
         for text in [&on, &off] {
             assert!(text.contains("set -g mouse on"));
             assert!(text.contains("set -s set-clipboard on"));
-            // Belt-and-braces for non-muxterm clients: clicks are consumed
-            // (not forwarded, not unbound).
-            assert!(text.contains("bind -n MouseDown1Pane select-pane -t ="));
-            assert!(text.contains("bind -n MouseUp1Pane select-pane -t ="));
+            // Left-clicks route by whether the pane's app asked for the
+            // mouse: relayed option+clicks (egui_term P25) reach tracking
+            // apps via send -M, everything else is consumed (not unbound).
+            assert!(text.contains(
+                "bind -n MouseDown1Pane if -F '#{mouse_any_flag}' {send -M} {select-pane -t =}"
+            ));
+            assert!(text.contains(
+                "bind -n MouseUp1Pane if -F '#{mouse_any_flag}' {send -M} {select-pane -t =}"
+            ));
         }
     }
 

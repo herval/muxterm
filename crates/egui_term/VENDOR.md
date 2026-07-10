@@ -257,3 +257,20 @@ tmux-backed design. Local patches:
   fragment must not hijack its URL) and above paths, single-run only
   (never joined across P20's guessed wraps); hover underline, press
   swallow, and open all ride the existing P10/P19/P20 machinery.
+- **P25** (`src/view.rs`, `TerminalViewState`, `process_left_button`):
+  option+click relays a left-button report to the application. P16 made
+  the widget silent by default, so forwarding no longer has to be
+  all-or-nothing - the old unwinnable case was the client sitting in
+  MOUSE_MODE full-time turning *every* click into a report. A press with
+  option held (and the terminal in MOUSE_MODE) skips local selection and
+  emits a plain SGR press through the wheel's P2 pipeline
+  (`BackendCommand::MouseReport`); the modifier bits are stripped so the
+  app sees a bare click. `relayed_click` on the view state pairs the
+  release with the press even if option was let go first (a press without
+  a release would leave the app's button state stuck), and the release
+  never touches P8 copy-on-select - the selection was never started.
+  Whether the click reaches an app is tmux's call, not the widget's:
+  muxterm's tmux.conf routes MouseDown1Pane/MouseUp1Pane by
+  `#{mouse_any_flag}` (`send -M` into mouse-tracking apps, consumed
+  otherwise), so an option+click on a plain shell does nothing. Plain
+  clicks, drags, and double/triple selection are untouched.

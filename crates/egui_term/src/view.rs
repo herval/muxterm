@@ -48,6 +48,11 @@ enum InputAction {
 #[derive(Clone, Default)]
 pub struct TerminalViewState {
     is_dragged: bool,
+    // muxterm patch P25: an option+click's press was relayed to the
+    // application, so its release must be relayed too - paired here rather
+    // than by re-checking modifiers, which the user may have let go of
+    // before releasing the button.
+    relayed_click: bool,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
 }
@@ -944,7 +949,7 @@ fn process_left_button(
     copy_on_select: bool,
 ) -> Vec<InputAction> {
     // muxterm patch P16 (supersedes P7's left-button forwarding): the left
-    // button is NEVER reported to the application - clicks and drags always
+    // button is never reported to the application - clicks and drags always
     // drive the widget's local selection, shift or not. Forwarding was
     // unwinnable: under tmux `mouse on` the client is in MOUSE_MODE for its
     // whole life, so every click went to tmux, and whatever the bindings,
@@ -955,8 +960,29 @@ fn process_left_button(
     // anchor only (no app sees it), drag = select (P8 copy-on-select),
     // double/triple = word/line (P14). The wheel is still reported (P2) -
     // that is how tmux scrollback works.
+    //
+    // muxterm patch P25: with the widget silent by default, forwarding no
+    // longer has to be all-or-nothing - option+click is the one deliberate
+    // exception, relayed as a plain left-button press/release pair (modifier
+    // bits stripped so the app sees a bare click; the wheel's P2 pipeline).
+    // tmux.conf routes it by `#{mouse_any_flag}`: panes whose app enabled
+    // mouse tracking get `send -M`, the rest consume it, so an option+click
+    // on a shell does nothing. The selection is never touched, so the
+    // release skips P8's copy-on-select the same way a link click does.
     let terminal_mode = backend.last_content().terminal_mode;
     if pressed {
+        if modifiers.alt && terminal_mode.intersects(TermMode::MOUSE_MODE) {
+            state.relayed_click = true;
+            state.is_dragged = false;
+            return vec![InputAction::BackendCall(
+                BackendCommand::MouseReport(
+                    MouseButton::LeftButton,
+                    Modifiers::default(),
+                    state.current_mouse_position_on_grid,
+                    true,
+                ),
+            )];
+        }
         // muxterm patch P10: a cmd+click on a link is for us, not the
         // application. Only the press decides: if the LinkOpen binding
         // matches and there is a link-shaped token under the pointer,
@@ -973,6 +999,17 @@ fn process_left_button(
         } else {
             process_left_button_pressed(state, layout, position)
         }
+    } else if state.relayed_click {
+        // P25: pair the relayed press with its release even if option was
+        // let go first - a press without a release would leave the app's
+        // button state stuck.
+        state.relayed_click = false;
+        vec![InputAction::BackendCall(BackendCommand::MouseReport(
+            MouseButton::LeftButton,
+            Modifiers::default(),
+            state.current_mouse_position_on_grid,
+            false,
+        ))]
     } else {
         process_left_button_released(
             state,
