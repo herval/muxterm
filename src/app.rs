@@ -79,6 +79,11 @@ pub struct App {
     /// (config `copy_on_select`; the tmux side lives in tmux.conf).
     copy_on_select: bool,
     settings_open: bool,
+    /// Which settings tab shows; survives close so cmd+shift+n's "no
+    /// projects yet" jump lands on Projects.
+    settings_tab: settings::Tab,
+    /// The Projects tab's add form, typed across frames.
+    project_draft: settings::ProjectDraft,
     dirty: bool,
     config_mtime: Option<SystemTime>,
     last_config_check: Instant,
@@ -127,6 +132,9 @@ pub struct App {
     new_workspace: Option<NewWorkspaceForm>,
     /// Folder the creation popup pre-fills - the last one a workspace used.
     last_workspace_dir: Option<String>,
+    /// The saved project registry (Settings > Projects): what cmd+shift+n
+    /// starts sessions from. Persisted in state.json.
+    projects: Vec<workspace::Project>,
     /// tab_id -> AI-generated title, streamed in by `workspace::spawn_title`.
     title_tx: Sender<(String, String)>,
     title_rx: Receiver<(String, String)>,
@@ -247,6 +255,8 @@ impl App {
             pane_titles: style.pane_titles,
             copy_on_select: style.copy_on_select,
             settings_open: false,
+            settings_tab: settings::Tab::default(),
+            project_draft: settings::ProjectDraft::default(),
             dirty: false,
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
@@ -273,6 +283,7 @@ impl App {
             archived_collapsed: false,
             new_workspace: None,
             last_workspace_dir: None,
+            projects: Vec::new(),
             title_tx,
             title_rx,
             naming: HashSet::new(),
@@ -299,6 +310,12 @@ impl App {
                 app.sidebar_open = saved.sidebar_open;
                 app.archived_collapsed = saved.archived_collapsed;
                 app.last_workspace_dir = saved.last_workspace_dir.clone();
+                app.projects = saved
+                    .projects
+                    .iter()
+                    .cloned()
+                    .map(workspace::Project::from_state)
+                    .collect();
                 let mut referenced = HashSet::new();
                 for window in &saved.windows {
                     for tab in &window.tabs {
@@ -506,15 +523,20 @@ impl App {
     /// which is also what defers the agent launch until the files exist.
     /// Without a worktree the agent launches straight away.
     fn create_workspace(&mut self, ctx: &egui::Context, form: NewWorkspaceForm) {
-        let root = expand_dir(&form.folder);
+        let root = workspace::expand_dir(&form.folder);
         let prompt = form.prompt.trim().to_string();
         let agent = muxterm::agent::by_id(form.agent);
         let model = (!form.model.is_empty()).then(|| form.model.clone());
 
+        // Project mode may need a clone first (a repo project's first use);
+        // that path always worktrees, checkbox or no - the checkbox logic
+        // reads the missing clone dest as "not a repo".
+        let clone = form.clone_needed();
         // A worktree only happens for a git repo; a failed claim falls back
         // to a plain workspace in the root.
-        let want_worktree =
-            form.create_worktree && root.as_deref().is_some_and(workspace::is_git_repo);
+        let want_worktree = clone.is_some()
+            || (form.create_worktree
+                && root.as_deref().is_some_and(workspace::is_git_repo));
         let branch_choice = form.branch_choice();
         let claim = want_worktree
             .then(|| {
@@ -524,6 +546,13 @@ impl App {
                     .ok()
             })
             .flatten();
+        if clone.is_some() && claim.is_none() {
+            // Without the claim there is nowhere to open panes: the clone
+            // dest doesn't exist yet and root falling back to it would just
+            // spawn a dead shell.
+            log::error!("no worktree claim for a clone; not opening the tab");
+            return;
+        }
         let start_dir = claim
             .as_ref()
             .map(|w| w.path.clone())
@@ -583,6 +612,8 @@ impl App {
             model: model.clone(),
             created_at: mesh::now(),
             archived_at: None,
+            // The workspace owns its copy; later project edits don't reach it.
+            setup: form.selected_project().and_then(|p| p.setup.clone()),
         };
 
         self.tabs.push(Tab {
@@ -609,15 +640,31 @@ impl App {
             );
         }
 
-        if let Some(claim) = claim {
+        if let Some(url) = clone {
+            // Repo project, first use: clone, then resolve the typed branch
+            // against the fresh clone, then check out - all off-thread, the
+            // agent launch waiting at the end (drain_worktrees).
+            self.pending_worktrees.insert(tab_id.clone());
+            workspace::spawn_clone_worktree(
+                tab_id,
+                url,
+                root.clone().expect("a clone implies a root"),
+                claim.expect("a clone always claims"),
+                form.branch.clone(),
+                self.worktree_tx.clone(),
+                ctx.clone(),
+            );
+        } else if let Some(claim) = claim {
             // The pane is already sitting in the claimed directory; the agent
             // launch waits for the checkout to land (drain_worktrees).
+            // Project mode freshens the base branch from its remote first.
             self.pending_worktrees.insert(tab_id.clone());
             workspace::spawn_worktree(
                 tab_id,
                 root.clone().expect("a claim implies a root"),
                 claim,
                 branch_choice,
+                !form.projects.is_empty(),
                 self.worktree_tx.clone(),
                 ctx.clone(),
             );
@@ -626,17 +673,21 @@ impl App {
             self.launch_agent(&tab_id, None);
         }
 
-        if let Some(r) = &root {
+        // Project roots (often a ~/.muxterm/clones dest) would make a
+        // strange cmd+n prefill; only folder-picked workspaces remember.
+        if let (Some(r), true) = (&root, form.projects.is_empty()) {
             self.last_workspace_dir = Some(r.display().to_string());
         }
         self.dirty = true;
     }
 
-    /// Type the agent's launch command into a workspace's pane, optionally
-    /// prefixed with a `cd`. The pane normally spawns where it belongs (root
-    /// or claimed worktree), so `cd` is only for the failed-checkout fallback
-    /// that walks the pane back to the root. A prompt-less workspace is left
-    /// as a plain shell.
+    /// Type the workspace's boot sequence into its first pane: an optional
+    /// `cd`, the project's setup script, then the agent's launch command.
+    /// The pane normally spawns where it belongs (root or claimed worktree),
+    /// so `cd` is only for the failed-checkout fallback that walks the pane
+    /// back. Setup lines are typed as-is, one per line, exactly like a user
+    /// would - a slow or failed line delays but never blocks the launch. A
+    /// prompt-less workspace without setup is left as a plain shell.
     fn launch_agent(&mut self, tab_id: &str, cd: Option<&std::path::Path>) {
         let Some(tab) = self.tabs.iter().find(|t| t.tab_id == tab_id) else {
             return;
@@ -645,24 +696,32 @@ impl App {
         let agent = tab.workspace.agent.and_then(muxterm::agent::by_id);
         let model = tab.workspace.model.clone();
         let prompt = tab.workspace.prompt.clone();
+        let setup = tab.workspace.setup.clone();
 
-        let cd_part = cd.map(|p| {
-            format!("cd {}", muxterm::agent::shell_quote(&p.display().to_string()))
-        });
-        let launch = match (agent, prompt.is_empty()) {
-            (Some(a), false) => {
-                Some(muxterm::agent::launch_command(a, model.as_deref(), &prompt))
-            },
-            _ => None,
-        };
-        let line = match (cd_part, launch) {
-            (Some(cd), Some(l)) => format!("{cd} && {l}"),
-            (Some(cd), None) => cd,
-            (None, Some(l)) => l,
-            (None, None) => return,
-        };
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(p) = cd {
+            lines.push(format!(
+                "cd {}",
+                muxterm::agent::shell_quote(&p.display().to_string())
+            ));
+        }
+        if let Some(setup) = &setup {
+            lines.extend(
+                setup.lines().map(str::to_string).filter(|l| !l.is_empty()),
+            );
+        }
+        if let (Some(a), false) = (agent, prompt.is_empty()) {
+            lines.push(muxterm::agent::launch_command(
+                a,
+                model.as_deref(),
+                &prompt,
+            ));
+        }
+        if lines.is_empty() {
+            return;
+        }
 
-        let mut bytes = line.into_bytes();
+        let mut bytes = lines.join("\r").into_bytes();
         bytes.push(b'\r');
         if let Some(pane) = self
             .tabs
@@ -692,23 +751,42 @@ impl App {
                 },
                 Err(e) => {
                     log::warn!("worktree creation failed: {e}");
+                    // The walk-back target must exist: after a failed
+                    // *clone* the root never came to be, so land at home
+                    // and repoint the workspace off the ghost path (the
+                    // root sync must not keep chasing it).
                     let root = self
                         .tabs
                         .iter()
                         .find(|t| t.tab_id == tab_id)
                         .and_then(|t| t.workspace.root.clone());
-                    self.launch_agent(&tab_id, root.as_deref());
+                    let fallback = root
+                        .filter(|r| r.exists())
+                        .or_else(dirs::home_dir);
+                    if let Some(tab) =
+                        self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
+                    {
+                        if !tab
+                            .workspace
+                            .root
+                            .as_deref()
+                            .is_some_and(|r| r.exists())
+                        {
+                            tab.workspace.root = fallback.clone();
+                        }
+                    }
+                    self.launch_agent(&tab_id, fallback.as_deref());
                     // The workspace's other panes (the side shell) sit in
                     // the removed claim dir too; walk them back as well.
-                    if let (Some(root), Some(tab)) = (
-                        root.as_deref(),
+                    if let (Some(fallback), Some(tab)) = (
+                        fallback.as_deref(),
                         self.tabs.iter_mut().find(|t| t.tab_id == tab_id),
                     ) {
                         let agent_pane = tab.tree.first_leaf();
                         let cd = format!(
                             "cd {}\r",
                             muxterm::agent::shell_quote(
-                                &root.display().to_string()
+                                &fallback.display().to_string()
                             )
                         );
                         for (pane_id, pane) in tab.panes.iter_mut() {
@@ -1279,6 +1357,27 @@ impl App {
                     ));
                 }
             },
+            Action::NewProjectWorkspace => {
+                // Nothing to pick from yet: open Settings on the Projects
+                // tab so the chord teaches the feature.
+                if self.projects.is_empty() {
+                    self.settings_tab = settings::Tab::Projects;
+                    self.settings_open = true;
+                } else if self.new_workspace.is_none() {
+                    self.reprobe_missing_agents(ctx);
+                    let installed = agent::installed(&self.agent_ok);
+                    let seed = installed
+                        .iter()
+                        .find(|a| a.id == self.agent.id)
+                        .copied()
+                        .unwrap_or(installed[0]);
+                    self.new_workspace = Some(NewWorkspaceForm::for_project(
+                        self.projects.clone(),
+                        seed.id,
+                        workspace_popup::default_model(seed.id),
+                    ));
+                }
+            },
             Action::ToggleSidebar => {
                 self.sidebar_open = !self.sidebar_open;
                 self.dirty = true;
@@ -1399,6 +1498,7 @@ impl App {
             last_workspace_dir: self.last_workspace_dir.clone(),
             sidebar_open: self.sidebar_open,
             archived_collapsed: self.archived_collapsed,
+            projects: self.projects.iter().map(|p| p.to_state()).collect(),
             windows: vec![WindowState {
                 active_tab: self.active,
                 tabs: self
@@ -1709,7 +1809,25 @@ impl App {
             self.git_status,
             self.pr_status,
             self.notifications,
+            &mut self.settings_tab,
+            &self.projects,
+            &mut self.project_draft,
         );
+        if let Some(p) = out.add_project {
+            // Upsert by name: `[ add ]` with a saved project's name is the
+            // edit path (rows load themselves into the draft).
+            match self.projects.iter_mut().find(|q| q.name == p.name) {
+                Some(q) => *q = p,
+                None => self.projects.push(p),
+            }
+            self.dirty = true;
+        }
+        if let Some(i) = out.remove_project {
+            if i < self.projects.len() {
+                self.projects.remove(i);
+                self.dirty = true;
+            }
+        }
         if let Some(name) = out.theme {
             config::set_theme(name);
             self.reload_config(ctx);
@@ -2321,24 +2439,6 @@ fn spawn_agent_probe(
             ctx.request_repaint();
         }
     });
-}
-
-/// Resolve the popup's folder text into a path: trim, expand a leading `~`,
-/// treat empty as "no folder". Existence isn't checked here - the git and
-/// spawn steps handle a bad path.
-fn expand_dir(input: &str) -> Option<PathBuf> {
-    let s = input.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if let Some(rest) = s.strip_prefix('~') {
-        if rest.is_empty() || rest.starts_with('/') {
-            if let Some(home) = dirs::home_dir() {
-                return Some(home.join(rest.trim_start_matches('/')));
-            }
-        }
-    }
-    Some(PathBuf::from(s))
 }
 
 /// Resolve symlinks so tmux's kernel-real cwds (`/private/tmp`) compare

@@ -576,6 +576,7 @@ mod tests {
             last_workspace_dir: None,
             sidebar_open: true,
             archived_collapsed: false,
+            projects: Vec::new(),
             windows: vec![WindowState {
                 active_tab: 0,
                 tabs: vec![

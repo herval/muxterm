@@ -16,7 +16,7 @@ use std::thread;
 
 use muxterm::agent::{self, Agent};
 use muxterm::mesh;
-use muxterm::state::{self, WorkspaceState, WorktreeState};
+use muxterm::state::{self, ProjectState, WorkspaceState, WorktreeState};
 
 #[derive(Clone, Debug)]
 pub struct Workspace {
@@ -44,6 +44,10 @@ pub struct Workspace {
     /// timestamp orders the pile newest-first. Archiving never touches the
     /// tmux session - it just hides the tab; the tab stays in `App.tabs`.
     pub archived_at: Option<u64>,
+    /// The project's setup script (cmd+shift+n), typed into the first pane
+    /// before the agent launches. The workspace owns its copy, so editing or
+    /// removing the project never touches a live tab. None for cmd+n/cmd+t.
+    pub setup: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +70,7 @@ impl Workspace {
             model: None,
             created_at: mesh::now(),
             archived_at: None,
+            setup: None,
         }
     }
 
@@ -88,6 +93,7 @@ impl Workspace {
             model: self.model.clone(),
             created_at: self.created_at,
             archived_at: self.archived_at,
+            setup: self.setup.clone(),
         }
     }
 
@@ -107,8 +113,97 @@ impl Workspace {
             model: s.model,
             created_at: s.created_at,
             archived_at: s.archived_at,
+            setup: s.setup,
         }
     }
+}
+
+/// A saved workspace source (Settings > Projects): the thing cmd+shift+n
+/// starts sessions from. Points at a folder on disk (`path`) or a GitHub
+/// repo (`repo`) cloned on first use under `~/.muxterm/clones/`. The
+/// layout's source of truth is `state::ProjectState`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Project {
+    pub name: String,
+    /// Local root when set; else the project lives at `local_root()`'s
+    /// clone destination.
+    pub path: Option<PathBuf>,
+    /// GitHub repo ("owner/repo" or a full clone URL); see `clone_url`.
+    pub repo: Option<String>,
+    /// Bash lines typed into a new workspace's first pane, before the agent
+    /// launch (e.g. "direnv allow").
+    pub setup: Option<String>,
+}
+
+impl Project {
+    pub fn to_state(&self) -> ProjectState {
+        ProjectState {
+            name: self.name.clone(),
+            path: self.path.clone(),
+            repo: self.repo.clone(),
+            setup: self.setup.clone(),
+        }
+    }
+
+    pub fn from_state(s: ProjectState) -> Self {
+        Self {
+            name: s.name,
+            path: s.path,
+            repo: s.repo,
+            setup: s.setup,
+        }
+    }
+
+    /// Where the project lives locally: `path` when set, else the clone
+    /// destination under `~/.muxterm/clones/`, named like a worktree dir
+    /// ('/' becomes '-').
+    pub fn local_root(&self) -> PathBuf {
+        match &self.path {
+            Some(p) => p.clone(),
+            None => state::clones_dir().join(worktree_dirname(&self.name)),
+        }
+    }
+
+    /// Some(clone URL) when this is a repo project whose local clone does
+    /// not exist yet - the cmd+shift+n submit path then clones before the
+    /// worktree checkout.
+    pub fn needs_clone(&self) -> Option<String> {
+        match (&self.path, &self.repo) {
+            (None, Some(repo)) if !self.local_root().exists() => {
+                Some(clone_url(repo))
+            },
+            _ => None,
+        }
+    }
+}
+
+/// The `git clone` URL for a project's `repo` field: bare "owner/repo"
+/// shorthand becomes a GitHub https URL; anything already scheme'd or
+/// scp-style ("git@host:...") passes through untouched.
+pub fn clone_url(repo: &str) -> String {
+    let r = repo.trim();
+    if r.contains("://") || r.starts_with("git@") {
+        return r.to_string();
+    }
+    format!("https://github.com/{}.git", r.trim_end_matches(".git"))
+}
+
+/// Resolve typed folder text into a path: trim, expand a leading `~`, treat
+/// empty as "no folder". Existence isn't checked here - the git and spawn
+/// steps handle a bad path.
+pub fn expand_dir(input: &str) -> Option<PathBuf> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            if let Some(home) = dirs::home_dir() {
+                return Some(home.join(rest.trim_start_matches('/')));
+            }
+        }
+    }
+    Some(PathBuf::from(s))
 }
 
 const ADJECTIVES: &[&str] = &[
@@ -433,6 +528,56 @@ pub fn claim_worktree(root: &Path, choice: &BranchChoice) -> anyhow::Result<Work
     anyhow::bail!("no free worktree name for {base}")
 }
 
+/// Bring the base of a project-mode worktree up to date with its remote
+/// before the checkout, so "continue branch x" continues x's *pushed* work.
+/// Best-effort throughout - offline, no remote, a diverged branch: every
+/// step may fail and the checkout proceeds on local state.
+///
+/// - always: fetch the choice's remote (else origin).
+/// - `Existing`: fast-forward the local ref in place (`fetch <name>:<name>`
+///   moves a non-checked-out branch without touching any working tree; a
+///   checked-out or diverged branch just refuses).
+/// - `Track`: nothing more - the fetch refreshed the remote-tracking ref
+///   `--track -b` will base on.
+/// - `Codename`/`New`: only inside a muxterm-owned clone (always clean,
+///   nobody works in it), fast-forward the clone's checked-out branch so
+///   new branches base on the fresh default; a user repo's HEAD is never
+///   moved.
+fn refresh_base(root: &Path, choice: &BranchChoice) {
+    let remote = match choice {
+        BranchChoice::Track { remote, .. } => remote.as_str(),
+        _ => "origin",
+    };
+    let fetch = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["fetch", "--prune", remote])
+        .output();
+    if !fetch.map(|o| o.status.success()).unwrap_or(false) {
+        return; // no remote / offline: nothing to be fresh against
+    }
+    match choice {
+        BranchChoice::Existing(name) => {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["fetch", remote])
+                .arg(format!("{name}:{name}"))
+                .output();
+        },
+        BranchChoice::Codename | BranchChoice::New(_)
+            if root.starts_with(state::clones_dir()) =>
+        {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["merge", "--ff-only", "@{u}"])
+                .output();
+        },
+        _ => {},
+    }
+}
+
 /// The slow half of `claim_worktree`: check `root` out into the claimed
 /// directory, on the claimed branch - created (`-b`), plain-checked-out, or
 /// created tracking its remote, per the popup's choice.
@@ -468,16 +613,22 @@ fn populate_worktree(
 /// large or lfs-heavy repo - and stream the result back to the App by tab id.
 /// A failed checkout gives the claimed directory back (`remove_dir` refuses
 /// non-empty, so a partial checkout is never deleted). Same channel + repaint
-/// wiring as the pr_status/git_status pollers.
+/// wiring as the pr_status/git_status pollers. `fresh_base` (project mode)
+/// updates the base branch from its remote first - network latency lands on
+/// this thread, never the UI.
 pub fn spawn_worktree(
     tab_id: String,
     root: PathBuf,
     worktree: Worktree,
     choice: BranchChoice,
+    fresh_base: bool,
     tx: Sender<(String, Result<Worktree, String>)>,
     ctx: egui::Context,
 ) {
     thread::spawn(move || {
+        if fresh_base {
+            refresh_base(&root, &choice);
+        }
         let res = match populate_worktree(&root, &worktree, &choice) {
             Ok(()) => Ok(worktree),
             Err(e) => {
@@ -488,6 +639,82 @@ pub fn spawn_worktree(
         let _ = tx.send((tab_id, res));
         ctx.request_repaint();
     });
+}
+
+/// `spawn_worktree`'s sibling for a repo project with no local clone yet:
+/// clone first, then resolve the typed branch text against the *fresh*
+/// clone's branches (the popup had no list to offer), then populate. Same
+/// channel protocol, same claimed-dir give-back on failure. A fresh clone
+/// is up to date by definition, so no `refresh_base` here.
+pub fn spawn_clone_worktree(
+    tab_id: String,
+    url: String,
+    root: PathBuf,
+    worktree: Worktree,
+    branch_input: String,
+    tx: Sender<(String, Result<Worktree, String>)>,
+    ctx: egui::Context,
+) {
+    thread::spawn(move || {
+        let res = match clone_and_populate(&url, &root, worktree, &branch_input)
+        {
+            Ok(wt) => Ok(wt),
+            Err((wt, e)) => {
+                let _ = fs::remove_dir(&wt.path);
+                Err(format!("{e:#}"))
+            },
+        };
+        let _ = tx.send((tab_id, res));
+        ctx.request_repaint();
+    });
+}
+
+/// The clone chain's body: `git clone` into the project's local root, then
+/// re-resolve the branch text and check out the worktree. Errors carry the
+/// claimed worktree back so the caller can return the directory. The clone
+/// runs with GIT_TERMINAL_PROMPT=0 - a private repo without ambient
+/// credentials fails fast instead of hanging a headless prompt.
+fn clone_and_populate(
+    url: &str,
+    root: &Path,
+    worktree: Worktree,
+    branch_input: &str,
+) -> Result<Worktree, (Worktree, anyhow::Error)> {
+    if let Some(parent) = root.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("clone")
+        .arg(url)
+        .arg(root)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {},
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            return Err((
+                worktree,
+                anyhow::anyhow!("git clone failed: {}", err.trim()),
+            ));
+        },
+        Err(e) => return Err((worktree, e.into())),
+    }
+    // The popup resolved against an empty branch list; now the branches
+    // exist. A typed name may turn out Existing/Track - repoint the claimed
+    // branch at the real resolution (the *directory* keeps its claimed name;
+    // dirs never rename branches).
+    let choice = resolve_branch(branch_input, &list_branches(root));
+    let mut wt = worktree;
+    wt.branch = match &choice {
+        BranchChoice::Codename => wt.branch,
+        BranchChoice::Existing(n) | BranchChoice::New(n) => n.clone(),
+        BranchChoice::Track { name, .. } => name.clone(),
+    };
+    match populate_worktree(root, &wt, &choice) {
+        Ok(()) => Ok(wt),
+        Err(e) => Err((wt, e)),
+    }
 }
 
 fn branch_exists(root: &Path, branch: &str) -> bool {
@@ -689,11 +916,13 @@ mod tests {
             model: Some("sonnet".into()),
             created_at: 7,
             archived_at: Some(9),
+            setup: Some("direnv allow".into()),
         };
         let back = Workspace::from_state(ws.to_state());
         assert_eq!(back.agent, Some("claude"));
         assert_eq!(back.worktree.unwrap().branch, "b");
         assert_eq!(back.archived_at, Some(9));
+        assert_eq!(back.setup.as_deref(), Some("direnv allow"));
         // An unknown agent id resolves to None rather than panicking.
         let mut st = ws.to_state();
         st.agent = Some("nope".into());
@@ -779,6 +1008,70 @@ refs/heads/quiet\t
         assert_eq!(worktree_dirname("main"), "main");
         assert_eq!(worktree_dirname("feat/x"), "feat-x");
         assert_eq!(worktree_dirname("a/b/c"), "a-b-c");
+    }
+
+    #[test]
+    fn clone_url_expands_github_shorthand() {
+        assert_eq!(
+            clone_url("herval/dotfiles"),
+            "https://github.com/herval/dotfiles.git"
+        );
+        assert_eq!(
+            clone_url(" herval/dotfiles.git "),
+            "https://github.com/herval/dotfiles.git"
+        );
+        // Already-full URLs and scp-style remotes pass through untouched.
+        assert_eq!(
+            clone_url("https://gitlab.com/a/b.git"),
+            "https://gitlab.com/a/b.git"
+        );
+        assert_eq!(
+            clone_url("git@github.com:a/b.git"),
+            "git@github.com:a/b.git"
+        );
+    }
+
+    #[test]
+    fn expand_dir_handles_tilde_and_empty() {
+        assert_eq!(expand_dir("  "), None);
+        assert_eq!(expand_dir("/tmp/x"), Some(PathBuf::from("/tmp/x")));
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_dir("~"), Some(home.clone()));
+        assert_eq!(expand_dir("~/dev"), Some(home.join("dev")));
+        // A ~user path is not expanded, just taken literally.
+        assert_eq!(expand_dir("~other"), Some(PathBuf::from("~other")));
+    }
+
+    #[test]
+    fn project_local_root_and_needs_clone() {
+        let local = Project {
+            name: "muxterm".into(),
+            path: Some("/tmp/muxterm".into()),
+            repo: None,
+            setup: None,
+        };
+        assert_eq!(local.local_root(), PathBuf::from("/tmp/muxterm"));
+        assert_eq!(local.needs_clone(), None);
+
+        // A uuid name guarantees the clone dest doesn't exist on this
+        // machine, whatever ~/.muxterm/clones already holds.
+        let name = format!("dot/files-{}", uuid::Uuid::new_v4());
+        let repo = Project {
+            name: name.clone(),
+            path: None,
+            repo: Some("herval/dotfiles".into()),
+            setup: None,
+        };
+        // Clone dest under ~/.muxterm/clones, slash-sanitized like worktrees.
+        assert_eq!(
+            repo.local_root(),
+            state::clones_dir().join(name.replace('/', "-"))
+        );
+        // An un-cloned repo project asks for its clone URL.
+        assert_eq!(
+            repo.needs_clone().as_deref(),
+            Some("https://github.com/herval/dotfiles.git")
+        );
     }
 
     /// Real-git round trip for every BranchChoice variant. Git is a hard
@@ -880,6 +1173,138 @@ refs/heads/quiet\t
             &BranchChoice::Existing("main".into()),
         );
         assert!(err.is_err(), "second checkout of main must fail");
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    fn scratch_git(
+        name: &str,
+    ) -> (PathBuf, impl Fn(&Path, &[&str]) -> String) {
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let scratch = std::env::temp_dir()
+            .join(format!("muxterm-{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&scratch).unwrap();
+        (scratch, git)
+    }
+
+    fn seed_repo(git: &impl Fn(&Path, &[&str]) -> String, repo: &Path) {
+        fs::create_dir_all(repo).unwrap();
+        git(repo, &["-c", "init.defaultBranch=main", "init"]);
+        git(
+            repo,
+            &[
+                "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "--allow-empty", "-m", "root",
+            ],
+        );
+    }
+
+    /// Real-git round trip of the cmd+shift+n clone chain: a local-path
+    /// "URL" keeps it offline. The typed branch text resolves against the
+    /// *clone's* branches (the popup had none to offer) - a name that turns
+    /// out to exist on the origin becomes a tracking checkout, not a `-b`.
+    #[test]
+    fn clone_and_populate_resolves_after_clone() {
+        let (scratch, git) = scratch_git("clonetest");
+        let origin = scratch.join("origin");
+        seed_repo(&git, &origin);
+        git(&origin, &["branch", "feat/x"]);
+
+        // Typed "feat/x" pre-clone: in the fresh clone it's a remote-only
+        // branch (only main comes out local), so it resolves Track.
+        let root = scratch.join("clone");
+        let claim = scratch.join("wt-feat");
+        fs::create_dir(&claim).unwrap();
+        let wt = Worktree { path: claim.clone(), branch: "feat/x".into() };
+        let wt = clone_and_populate(
+            origin.to_str().unwrap(),
+            &root,
+            wt,
+            "feat/x",
+        )
+        .expect("clone + checkout");
+        assert_eq!(wt.branch, "feat/x");
+        assert_eq!(
+            git(&claim, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feat/x"
+        );
+        assert!(root.join(".git").exists(), "clone landed");
+
+        // A bad URL: the error carries the claimed dir back untouched.
+        let root2 = scratch.join("clone2");
+        let claim2 = scratch.join("wt-bad");
+        fs::create_dir(&claim2).unwrap();
+        let wt = Worktree { path: claim2.clone(), branch: "x".into() };
+        let (back, _) = clone_and_populate(
+            scratch.join("no-such-origin").to_str().unwrap(),
+            &root2,
+            wt,
+            "x",
+        )
+        .expect_err("clone must fail");
+        assert_eq!(back.path, claim2);
+        assert!(claim2.exists(), "give-back is the caller's job");
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// `refresh_base` fast-forwards a chosen existing branch to its remote
+    /// tip without touching any working tree - the "continue branch x"
+    /// promise of project mode.
+    #[test]
+    fn refresh_base_fast_forwards_existing() {
+        let (scratch, git) = scratch_git("freshtest");
+        let origin = scratch.join("origin");
+        seed_repo(&git, &origin);
+        git(&origin, &["branch", "feat"]);
+
+        let clone = scratch.join("clone");
+        git(
+            &scratch,
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        // A local feat lagging its remote: create it at the current tip,
+        // then advance the origin.
+        git(&clone, &["branch", "feat", "origin/feat"]);
+        git(&origin, &["checkout", "feat"]);
+        git(
+            &origin,
+            &[
+                "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "--allow-empty", "-m", "ahead",
+            ],
+        );
+        let new_tip = git(&origin, &["rev-parse", "feat"]);
+        assert_ne!(git(&clone, &["rev-parse", "feat"]), new_tip);
+
+        refresh_base(&clone, &BranchChoice::Existing("feat".into()));
+        assert_eq!(
+            git(&clone, &["rev-parse", "feat"]),
+            new_tip,
+            "local feat fast-forwarded to the fetched remote tip"
+        );
+        // The clone's checked-out branch (main) was left alone.
+        assert_eq!(
+            git(&clone, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main"
+        );
 
         fs::remove_dir_all(&scratch).unwrap();
     }

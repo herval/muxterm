@@ -4,6 +4,12 @@
 //! Unlike settings (a pure painter grid) this hosts real text entry, so the
 //! folder and task fields stay egui `TextEdit`s - restyled to monospace with a
 //! hairline border so they sit inside the same grid.
+//!
+//! cmd+shift+n opens the same form in *project mode* (`for_project`): the
+//! folder field gives way to rows over the saved projects (Settings >
+//! Projects), the worktree toggle disappears (always on), and a repo project
+//! that hasn't been cloned yet swaps the branch typeahead for a clone notice
+//! with deferred branch resolution.
 
 use std::path::Path;
 
@@ -16,7 +22,7 @@ use egui::{
 use muxterm::agent::{self, Agent};
 
 use crate::theme::{self, UiTheme};
-use crate::workspace::{Branch, BranchChoice};
+use crate::workspace::{Branch, BranchChoice, Project};
 
 /// Live state of the open popup, owned by the App as `Option<NewWorkspaceForm>`.
 pub struct NewWorkspaceForm {
@@ -29,6 +35,11 @@ pub struct NewWorkspaceForm {
     pub prompt: String,
     pub agent: &'static str,
     pub model: String,
+    /// Project mode (cmd+shift+n): the saved projects to pick from,
+    /// snapshotted at open. Empty = the plain cmd+n folder form.
+    pub projects: Vec<Project>,
+    /// Index into `projects` of the picked one.
+    pub project: usize,
     /// Cached `is_git_repo` for `folder`, refreshed only when the folder text
     /// settles on an existing directory (so we don't spawn `git` per keystroke).
     is_repo: bool,
@@ -48,6 +59,8 @@ impl NewWorkspaceForm {
             prompt: String::new(),
             agent,
             model,
+            projects: Vec::new(),
+            project: 0,
             is_repo: false,
             branches: Vec::new(),
             checked: String::from("\0"), // force a first check
@@ -56,6 +69,35 @@ impl NewWorkspaceForm {
         // A git repo defaults the checkbox on - the common case for cmd+n.
         form.create_worktree = form.is_repo;
         form
+    }
+
+    /// cmd+shift+n: the same form in project mode, seeded on the first
+    /// saved project. The folder tracks the picked project; a worktree is
+    /// always wanted (that's the point of a project session), even when
+    /// the checkbox logic would say no because the clone doesn't exist yet.
+    pub fn for_project(
+        projects: Vec<Project>,
+        agent: &'static str,
+        model: String,
+    ) -> Self {
+        let folder = projects
+            .first()
+            .map(|p| p.local_root().display().to_string())
+            .unwrap_or_default();
+        let mut form = Self::new(folder, agent, model);
+        form.projects = projects;
+        form
+    }
+
+    /// The picked project, in project mode.
+    pub fn selected_project(&self) -> Option<&Project> {
+        self.projects.get(self.project)
+    }
+
+    /// Some(clone URL) when the picked project is a repo without its local
+    /// clone yet - submit must clone before the worktree checkout.
+    pub fn clone_needed(&self) -> Option<String> {
+        self.selected_project().and_then(|p| p.needs_clone())
     }
 
     /// Re-run the git-repo probe (and the branch listing) when the folder
@@ -132,39 +174,49 @@ pub fn show(
             // the grid's look (monospace, hairline border, accent on focus).
             panel.style_inputs(ui);
 
-            panel.divider(ui, "[ New workspace ]", th.accent);
+            let project_mode = !form.projects.is_empty();
+            let title = if project_mode {
+                "[ New workspace from project ]"
+            } else {
+                "[ New workspace ]"
+            };
+            panel.divider(ui, title, th.accent);
             ui.add_space(2.0);
 
-            panel.divider(ui, "Folder", th.accent);
-            ui.add_space(2.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut form.folder)
-                    .hint_text("~/path/to/project")
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add_space(2.0);
-            if form.is_repo {
-                if panel
-                    .toggle(ui, form.create_worktree, "Create git worktree", true)
-                    .clicked()
-                {
-                    form.create_worktree = !form.create_worktree;
-                }
+            if project_mode {
+                project_picker(ui, form, &panel, th);
             } else {
-                panel.toggle(ui, false, "Create git worktree", false);
-                if !form.folder.trim().is_empty() {
-                    panel.row(
-                        ui,
-                        vec![(
-                            "not a git repo - worktree off".into(),
-                            th.text_dim,
-                        )],
-                        false,
-                    );
+                panel.divider(ui, "Folder", th.accent);
+                ui.add_space(2.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.folder)
+                        .hint_text("~/path/to/project")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(2.0);
+                if form.is_repo {
+                    if panel
+                        .toggle(ui, form.create_worktree, "Create git worktree", true)
+                        .clicked()
+                    {
+                        form.create_worktree = !form.create_worktree;
+                    }
+                } else {
+                    panel.toggle(ui, false, "Create git worktree", false);
+                    if !form.folder.trim().is_empty() {
+                        panel.row(
+                            ui,
+                            vec![(
+                                "not a git repo - worktree off".into(),
+                                th.text_dim,
+                            )],
+                            false,
+                        );
+                    }
                 }
-            }
-            if form.is_repo && form.create_worktree {
-                branch_picker(ui, form, &panel, th);
+                if form.is_repo && form.create_worktree {
+                    branch_picker(ui, form, &panel, th);
+                }
             }
             ui.add_space(6.0);
 
@@ -247,6 +299,93 @@ pub fn show(
         outcome = Outcome::Create;
     }
     outcome
+}
+
+/// Project mode's replacement for the Folder section: one row per saved
+/// project, then the worktree area for the picked one - the branch picker
+/// against a local repo, or the clone notice (with a deferred branch field)
+/// when the repo hasn't been cloned yet. There is no worktree toggle in
+/// this mode: a project session always wants one.
+fn project_picker(
+    ui: &mut egui::Ui,
+    form: &mut NewWorkspaceForm,
+    panel: &Panel<'_>,
+    th: &UiTheme,
+) {
+    panel.divider(ui, "Project", th.accent);
+    ui.add_space(2.0);
+    let mut pick: Option<usize> = None;
+    for (i, p) in form.projects.iter().enumerate() {
+        let note = match (&p.path, &p.repo) {
+            (Some(path), _) => home_abbrev(&path.display().to_string()),
+            (None, Some(repo)) => format!("github: {repo}"),
+            (None, None) => String::new(),
+        };
+        if panel
+            .option(ui, &p.name, &note, true, i == form.project)
+            .clicked()
+        {
+            pick = Some(i);
+        }
+    }
+    if let Some(i) = pick {
+        form.project = i;
+        form.folder = form.projects[i].local_root().display().to_string();
+        form.refresh_repo();
+        // refresh_repo only ever clears the flag; project mode wants the
+        // worktree whenever the folder really is a repo.
+        form.create_worktree = form.is_repo;
+    }
+    ui.add_space(2.0);
+
+    if form.clone_needed().is_some() {
+        // The home-relative clone destination fits the row; the full URL
+        // often wouldn't.
+        panel.row(
+            ui,
+            vec![(
+                format!("will clone into {}", home_abbrev(&form.folder)),
+                th.text_dim,
+            )],
+            false,
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut form.branch)
+                .hint_text("branch: random codename - type a name to use")
+                .desired_width(f32::INFINITY),
+        );
+        // No branch list exists to resolve against until the clone lands;
+        // promising "create branch 'x'" here would often be wrong.
+        panel.row(
+            ui,
+            vec![(
+                "-> resolved after clone (empty = codename)".into(),
+                th.text_dim,
+            )],
+            false,
+        );
+    } else if form.is_repo {
+        form.create_worktree = true;
+        branch_picker(ui, form, panel, th);
+    } else {
+        panel.row(
+            ui,
+            vec![("not a git repo - worktree off".into(), th.text_dim)],
+            false,
+        );
+    }
+}
+
+/// Shorten a home-prefixed path for a row ("/Users/u/dev/x" -> "~/dev/x");
+/// anything else passes through.
+fn home_abbrev(path: &str) -> String {
+    match dirs::home_dir() {
+        Some(home) => path
+            .strip_prefix(&home.display().to_string())
+            .map(|rest| format!("~{rest}"))
+            .unwrap_or_else(|| path.to_string()),
+        None => path.to_string(),
+    }
 }
 
 /// The suggestion list's slot count cap: enough to surface the newest
@@ -803,5 +942,101 @@ mod tests {
                 remote: "origin".into(),
             }
         );
+    }
+
+    /// Project mode renders project rows instead of the folder field, hides
+    /// the worktree toggle, and shows the clone notice with the deferred
+    /// branch caption for a repo project that has no local clone yet.
+    #[test]
+    fn popup_renders_project_mode() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, ui_theme) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        // Non-existent paths keep refresh_repo subprocess-free; the uuid
+        // name guarantees the repo project's clone dest is absent.
+        let projects = vec![
+            Project {
+                name: "local-proj".into(),
+                path: Some("/no/such/dir/local-proj".into()),
+                repo: None,
+                setup: None,
+            },
+            Project {
+                name: format!("dots-{}", uuid::Uuid::new_v4()),
+                path: None,
+                repo: Some("herval/dotfiles".into()),
+                setup: Some("direnv allow".into()),
+            },
+        ];
+        let mut form = NewWorkspaceForm::for_project(
+            projects,
+            "claude",
+            "opus".into(),
+        );
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let agents: Vec<_> = agent::AGENTS.iter().collect();
+        let mut render = |form: &mut NewWorkspaceForm| {
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(ctx, form, &agents, &ui_theme, &font);
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let output = ctx.run(input.clone(), &mut frame);
+            let mut texts: Vec<String> = Vec::new();
+            for clipped in &output.shapes {
+                collect_texts(&clipped.shape, &mut texts);
+            }
+            for run in &texts {
+                assert!(run.is_ascii(), "non-ASCII painted run: {run:?}");
+            }
+            texts.join("\u{1}")
+        };
+
+        // First project (a plain folder, not a repo): rows for both
+        // projects, no worktree toggle, the non-repo note.
+        let joined = render(&mut form);
+        assert!(joined.contains("[ New workspace from project ]"));
+        assert!(joined.contains("local-proj"));
+        assert!(joined.contains("github: herval/dotfiles"));
+        assert!(
+            !joined.contains("Create git worktree"),
+            "project mode must not offer the toggle: {joined}"
+        );
+        assert!(joined.contains("not a git repo - worktree off"));
+
+        // Pick the un-cloned repo project (as project_picker's click does):
+        // the clone notice and the deferred branch caption appear.
+        form.project = 1;
+        form.folder =
+            form.projects[1].local_root().display().to_string();
+        let joined = render(&mut form);
+        assert!(
+            joined.contains("will clone into "),
+            "clone notice missing: {joined}"
+        );
+        assert!(joined.contains("-> resolved after clone (empty = codename)"));
+        assert!(form.clone_needed().is_some());
+
+        // cmd+Enter still submits in project mode.
+        let mut submit = input.clone();
+        submit.events.push(egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let mut outcome = Outcome::None;
+        let _ = ctx.run(submit, |ctx| {
+            outcome = show(ctx, &mut form, &agents, &ui_theme, &font);
+        });
+        assert!(matches!(outcome, Outcome::Create));
     }
 }

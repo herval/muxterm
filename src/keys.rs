@@ -8,6 +8,10 @@ pub enum Action {
     /// cmd+n: open the workspace-creation popup (folder + worktree + prompt +
     /// agent). cmd+t (NewTab) stays the shortcut for a bare shell workspace.
     NewWorkspace,
+    /// cmd+shift+n: the same popup over a saved project (Settings >
+    /// Projects) - worktree always on, repo projects cloned on first use.
+    /// With no projects saved it opens Settings on the Projects tab instead.
+    NewProjectWorkspace,
     /// cmd+\: show/collapse the workspace sidebar.
     ToggleSidebar,
     /// cmd+k: clear the focused pane's screen and scrollback (iTerm-style).
@@ -71,6 +75,7 @@ pub fn drain_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         consume(cmd | Modifiers::SHIFT, Key::D, Action::Split(SplitAxis::Stacked));
         consume(cmd, Key::D, Action::Split(SplitAxis::SideBySide));
         consume(cmd, Key::T, Action::NewTab);
+        consume(cmd | Modifiers::SHIFT, Key::N, Action::NewProjectWorkspace);
         consume(cmd, Key::N, Action::NewWorkspace);
         consume(cmd, Key::Backslash, Action::ToggleSidebar);
         consume(cmd, Key::K, Action::ClearScreen);

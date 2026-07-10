@@ -24,6 +24,10 @@ pub struct StateFile {
     /// with `#[serde(default)]` (expanded), so older state files load as-is.
     #[serde(default)]
     pub archived_collapsed: bool,
+    /// The saved project registry (Settings > Projects), the sources the
+    /// cmd+shift+n popup offers. Additive with `#[serde(default)]` (empty).
+    #[serde(default)]
+    pub projects: Vec<ProjectState>,
 }
 
 fn default_true() -> bool {
@@ -75,12 +79,32 @@ pub struct WorkspaceState {
     /// visible - no VERSION bump needed.
     #[serde(default)]
     pub archived_at: Option<u64>,
+    /// The project's setup script, copied in at creation (the workspace owns
+    /// its copy so later project edits/removal never touch a live tab, and a
+    /// relaunch mid-checkout still knows what to run).
+    #[serde(default)]
+    pub setup: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorktreeState {
     pub path: PathBuf,
     pub branch: String,
+}
+
+/// Serde mirror of the GUI's `workspace::Project`: a saved workspace source -
+/// a folder on disk (`path`) or a GitHub repo (`repo`, cloned on first use
+/// under `~/.muxterm/clones/`), plus an optional setup script typed into a
+/// new workspace's first pane.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ProjectState {
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub setup: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -184,6 +208,13 @@ pub fn worktrees_dir() -> PathBuf {
     config_dir().join("worktrees")
 }
 
+/// Directory holding the local clones of GitHub-repo projects
+/// (`~/.muxterm/clones/`), made on first use. Never GC'd - same doctrine as
+/// worktrees; removing a project keeps its clone.
+pub fn clones_dir() -> PathBuf {
+    config_dir().join("clones")
+}
+
 pub fn state_path() -> PathBuf {
     config_dir().join("state.json")
 }
@@ -241,6 +272,20 @@ mod tests {
             last_workspace_dir: Some("/tmp/proj".into()),
             sidebar_open: true,
             archived_collapsed: false,
+            projects: vec![
+                ProjectState {
+                    name: "muxterm".into(),
+                    path: Some("/tmp/proj".into()),
+                    repo: None,
+                    setup: Some("direnv allow".into()),
+                },
+                ProjectState {
+                    name: "dotfiles".into(),
+                    path: None,
+                    repo: Some("herval/dotfiles".into()),
+                    setup: None,
+                },
+            ],
             windows: vec![WindowState {
                 active_tab: 1,
                 tabs: vec![
@@ -279,6 +324,7 @@ mod tests {
                             model: Some("sonnet".into()),
                             created_at: 123,
                             archived_at: None,
+                            setup: Some("direnv allow".into()),
                         }),
                     },
                 ],
@@ -294,6 +340,10 @@ mod tests {
         let ws = back.windows[0].tabs[1].workspace.as_ref().unwrap();
         assert_eq!(ws.title, "wire up auth");
         assert_eq!(ws.worktree.as_ref().unwrap().branch, "wire-up-auth");
+        assert_eq!(ws.setup.as_deref(), Some("direnv allow"));
+        assert_eq!(back.projects.len(), 2);
+        assert_eq!(back.projects[0].path.as_deref(), Some(Path::new("/tmp/proj")));
+        assert_eq!(back.projects[1].repo.as_deref(), Some("herval/dotfiles"));
 
         let mut sessions = HashSet::new();
         for tab in &back.windows[0].tabs {
@@ -326,5 +376,7 @@ mod tests {
         // Sidebar defaults on for discoverability, archived pile expanded.
         assert!(s.sidebar_open);
         assert!(!s.archived_collapsed);
+        // No saved projects in an older file.
+        assert!(s.projects.is_empty());
     }
 }
