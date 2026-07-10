@@ -4,6 +4,8 @@
 //! not a native gray panel - so it sits flush with the panes beside it.
 //! Display-only, like `tabbar`: it returns a vec of actions the App applies.
 
+use std::time::Duration;
+
 use egui::text::LayoutJob;
 use egui::{
     Align2, Color32, CornerRadius, FontId, Margin, Pos2, Rect, Stroke,
@@ -155,10 +157,17 @@ fn row_action(
     }
 }
 
+/// Repaint cadence while a working pulse is on screen. A 1.4s sine is
+/// indistinguishable at ~15fps, and agents work for hours at a stretch - the
+/// pulse must never be what pins the render loop at display refresh rate.
+const PULSE_FRAME: Duration = Duration::from_millis(66);
+
 /// A breathing brightness for the "working" icon: a sine over `time`
 /// (seconds) eases the color between a dimmed-toward-background trough and
 /// the full status green. ~1.4s period reads as a calm pulse, not a blink.
-fn pulse(bright: Color32, bg: Color32, time: f64) -> Color32 {
+/// `None` (window unfocused - nobody is watching) holds steady full green.
+fn pulse(bright: Color32, bg: Color32, time: Option<f64>) -> Color32 {
+    let Some(time) = time else { return bright };
     let s = 0.5 + 0.5 * (time * 4.5).sin() as f32; // 0..1
     let dim = theme::blend(bright, bg, 0.6);
     theme::blend(dim, bright, s)
@@ -175,7 +184,7 @@ fn status_icon(
     font_size: f32,
     status: Status,
     t: &UiTheme,
-    time: f64,
+    time: Option<f64>,
 ) {
     let r = font_size * 0.30;
     match status {
@@ -244,12 +253,19 @@ fn workspace_row(
     // The leading icon is the status light, and its *shape* carries the
     // state as much as its color (so it reads without color vision): a
     // quiet ring when idle, a breathing play-triangle while an agent works,
-    // a steady red exclamation while one is blocked waiting. Working keeps
-    // repainting so the motion stays smooth (and so the light goes out
-    // promptly once the agent stops). Painter-drawn, not a glyph: advance
-    // widths vary across terminal fonts/fallbacks, a fixed band doesn't.
-    if row.status == Status::Working {
-        ui.ctx().request_repaint();
+    // a steady red exclamation while one is blocked waiting. Painter-drawn,
+    // not a glyph: advance widths vary across terminal fonts/fallbacks, a
+    // fixed band doesn't.
+    //
+    // Working animates only while the window has focus, and at PULSE_FRAME
+    // rather than every frame: agents run for hours, so an unthrottled
+    // request_repaint here means the whole app renders at display refresh
+    // rate more or less permanently - even sitting behind other windows.
+    // Unfocused, the triangle holds steady and the light stays honest via
+    // the App's idle heartbeat and PTY-event repaints.
+    let animate = row.status == Status::Working && ui.input(|i| i.focused);
+    if animate {
+        ui.ctx().request_repaint_after(PULSE_FRAME);
     }
     let status_w = font.size * 1.1;
     let mut job = LayoutJob::default();
@@ -321,7 +337,7 @@ fn workspace_row(
         font.size,
         row.status,
         t,
-        ui.input(|i| i.time),
+        animate.then(|| ui.input(|i| i.time)),
     );
     if hovered {
         ui.painter().text(
@@ -429,5 +445,58 @@ mod tests {
         assert!(ring, "idle ring not painted");
         assert!(triangle, "working play-triangle not painted");
         assert!(bang_dot, "blocked exclamation dot not painted");
+    }
+
+    /// The working pulse schedules its own repaints, but throttled (at
+    /// PULSE_FRAME, never every frame) and only while the window is focused.
+    /// Guards the battery contract: agents work for hours, and one working
+    /// row must not keep the render loop at display refresh rate - nor
+    /// render at all while the app sits behind other windows.
+    #[test]
+    fn working_pulse_repaint_is_throttled_and_focus_gated() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let rows = vec![Row {
+            tab_index: 0,
+            title: "busy-ws".into(),
+            subtitle: None,
+            active: false,
+            status: Status::Working,
+            archived: false,
+        }];
+        let mut frame = |ctx: &egui::Context| {
+            let _ = show(ctx, &rows, &font, &th);
+        };
+        let input = |focused: bool| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            focused,
+            ..Default::default()
+        };
+
+        let _ = ctx.run(input(true), &mut frame);
+        let out = ctx.run(input(true), &mut frame);
+        let delay =
+            out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(
+            delay > Duration::ZERO,
+            "focused pulse repaints every frame (delay {delay:?})"
+        );
+        assert!(
+            delay <= PULSE_FRAME,
+            "focused pulse stopped animating (delay {delay:?})"
+        );
+
+        let out = ctx.run(input(false), &mut frame);
+        let delay =
+            out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(
+            delay > Duration::from_secs(1),
+            "unfocused pulse still schedules repaints (delay {delay:?})"
+        );
     }
 }
