@@ -21,25 +21,33 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-/// claude's hook events -> the state each reports. PreToolUse (unmatched =
-/// every tool) is deliberate: it flips attention back to working the moment
-/// a permission request is approved, not at end of turn.
-const CLAUDE_EVENTS: &[(&str, &str)] = &[
-    ("UserPromptSubmit", "working"),
-    ("PreToolUse", "working"),
-    ("Stop", "idle"),
-    ("Notification", "attention"),
-    ("SessionEnd", "gone"),
+/// The notification types that mean claude is blocked on the user: a
+/// permission prompt or an MCP elicitation form. Deliberately excludes
+/// idle_prompt - the ~60s "waiting for your next prompt" nudge - which
+/// would otherwise repaint every idle agent as attention (Stop already
+/// reported idle, and nothing would ever downgrade the false alarm).
+const CLAUDE_NOTIFY_MATCHER: &str = "permission_prompt|elicitation_dialog";
+
+/// claude's hook events -> (the state each reports, optional matcher).
+/// PreToolUse (unmatched = every tool) is deliberate: it flips attention
+/// back to working the moment a permission request is approved, not at
+/// end of turn.
+const CLAUDE_EVENTS: &[(&str, &str, Option<&str>)] = &[
+    ("UserPromptSubmit", "working", None),
+    ("PreToolUse", "working", None),
+    ("Stop", "idle", None),
+    ("Notification", "attention", Some(CLAUDE_NOTIFY_MATCHER)),
+    ("SessionEnd", "gone", None),
 ];
 
 /// codex shares claude's event vocabulary but has no SessionEnd (the GUI's
 /// foreground-process prune covers agent exit) and names the approval event
 /// PermissionRequest.
-const CODEX_EVENTS: &[(&str, &str)] = &[
-    ("UserPromptSubmit", "working"),
-    ("PreToolUse", "working"),
-    ("Stop", "idle"),
-    ("PermissionRequest", "attention"),
+const CODEX_EVENTS: &[(&str, &str, Option<&str>)] = &[
+    ("UserPromptSubmit", "working", None),
+    ("PreToolUse", "working", None),
+    ("Stop", "idle", None),
+    ("PermissionRequest", "attention", None),
 ];
 
 /// Install/refresh the hooks for every agent whose config dir exists.
@@ -97,7 +105,11 @@ fn resolve_mux() -> Option<String> {
 /// Read-merge-write one hooks JSON file (claude settings.json and codex
 /// hooks.json share the shape). A file that exists but doesn't parse is
 /// left strictly alone - never clobber a user's config to install a dot.
-fn merge_hooks_file(path: &PathBuf, events: &[(&str, &str)], mux: &str) {
+fn merge_hooks_file(
+    path: &PathBuf,
+    events: &[(&str, &str, Option<&str>)],
+    mux: &str,
+) {
     let root_text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(_) => "{}".to_string(),
@@ -124,17 +136,22 @@ fn merge_hooks_file(path: &PathBuf, events: &[(&str, &str)], mux: &str) {
     }
 }
 
-/// The muxterm hook group for one state. Kept minimal: no matcher (match
-/// every tool/notification), a short timeout so a wedged hook can never
-/// stall the agent.
-fn hook_group(mux: &str, state: &str) -> Value {
-    json!({
+/// The muxterm hook group for one state. Kept minimal: a short timeout so
+/// a wedged hook can never stall the agent, and a matcher only where one
+/// event multiplexes triggers we must tell apart (claude's Notification) -
+/// absent means match every tool/notification.
+fn hook_group(mux: &str, state: &str, matcher: Option<&str>) -> Value {
+    let mut group = json!({
         "hooks": [{
             "type": "command",
             "command": format!("{mux} agent-event {state}"),
             "timeout": 5,
         }],
-    })
+    });
+    if let Some(matcher) = matcher {
+        group["matcher"] = json!(matcher);
+    }
+    group
 }
 
 /// Merge muxterm's hook groups into `root.hooks.<event>`, preserving every
@@ -142,7 +159,11 @@ fn hook_group(mux: &str, state: &str) -> Value {
 /// command) is replaced in place when it drifted (e.g. mux moved), appended
 /// when missing, and left untouched when identical. Returns whether the
 /// document changed.
-fn merge_hooks(root: &mut Value, events: &[(&str, &str)], mux: &str) -> bool {
+fn merge_hooks(
+    root: &mut Value,
+    events: &[(&str, &str, Option<&str>)],
+    mux: &str,
+) -> bool {
     let Some(obj) = root.as_object_mut() else {
         return false;
     };
@@ -151,8 +172,8 @@ fn merge_hooks(root: &mut Value, events: &[(&str, &str)], mux: &str) -> bool {
         return false;
     };
     let mut changed = false;
-    for (event, state) in events {
-        let desired = hook_group(mux, state);
+    for (event, state, matcher) in events {
+        let desired = hook_group(mux, state, *matcher);
         let entry = hooks.entry(*event).or_insert_with(|| json!([]));
         let Some(list) = entry.as_array_mut() else {
             continue;
@@ -240,17 +261,39 @@ mod tests {
     fn merge_into_empty_adds_all_events() {
         let mut root = json!({});
         assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
-        for (event, state) in CLAUDE_EVENTS {
-            let cmd = root["hooks"][*event][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap();
+        for (event, state, matcher) in CLAUDE_EVENTS {
+            let group = &root["hooks"][*event][0];
+            let cmd = group["hooks"][0]["command"].as_str().unwrap();
             assert_eq!(
                 cmd,
                 format!("/usr/local/bin/mux agent-event {state}")
             );
+            assert_eq!(group["matcher"].as_str(), *matcher);
         }
         // Idempotent: a second merge with the same path changes nothing.
         assert!(!merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+    }
+
+    #[test]
+    fn merge_scopes_a_matcherless_notification_group() {
+        // The upgrade path for every pre-matcher install: the Notification
+        // group used to fire on all notification types (idle_prompt
+        // included) and must be replaced in place, not duplicated.
+        let mut root = json!({
+            "hooks": {
+                "Notification": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/mux agent-event attention",
+                        "timeout": 5,
+                    }],
+                }],
+            },
+        });
+        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+        let groups = root["hooks"]["Notification"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["matcher"], CLAUDE_NOTIFY_MATCHER);
     }
 
     #[test]
