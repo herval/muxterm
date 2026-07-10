@@ -27,8 +27,9 @@ fn default_config() -> String {
     format!(
         r##"# muxterm configuration - edits apply live while the app is running.
 
-# Built-in themes: "iterm-dark", "dracula", "solarized-dark", "gruvbox-dark",
-#                  "iterm-light", "solarized-light", "github-light"
+# Built-in themes: "iterm-dark", "bbs", "iterm-light", "github-light".
+# Each is a full look: palette plus its own font (Monaco for the iterms,
+# IBM VGA for bbs, SF Mono for github-light).
 theme = "iterm-dark"
 
 # Agent CLI behind the "?" prompt line (type "?" at an empty shell
@@ -66,10 +67,11 @@ copy_on_select = false
 # notifications = true
 
 [font]
-# Monospace font: a name searched in the macOS font folders, or a path to a
-# .ttf/.otf/.ttc file. Comment out for the built-in font (Hack).
+# Each theme picks its own font; set either key to override it for every
+# theme. A family is a name searched in the macOS font folders, or a path
+# to a .ttf/.otf/.ttc file.
 # family = "Menlo"
-size = 14.0
+# size = 14.0
 
 [colors]
 # Override any color of the chosen theme with "#rrggbb":
@@ -126,20 +128,12 @@ impl Default for ConfigFile {
     }
 }
 
-#[derive(Deserialize, Debug)]
+/// User overrides on top of the theme's font: either half alone is fine.
+#[derive(Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct FontConfig {
     pub family: Option<String>,
-    pub size: f32,
-}
-
-impl Default for FontConfig {
-    fn default() -> Self {
-        Self {
-            family: None,
-            size: 14.0,
-        }
-    }
+    pub size: Option<f32>,
 }
 
 pub struct Style {
@@ -219,8 +213,20 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
         agent::default_agent()
     });
 
-    let size = cfg.font.size.clamp(6.0, 40.0);
-    let font_data = cfg.font.family.as_deref().and_then(load_font_data);
+    // The theme's font, with `[font]` as user overrides: family replaces
+    // the face, size the point size. A family that fails to load falls
+    // back to the theme's font, not egui's built-in.
+    let size = cfg.font.size.unwrap_or(preset.font.size).clamp(6.0, 40.0);
+    let theme_font = || match preset.font.source {
+        theme::FontSource::System(path) => load_font_data(path),
+        theme::FontSource::Builtin(bytes) => {
+            Some(FontData::from_static(bytes))
+        },
+    };
+    let font_data = match cfg.font.family.as_deref() {
+        Some(family) => load_font_data(family).or_else(theme_font),
+        None => theme_font(),
+    };
 
     (
         Style {
@@ -465,7 +471,7 @@ fn load_font_data(family: &str) -> Option<FontData> {
         None => {
             log::warn!(
                 "font {family:?} not found (searched ~/Library/Fonts, \
-                 /Library/Fonts, /System/Library/Fonts); using built-in"
+                 /Library/Fonts, /System/Library/Fonts); falling back"
             );
             None
         },
@@ -501,11 +507,107 @@ mod tests {
         });
     }
 
+    /// Resolve a theme + [font] overrides and install the result, so
+    /// glyph coverage can be asserted against the actual primary font.
+    fn install_theme(theme: &str, font: FontConfig) -> egui::Context {
+        let cfg = ConfigFile {
+            theme: theme.into(),
+            font,
+            ..ConfigFile::default()
+        };
+        let (_, font_data) = resolve(&cfg);
+        assert!(font_data.is_some(), "{theme}: no font resolved");
+        let ctx = egui::Context::default();
+        install_fonts(&ctx, font_data);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        ctx
+    }
+
+    #[test]
+    fn bbs_bundled_font_covers_cp437_art() {
+        // The whole point of the bundled Px437 face: box drawing, shades,
+        // and the card suits BBS ANSI art is made of.
+        let ctx = install_theme("bbs", FontConfig::default());
+        ctx.fonts(|f| {
+            assert!(
+                f.has_glyphs(
+                    &FontId::monospace(16.0),
+                    "░▒▓█▄▀│┤╣║╗╝┌└├─┼═╔╚╩╦╠╬♥♦♣♠"
+                ),
+                "CP437 art glyphs missing from Px437"
+            );
+        });
+    }
+
+    #[test]
+    fn github_light_font_loads_and_covers_ascii() {
+        // The SFNSMono canary: system SF Mono has quirky internals, so
+        // prove it parses and shapes ASCII before shipping it as a theme
+        // font. If this ever fails, point the preset at Menlo.ttc.
+        let ctx = install_theme("github-light", FontConfig::default());
+        ctx.fonts(|f| {
+            assert!(
+                f.has_glyphs(
+                    &FontId::monospace(12.0),
+                    "abcXYZ019{}[]|~"
+                ),
+                "SF Mono failed to shape ASCII"
+            );
+        });
+    }
+
+    #[test]
+    fn theme_font_yields_to_config_overrides() {
+        // No overrides: the theme's own font and size.
+        let (style, font_data) = resolve(&ConfigFile::default());
+        assert_eq!(style.font.size, 12.0); // iterm-dark = Monaco 12
+        assert!(font_data.is_some(), "Monaco failed to load");
+        let bbs = ConfigFile {
+            theme: "bbs".into(),
+            ..ConfigFile::default()
+        };
+        let (style, _) = resolve(&bbs);
+        assert_eq!(style.font.size, 16.0);
+
+        // [font] size wins over the theme's.
+        let cfg = ConfigFile {
+            theme: "bbs".into(),
+            font: FontConfig {
+                family: None,
+                size: Some(13.0),
+            },
+            ..ConfigFile::default()
+        };
+        let (style, _) = resolve(&cfg);
+        assert_eq!(style.font.size, 13.0);
+
+        // A [font] family that fails to load falls back to the theme's
+        // font, not to None (which would mean egui's built-in).
+        let cfg = ConfigFile {
+            theme: "bbs".into(),
+            font: FontConfig {
+                family: Some("NoSuchFace".into()),
+                size: None,
+            },
+            ..ConfigFile::default()
+        };
+        let (style, font_data) = resolve(&cfg);
+        assert!(font_data.is_some(), "theme font fallback lost");
+        assert_eq!(style.font.size, 16.0);
+    }
+
+    #[test]
+    fn seed_config_leaves_font_to_the_theme() {
+        let cfg: ConfigFile = toml::from_str(&default_config()).unwrap();
+        assert_eq!(cfg.font.size, None);
+        assert_eq!(cfg.font.family, None);
+    }
+
     #[test]
     fn theme_line_is_replaced_in_place() {
         let text = "# comment\ntheme = \"iterm-dark\"\n\n[font]\nsize = 14.0\n";
-        let out = replace_theme_line(text, "dracula");
-        assert!(out.contains("theme = \"dracula\""));
+        let out = replace_theme_line(text, "bbs");
+        assert!(out.contains("theme = \"bbs\""));
         assert!(!out.contains("iterm-dark"));
         assert!(out.contains("# comment"));
         assert!(out.contains("size = 14.0"));
@@ -513,18 +615,18 @@ mod tests {
 
     #[test]
     fn theme_line_is_prepended_when_missing() {
-        let out = replace_theme_line("[font]\nsize = 14.0\n", "gruvbox-dark");
-        assert!(out.starts_with("theme = \"gruvbox-dark\""));
+        let out = replace_theme_line("[font]\nsize = 14.0\n", "github-light");
+        assert!(out.starts_with("theme = \"github-light\""));
     }
 
     #[test]
     fn agent_line_is_replaced_in_place() {
-        let text = "theme = \"dracula\"\nagent = \"claude\"\n\n[font]\n";
+        let text = "theme = \"bbs\"\nagent = \"claude\"\n\n[font]\n";
         let out =
             replace_top_level_line(text, "agent", "agent = \"codex\"");
         assert!(out.contains("agent = \"codex\""));
         assert!(!out.contains("claude"));
-        assert!(out.contains("theme = \"dracula\""));
+        assert!(out.contains("theme = \"bbs\""));
     }
 
     #[test]
@@ -595,7 +697,7 @@ mod tests {
 
     #[test]
     fn copy_on_select_line_is_rewritten_at_top_level() {
-        let text = "theme = \"dracula\"\ncopy_on_select = true\n\n[font]\n";
+        let text = "theme = \"bbs\"\ncopy_on_select = true\n\n[font]\n";
         let out = replace_top_level_line(
             text,
             "copy_on_select",
@@ -603,7 +705,7 @@ mod tests {
         );
         assert!(out.contains("copy_on_select = false"));
         assert!(!out.contains("copy_on_select = true"));
-        assert!(out.contains("theme = \"dracula\""));
+        assert!(out.contains("theme = \"bbs\""));
     }
 
     #[test]
@@ -618,11 +720,19 @@ mod tests {
 
     #[test]
     fn size_line_only_touches_font_section() {
-        let text = "theme = \"dracula\"\n\n[font]\nsize = 14.0\n\n[colors]\n";
+        let text = "theme = \"bbs\"\n\n[font]\nsize = 14.0\n\n[colors]\n";
         let out = replace_size_line(text, 16.0);
         assert!(out.contains("size = 16.0"));
         assert!(!out.contains("size = 14.0"));
-        let out2 = replace_size_line("theme = \"dracula\"\n", 12.0);
+        let out2 = replace_size_line("theme = \"bbs\"\n", 12.0);
         assert!(out2.contains("[font]\nsize = 12.0"));
+        // The seed's size line is commented out (the theme owns the size),
+        // so the stepper's first write inserts a live line under [font]
+        // and leaves the comment alone.
+        let out3 = replace_size_line(&default_config(), 15.0);
+        assert!(out3.contains("[font]\nsize = 15.0"));
+        assert!(out3.contains("# size = 14.0"));
+        let cfg: ConfigFile = toml::from_str(&out3).unwrap();
+        assert_eq!(cfg.font.size, Some(15.0));
     }
 }

@@ -1,0 +1,9 @@
+Px437_IBM_VGA_8x16.ttf — from The Ultimate Oldschool PC Font Pack v2.2
+by VileR (https://int10h.org/oldschool-pc-fonts/), a pixel-outline
+remake of the IBM VGA 8x16 text-mode font.
+
+Licensed under Creative Commons Attribution-ShareAlike 4.0 International
+(CC BY-SA 4.0): https://creativecommons.org/licenses/by-sa/4.0/
+
+The font file is included unmodified. The license applies to the font
+itself; muxterm merely embeds it (aggregation).

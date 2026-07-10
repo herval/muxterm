@@ -1991,7 +1991,10 @@ impl eframe::App for App {
                             ui.painter().rect_stroke(
                                 ring,
                                 CornerRadius::same(2),
-                                Stroke::new(1.0, self.ui_theme.accent),
+                                Stroke::new(
+                                    self.ui_theme.border_width,
+                                    self.ui_theme.accent,
+                                ),
                                 StrokeKind::Inside,
                             );
                         }
@@ -2294,10 +2297,35 @@ fn draw_ai_overlay(
     }
 }
 
-/// The cmd+f search bar, a strip over the pane's top-right corner (the
-/// pane-title spot - it covers the badge and tmux's own copy-mode
-/// indicator, both redundant while searching). tmux draws the matches
-/// and moves the viewport; this is only the query line and counter.
+/// Place a HUD box of `size` in the pane corner the theme picked, inset
+/// 4pt. Returns the rect plus the horizontal growth direction toward the
+/// pane's center (+1.0 rightward, -1.0 leftward) for stacking chips.
+fn hud_anchor(
+    pane_rect: Rect,
+    size: Vec2,
+    corner: theme::Corner,
+) -> (Rect, f32) {
+    use theme::Corner::*;
+    let x = match corner {
+        TopLeft | BottomLeft => pane_rect.min.x + 4.0,
+        TopRight | BottomRight => pane_rect.max.x - size.x - 4.0,
+    };
+    let y = match corner {
+        TopLeft | TopRight => pane_rect.min.y + 4.0,
+        BottomLeft | BottomRight => pane_rect.max.y - size.y - 4.0,
+    };
+    let dir = match corner {
+        TopLeft | BottomLeft => 1.0,
+        TopRight | BottomRight => -1.0,
+    };
+    (Rect::from_min_size(egui::pos2(x, y), size), dir)
+}
+
+/// The cmd+f search bar, a strip over the theme's HUD corner (the
+/// pane-title spot - it covers the badge and, top-right, tmux's own
+/// copy-mode indicator, both redundant while searching). tmux draws the
+/// matches and moves the viewport; this is only the query line and
+/// counter.
 fn draw_search_bar(
     ui: &egui::Ui,
     pane_rect: Rect,
@@ -2319,9 +2347,10 @@ fn draw_search_bar(
         return;
     }
     let pad = Vec2::new(8.0, 3.0);
-    let rect = Rect::from_min_size(
-        egui::pos2(pane_rect.max.x - width - 4.0, pane_rect.min.y + 4.0),
+    let (rect, _) = hud_anchor(
+        pane_rect,
         Vec2::new(width, row_h + pad.y * 2.0),
+        theme.hud_corner,
     );
     painter.rect_filled(
         rect,
@@ -2409,10 +2438,10 @@ fn draw_search_bar(
     );
 }
 
-/// Small badge naming what a pane runs, drawn over its top-right corner,
-/// plus the pane's git-branch and PR chips growing leftward from it when
-/// those features are on. Only split tabs get badges; a lone pane's title
-/// is already in the tab bar.
+/// Small badge naming what a pane runs, drawn over the theme's HUD
+/// corner, plus the pane's git-branch and PR chips growing toward the
+/// pane's center when those features are on. Only split tabs get badges;
+/// a lone pane's title is already in the tab bar.
 #[allow(clippy::too_many_arguments)]
 fn draw_pane_title(
     ui: &egui::Ui,
@@ -2447,10 +2476,7 @@ fn draw_pane_title(
     }
     let pad = Vec2::new(6.0, 2.0);
     let size = galley.size() + pad * 2.0;
-    let rect = Rect::from_min_size(
-        egui::pos2(pane_rect.max.x - size.x - 4.0, pane_rect.min.y + 4.0),
-        size,
-    );
+    let (rect, dir) = hud_anchor(pane_rect, size, theme.hud_corner);
     // Translucent theme background: readable over any terminal content
     // without fully hiding what's underneath.
     painter.rect_filled(
@@ -2460,16 +2486,23 @@ fn draw_pane_title(
     );
     painter.galley(rect.min + pad, galley, color);
 
-    // Chips grow leftward from the title box; `left` tracks the current
-    // leftmost drawn edge, and a chip that would spill past the pane's left
-    // edge is dropped rather than clipped. PR sits nearest the title, the
-    // git chip beyond it (same left-to-right order as the tab bar).
-    let mut left = rect.min.x;
-    let chip_rect = |galley_size: Vec2, left: f32| {
-        Rect::from_min_size(
-            egui::pos2(left - galley_size.x - pad.x * 2.0 - 4.0, pane_rect.min.y + 4.0),
-            galley_size + pad * 2.0,
-        )
+    // Chips stack from the title box toward the pane's center; `edge`
+    // tracks the last drawn edge on that side, and a chip that would
+    // spill past either pane edge is dropped rather than clipped. PR sits
+    // nearest the title, the git chip beyond it.
+    let mut edge = if dir < 0.0 { rect.min.x } else { rect.max.x };
+    let chip_rect = |galley_size: Vec2, edge: f32| {
+        let size = galley_size + pad * 2.0;
+        let x = if dir < 0.0 {
+            edge - size.x - 4.0
+        } else {
+            edge + 4.0
+        };
+        Rect::from_min_size(egui::pos2(x, rect.min.y), size)
+    };
+    let fits = |chip: &Rect| {
+        chip.min.x >= pane_rect.min.x + 4.0
+            && chip.max.x <= pane_rect.max.x - 4.0
     };
 
     if let Some(b) = pr {
@@ -2485,8 +2518,8 @@ fn draw_pane_title(
             TextFormat::simple(font.clone(), color),
         );
         let galley = ui.fonts(|f| f.layout_job(job));
-        let chip = chip_rect(galley.size(), left);
-        if chip.min.x >= pane_rect.min.x + 4.0 {
+        let chip = chip_rect(galley.size(), edge);
+        if fits(&chip) {
             painter.rect_filled(
                 chip,
                 CornerRadius::same(3),
@@ -2500,14 +2533,14 @@ fn draw_pane_title(
             if resp.clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(&b.url));
             }
-            left = chip.min.x;
+            edge = if dir < 0.0 { chip.min.x } else { chip.max.x };
         }
     }
 
     if let Some(g) = git {
         let galley = ui.fonts(|f| f.layout_job(g.chip_job(font, color, theme)));
-        let chip = chip_rect(galley.size(), left);
-        if chip.min.x >= pane_rect.min.x + 4.0 {
+        let chip = chip_rect(galley.size(), edge);
+        if fits(&chip) {
             painter.rect_filled(
                 chip,
                 CornerRadius::same(3),
@@ -2810,5 +2843,31 @@ mod tests {
         assert_eq!(step_visible_target(&visible, 1, -1), Some(3));
         // Nothing visible.
         assert_eq!(step_visible_target(&[], 0, 1), None);
+    }
+
+    #[test]
+    fn hud_anchor_places_every_corner_inset_and_growing_inward() {
+        let pane = Rect::from_min_max(
+            egui::pos2(100.0, 200.0),
+            egui::pos2(300.0, 400.0),
+        );
+        let size = Vec2::new(50.0, 20.0);
+        use crate::theme::Corner::*;
+        let (r, dir) = hud_anchor(pane, size, TopRight);
+        assert_eq!(r.min, egui::pos2(246.0, 204.0));
+        assert_eq!(dir, -1.0);
+        let (r, dir) = hud_anchor(pane, size, TopLeft);
+        assert_eq!(r.min, egui::pos2(104.0, 204.0));
+        assert_eq!(dir, 1.0);
+        let (r, dir) = hud_anchor(pane, size, BottomRight);
+        assert_eq!(r.min, egui::pos2(246.0, 376.0));
+        assert_eq!(dir, -1.0);
+        let (r, dir) = hud_anchor(pane, size, BottomLeft);
+        assert_eq!(r.min, egui::pos2(104.0, 376.0));
+        assert_eq!(dir, 1.0);
+        for corner in [TopLeft, TopRight, BottomLeft, BottomRight] {
+            let (r, _) = hud_anchor(pane, size, corner);
+            assert!(pane.contains_rect(r), "{corner:?} spills the pane");
+        }
     }
 }

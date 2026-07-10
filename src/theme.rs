@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use egui::Color32;
 use egui_term::{ColorPalette, TerminalTheme};
 
-/// Chrome colors derived from the terminal palette (plus overrides).
+/// Chrome look derived from the terminal palette (plus overrides).
 #[derive(Clone, Debug)]
 pub struct UiTheme {
     pub bg: Color32,
@@ -14,6 +14,10 @@ pub struct UiTheme {
     pub text: Color32,
     pub text_dim: Color32,
     pub accent: Color32,
+    /// Focused-pane border stroke width in points (color: `accent`).
+    pub border_width: f32,
+    /// Pane corner the title badge, status chips, and search bar anchor to.
+    pub hud_corner: Corner,
     /// Translucent wash painted over unfocused panes (bg at some alpha).
     pub dim_overlay: Color32,
     /// Heavier wash over every pane of a peeked *archived* workspace, marking
@@ -28,24 +32,68 @@ pub struct UiTheme {
     pub status_merged: Color32,
 }
 
+/// Where a preset's font bytes come from.
+#[derive(Clone, Copy, Debug)]
+pub enum FontSource {
+    /// An absolute path into the macOS font folders, resolved like the
+    /// `[font] family` override.
+    System(&'static str),
+    /// A face compiled into the binary.
+    Builtin(&'static [u8]),
+}
+
+/// A preset's monospace face and the point size the theme was designed
+/// around. `[font] family` / `[font] size` each override their half.
+#[derive(Clone, Copy, Debug)]
+pub struct FontSpec {
+    /// Short human name for the settings theme row ("Monaco", "VGA 8x16").
+    pub label: &'static str,
+    pub source: FontSource,
+    pub size: f32,
+}
+
+/// Which pane corner the title badge, status chips, and search bar
+/// anchor to. Bottom corners are supported but sit over the prompt line,
+/// so preset defaults stay on top. Only TopRight is used by the built-in
+/// presets today; the other variants are the knob future looks turn.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
 pub struct Preset {
     pub bg: &'static str,
     pub fg: &'static str,
     pub accent: &'static str,
     /// black, red, green, yellow, blue, magenta, cyan, white, then brights.
     pub ansi: [&'static str; 16],
+    /// The theme's monospace face; part of the look, like the palette.
+    pub font: FontSpec,
+    /// Focused-pane border stroke width in points (color stays `accent`).
+    pub border_width: f32,
+    /// Pane corner for the title badge + chips + search bar.
+    pub hud_corner: Corner,
 }
 
-pub const PRESET_NAMES: &[&str] = &[
-    "iterm-dark",
-    "dracula",
-    "solarized-dark",
-    "gruvbox-dark",
-    "bbs",
-    "iterm-light",
-    "solarized-light",
-    "github-light",
-];
+/// Px437 IBM VGA 8x16 from the Ultimate Oldschool PC Font Pack
+/// (int10h.org, CC BY-SA 4.0 — see assets/fonts/LICENSE.txt). At 16pt on
+/// a 2x display each glyph lands on exactly 2x the native 8x16 bitmap
+/// grid, so the pixels stay crisp.
+const PX437_VGA: &[u8] =
+    include_bytes!("../assets/fonts/Px437_IBM_VGA_8x16.ttf");
+
+const MONACO: FontSpec = FontSpec {
+    label: "Monaco",
+    source: FontSource::System("/System/Library/Fonts/Monaco.ttf"),
+    size: 12.0,
+};
+
+pub const PRESET_NAMES: &[&str] =
+    &["iterm-dark", "bbs", "iterm-light", "github-light"];
 
 pub fn preset(name: &str) -> Option<&'static Preset> {
     match name {
@@ -59,39 +107,9 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 "#5ffa68", "#fffc67", "#6871ff", "#ff77ff", "#60fdff",
                 "#ffffff",
             ],
-        }),
-        "dracula" => Some(&Preset {
-            bg: "#282a36",
-            fg: "#f8f8f2",
-            accent: "#bd93f9",
-            ansi: [
-                "#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9",
-                "#ff79c6", "#8be9fd", "#f8f8f2", "#6272a4", "#ff6e6e",
-                "#69ff94", "#ffffa5", "#d6acff", "#ff92df", "#a4ffff",
-                "#ffffff",
-            ],
-        }),
-        "solarized-dark" => Some(&Preset {
-            bg: "#002b36",
-            fg: "#839496",
-            accent: "#268bd2",
-            ansi: [
-                "#073642", "#dc322f", "#859900", "#b58900", "#268bd2",
-                "#d33682", "#2aa198", "#eee8d5", "#002b36", "#cb4b16",
-                "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1",
-                "#fdf6e3",
-            ],
-        }),
-        "gruvbox-dark" => Some(&Preset {
-            bg: "#282828",
-            fg: "#ebdbb2",
-            accent: "#83a598",
-            ansi: [
-                "#282828", "#cc241d", "#98971a", "#d79921", "#458588",
-                "#b16286", "#689d6a", "#a89984", "#928374", "#fb4934",
-                "#b8bb26", "#fabd2f", "#83a598", "#d3869b", "#8ec07c",
-                "#ebdbb2",
-            ],
+            font: MONACO,
+            border_width: 1.0,
+            hud_corner: Corner::TopRight,
         }),
         // The DOS/VGA text-mode 16-color palette on a pure-black CRT
         // screen — the colors BBS ANSI art was drawn with — but with the
@@ -113,6 +131,14 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 "#55ff55", "#ffff55", "#6f8fff", "#ff55ff", "#55ffff",
                 "#ffffff",
             ],
+            font: FontSpec {
+                label: "VGA 8x16",
+                source: FontSource::Builtin(PX437_VGA),
+                size: 16.0,
+            },
+            // A retro slab of a frame, like a DOS double-line box border.
+            border_width: 3.0,
+            hud_corner: Corner::TopRight,
         }),
         "iterm-light" => Some(&Preset {
             bg: "#ffffff",
@@ -124,17 +150,9 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 "#00b310", "#8f7500", "#4a63e0", "#c540c2", "#00a3a3",
                 "#f2f2f2",
             ],
-        }),
-        "solarized-light" => Some(&Preset {
-            bg: "#fdf6e3",
-            fg: "#657b83",
-            accent: "#268bd2",
-            ansi: [
-                "#073642", "#dc322f", "#859900", "#b58900", "#268bd2",
-                "#d33682", "#2aa198", "#eee8d5", "#002b36", "#cb4b16",
-                "#586e75", "#657b83", "#839496", "#6c71c4", "#93a1a1",
-                "#fdf6e3",
-            ],
+            font: MONACO,
+            border_width: 1.0,
+            hud_corner: Corner::TopRight,
         }),
         "github-light" => Some(&Preset {
             bg: "#ffffff",
@@ -146,6 +164,17 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 "#1a7f37", "#bf8700", "#218bff", "#a475f9", "#3192aa",
                 "#8c959f",
             ],
+            // What github.com's font stack (ui-monospace) resolves to on
+            // macOS.
+            font: FontSpec {
+                label: "SF Mono",
+                source: FontSource::System(
+                    "/System/Library/Fonts/SFNSMono.ttf",
+                ),
+                size: 12.0,
+            },
+            border_width: 1.0,
+            hud_corner: Corner::TopRight,
         }),
         _ => None,
     }
@@ -279,6 +308,8 @@ pub fn build(
         ),
         text_dim: blend(fg, bg, 0.45),
         accent,
+        border_width: preset.border_width,
+        hud_corner: preset.hud_corner,
         // A wash of the background recedes inactive panes. The same alpha
         // reads far weaker on dark themes — a near-black pour barely touches
         // the sparse bright glyphs, while on a light bg it drops the
@@ -345,7 +376,30 @@ mod tests {
             for c in p.ansi {
                 assert!(parse_hex(c).is_some(), "{name} ansi {c}");
             }
+            assert!(
+                (6.0..=40.0).contains(&p.font.size),
+                "{name} font size"
+            );
+            assert!(!p.font.label.is_empty(), "{name} font label");
+            if let FontSource::Builtin(bytes) = p.font.source {
+                assert!(!bytes.is_empty(), "{name} builtin font empty");
+            }
+            assert!(
+                p.border_width > 0.0 && p.border_width <= 8.0,
+                "{name} border width"
+            );
         }
+    }
+
+    #[test]
+    fn build_carries_look_fields() {
+        let (_, ui) =
+            build(preset("iterm-dark").unwrap(), &HashMap::new(), 0.25);
+        assert_eq!(ui.border_width, 1.0);
+        assert_eq!(ui.hud_corner, Corner::TopRight);
+        let (_, ui) = build(preset("bbs").unwrap(), &HashMap::new(), 0.25);
+        assert_eq!(ui.border_width, 3.0);
+        assert_eq!(ui.hud_corner, Corner::TopRight);
     }
 
     #[test]

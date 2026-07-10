@@ -90,6 +90,7 @@ pub fn show(
 
             grid.divider(ui, "Font", th.accent);
             out.font_size = grid.font_row(ui, font.size);
+            grid.hint(ui, "overrides the theme's font size");
 
             grid.divider(ui, "Mouse", th.accent);
             let mark = if copy_on_select { "[x]" } else { "[ ]" };
@@ -326,9 +327,9 @@ impl Grid<'_> {
         );
     }
 
-    /// `> <swatches> name` - five palette swatches filled straight into
-    /// their cells, with a hairline around the strip so light swatches
-    /// survive light themes.
+    /// `> <swatches> name  font` - five palette swatches filled straight
+    /// into their cells, with a hairline around the strip so light
+    /// swatches survive light themes, and the theme's font trailing dim.
     fn theme_row(
         &self,
         ui: &mut egui::Ui,
@@ -344,7 +345,14 @@ impl Grid<'_> {
                 (marker.to_string(), self.th.accent),
                 // Cells 4..14 stay blank; the swatch strip paints there.
                 (" ".repeat(11), self.th.text),
-                (name.to_string(), color),
+                (format!("{name:<14}"), color),
+                (
+                    format!(
+                        "{} {:.0}",
+                        preset.font.label, preset.font.size
+                    ),
+                    self.th.text_dim,
+                ),
             ],
             true,
             selected,
@@ -499,8 +507,8 @@ mod tests {
         for clipped in &output.shapes {
             collect_texts(&clipped.shape, &mut texts);
         }
-        // Top + bottom + 7 section rules + 7 themes + 2 agents +
-        // 4 checkboxes + 5 hints, plus the seg-built rows in pieces.
+        // Top + bottom + 7 section rules + 4 themes + 2 agents +
+        // 4 checkboxes + 6 hints, plus the seg-built rows in pieces.
         assert!(
             texts.len() >= 20,
             "expected the panel's text runs, found {}",

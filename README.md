@@ -132,8 +132,10 @@ every few seconds; GitHub itself is asked at most once per minute per
 **edits apply live** while the app is running):
 
 ```toml
-theme = "iterm-dark"   # dracula | solarized-dark | gruvbox-dark | bbs |
-                       # iterm-light | solarized-light | github-light
+theme = "iterm-dark"   # bbs | iterm-light | github-light — each theme is a
+                       # full look: palette + font + pane-border weight
+                       # (Monaco for the iterms, IBM VGA 8x16 for bbs,
+                       # SF Mono for github-light)
 agent = "claude"       # "?" prompt agent: claude | codex
 agent_model = ""       # --model for "?" answers; empty = the agent's fast
                        # default (haiku / gpt-5.4-mini)
@@ -146,9 +148,9 @@ copy_on_select = true       # mouse selections copy to the clipboard as
 pr_status = true            # the branch's GitHub PR beside the tab title
                             # (status dot + number, click opens); needs gh
 
-[font]
+[font]                 # overrides the theme's font for every theme
 family = "Menlo"       # font name in the macOS font folders, or a file path
-size = 14.0
+size = 14.0            # delete both lines to get each theme's own font
 
 [colors]               # override any color of the chosen theme
 background = "#1d1e23"
@@ -157,7 +159,10 @@ bright_green = "#5ffa68"
 ```
 
 Tab bar, dividers, and pane-border chrome are derived from the palette
-automatically, so a theme change restyles the whole window.
+automatically, so a theme change restyles the whole window — font
+included. The bbs theme's IBM VGA font is Px437 from the
+[Ultimate Oldschool PC Font Pack](https://int10h.org/oldschool-pc-fonts/)
+by VileR (CC BY-SA 4.0; see `assets/fonts/LICENSE.txt`).
 
 ## Agent mesh
 

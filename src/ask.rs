@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(agent.id, "codex");
         assert_eq!(model.as_deref(), Some("gpt-5.5"));
 
-        let (agent, model) = parse_config("theme = \"dracula\"\n[font]\n");
+        let (agent, model) = parse_config("theme = \"bbs\"\n[font]\n");
         assert_eq!(agent.id, "claude");
         assert_eq!(model, None);
 
