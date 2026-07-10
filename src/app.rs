@@ -312,11 +312,11 @@ impl App {
         // cmd+clicked URLs/paths: relative paths resolve against this
         // pane's cwd, so the opener is tied to the session.
         let (tmux, opener_session) = (self.tmux.clone(), session.clone());
-        backend.set_link_opener(move |text| {
+        backend.set_link_opener(move |texts| {
             crate::links::spawn_open(
                 tmux.clone(),
                 opener_session.clone(),
-                text.to_string(),
+                texts.to_vec(),
             )
         });
         Ok(Pane {

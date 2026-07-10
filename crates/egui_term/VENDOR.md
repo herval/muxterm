@@ -167,3 +167,29 @@ tmux-backed design. Local patches:
   The regexes moved from alacritty's `RegexSearch` to the `regex` crate (the
   same patterns, `\u{..}` rewritten `\x{..}`; already in the lock tree). This
   subsumes the old single-row and native-`WRAPLINE` paths (both still tested).
+- **P20** (`src/backend/mod.rs`, `link_match_at`, `runs_of`,
+  `set_link_opener`): rejoin tokens a TUI hard-wrapped across rows. P19 only
+  stitches rows that are *visually* continuous (`WRAPLINE` or a full last
+  column); a TUI that wraps inside its own layout box - Claude Code breaks a
+  long path short of the right edge and indents the continuation - leaves
+  neither signal, and the wrap whitespace splits the token anyway. Now, when
+  the clicked non-whitespace run starts its logical line, the previous line's
+  trailing run may be its head; when it ends its line, the next line's
+  leading run may be its tail (chained through single-run middle lines,
+  capped at `JOIN_CAP` runs, whitespace between runs dropped). A run is only
+  taken as a continuation when it is *indented* - boxed TUIs indent the rows
+  they wrap onto, while flush-left runs are distinct items (a find/ls column
+  of paths must not glue, in the hover highlight or anywhere). The emitter's
+  wrap point is invisible, so every joining is a guess: `link_match_at` now
+  returns *candidate* texts - every sub-chain's match around the clicked
+  run, longest first, the plain unjoined match last - and the `link_opener`
+  callback takes `&[String]`. The app opener existence-checks candidates in
+  order, which is what discards bad guesses (prose gluing `src/app.rs` +
+  `and` falls back to `src/app.rs`); the no-opener fallback tries
+  `open::that` per candidate until one succeeds. URLs never match across a
+  guessed join (multi-run sub-chains are path-only): URLs open without an
+  existence check, and gluing the next line's word onto one would open a
+  wrong address - within a P19 logical line the text is genuinely
+  contiguous, so URLs still span real soft wraps. Hover highlights the best
+  candidate's span, which can overreach into the next line's first word for
+  prose; the same wart family as P10's `and/or` (highlights, opens nothing).

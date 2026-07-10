@@ -1,26 +1,37 @@
-//! cmd+click link opening (egui_term patch P10 hands us the matched text).
-//! URLs open as-is; path-shaped tokens are resolved against the pane's live
-//! cwd and only opened when they exist, which is also what filters the
-//! regex's false positives (`and/or` in prose resolves to nothing).
+//! cmd+click link opening (egui_term patches P10/P20 hand us the matched
+//! candidate texts, most complete first - P20 speculatively rejoins tokens
+//! a TUI hard-wrapped across rows, so a joined guess arrives ahead of its
+//! unjoined fallback). URLs open as-is; path-shaped tokens are resolved
+//! against the pane's live cwd and only opened when they exist, which is
+//! what filters both the regex's false positives (`and/or` in prose
+//! resolves to nothing) and bad wrap-join guesses (`src/app.rsand` loses
+//! to `src/app.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::tmux::TmuxCtl;
 
-/// The pane's link opener. Off the render thread: resolving a relative
-/// path shells out to tmux for the pane's cwd, and `open` itself can take
-/// tens of ms.
-pub fn spawn_open(tmux: TmuxCtl, session: String, text: String) {
+/// The pane's link opener: the first candidate that resolves wins. Off the
+/// render thread: resolving a relative path shells out to tmux for the
+/// pane's cwd, and `open` itself can take tens of ms.
+pub fn spawn_open(tmux: TmuxCtl, session: String, texts: Vec<String>) {
     std::thread::spawn(move || {
-        let target = if is_url(&text) {
-            Some(text)
-        } else {
-            let cwd = tmux.pane_current_path(&session);
-            let home = std::env::var("HOME").ok();
-            resolve_path(&text, cwd.as_deref(), home.as_deref())
-                .map(|p| p.display().to_string())
-        };
+        // One cwd fetch serves every candidate.
+        let cwd = texts
+            .iter()
+            .any(|t| !is_url(t))
+            .then(|| tmux.pane_current_path(&session))
+            .flatten();
+        let home = std::env::var("HOME").ok();
+        let target = texts.iter().find_map(|text| {
+            if is_url(text) {
+                Some(text.clone())
+            } else {
+                resolve_path(text, cwd.as_deref(), home.as_deref())
+                    .map(|p| p.display().to_string())
+            }
+        });
         if let Some(target) = target {
             // Every non-URL target is an absolute path (resolve_path
             // guarantees it), so it can't be mistaken for an `open` flag.
@@ -70,6 +81,25 @@ fn candidates(text: &str) -> Vec<String> {
     {
         if !cand.is_empty() && !out.iter().any(|c| c == cand) {
             out.push(cand.to_string());
+        }
+    }
+    // A bare-relative token can be prose glued to an absolute path - Claude
+    // Code prints `[image/private/tmp/x.png`, which the grid regex matches
+    // from `image` - so each bare form also tries from its first slash.
+    // After the literal forms (a real relative path resolves against the
+    // cwd first), and only for multi-segment tails: `usr/bin` in a tar
+    // listing must not open `/bin`.
+    let stripped: Vec<String> = out
+        .iter()
+        .filter(|c| !c.starts_with(['/', '~', '.']))
+        .filter_map(|c| {
+            let i = c.find('/')?;
+            c[i + 1..].contains('/').then(|| c[i..].to_string())
+        })
+        .collect();
+    for cand in stripped {
+        if !out.iter().any(|c| *c == cand) {
+            out.push(cand);
         }
     }
     out
@@ -144,6 +174,26 @@ mod tests {
         );
         assert_eq!(candidates("src/app.rs"), vec!["src/app.rs"]);
         assert_eq!(candidates("a/b."), vec!["a/b.", "a/b"]);
+    }
+
+    #[test]
+    fn glued_junk_strips_to_the_absolute_tail() {
+        assert_eq!(
+            candidates("image/private/tmp/x.png"),
+            vec!["image/private/tmp/x.png", "/private/tmp/x.png"]
+        );
+        // A single-segment tail stays put: `usr/bin` must not try `/bin`.
+        assert_eq!(candidates("usr/bin"), vec!["usr/bin"]);
+    }
+
+    #[test]
+    fn glued_absolute_paths_resolve() {
+        let dir = std::env::temp_dir().join("muxterm-links-glue-test");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a/x.png"), "x").unwrap();
+        let glued = format!("image{}", dir.join("a/x.png").display());
+        assert_eq!(resolve_path(&glued, None, None), Some(dir.join("a/x.png")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

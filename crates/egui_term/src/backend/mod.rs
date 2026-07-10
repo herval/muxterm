@@ -145,11 +145,13 @@ pub struct TerminalBackend {
     // muxterm patch P10: file paths are links too (iTerm's semantic
     // history). Kept separate from url_regex so URLs win when both match.
     pub path_regex: regex::Regex,
-    /// muxterm patch P10: where a cmd+clicked link's text goes. The app
-    /// decides what "open" means (resolve relative paths against the pane's
-    /// cwd, existence-check, pick an opener); without one, URLs and absolute
-    /// paths fall back to `open::that`.
-    link_opener: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    /// muxterm patch P10/P20: where a cmd+clicked link's candidate texts
+    /// go, most complete first (P20 rejoins tokens a TUI hard-wrapped, so a
+    /// guess and its unjoined fallback travel together). The app decides
+    /// what "open" means (resolve relative paths against the pane's cwd,
+    /// existence-check candidates in order, pick an opener); without one,
+    /// candidates fall back to `open::that` until one succeeds.
+    link_opener: Option<Box<dyn Fn(&[String]) + Send + Sync>>,
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
     notifier: Notifier,
@@ -353,7 +355,7 @@ impl TerminalBackend {
     /// muxterm patch P10: register the app's link opener (see the field).
     pub fn set_link_opener(
         &mut self,
-        opener: impl Fn(&str) + Send + Sync + 'static,
+        opener: impl Fn(&[String]) + Send + Sync + 'static,
     ) {
         self.link_opener = Some(Box::new(opener));
     }
@@ -388,14 +390,17 @@ impl TerminalBackend {
                 // from the live terminal instead of trusting the last hover
                 // (which may be stale or unset if the mouse never moved),
                 // and never panic on a failed open.
-                let text =
+                let texts =
                     link_match_at(terminal, point, &self.url_regex, &self.path_regex)
-                        .map(|(text, _)| text);
-                if let Some(text) = text {
+                        .map(|(texts, _)| texts);
+                if let Some(texts) = texts {
                     match &self.link_opener {
-                        Some(opener) => opener(&text),
+                        Some(opener) => opener(&texts),
                         None => {
-                            let _ = open::that(text);
+                            // No app opener means no cwd to existence-check
+                            // against; walk the candidates until one opens.
+                            let _ =
+                                texts.iter().find(|t| open::that(t).is_ok());
                         },
                     }
                 }
@@ -670,34 +675,167 @@ fn logical_line<T: EventListener>(
     (text, points)
 }
 
-/// muxterm patch P10/P19: the link under a grid point - its text and grid
-/// span - URLs winning over paths (every URL tail is also a path-shaped
-/// token). Reconstructs the clicked point's logical line and matches on it,
-/// so multi-row (soft-wrapped) links resolve whole.
+/// muxterm patch P20: cap on how many whitespace-delimited runs a guessed
+/// wrap join may chain together (a path rarely spans more than three rows).
+const JOIN_CAP: usize = 6;
+
+/// muxterm patch P20: the [start, end) char spans of the maximal
+/// non-whitespace runs of `chars`.
+fn runs_of(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (i, c) in chars.iter().enumerate() {
+        match (start, c.is_whitespace()) {
+            (None, false) => start = Some(i),
+            (Some(s), true) => {
+                runs.push((s, i));
+                start = None;
+            },
+            _ => {},
+        }
+    }
+    if let Some(s) = start {
+        runs.push((s, chars.len()));
+    }
+    runs
+}
+
+/// muxterm patch P10/P19/P20: the link candidates under a grid point -
+/// their texts ordered most-complete-first plus the grid span of the best
+/// one - URLs winning over paths (every URL tail is also a path-shaped
+/// token). Matches run over the clicked point's reconstructed logical line,
+/// so soft-wrapped links resolve whole (P19). A TUI that hard-wraps a long
+/// token at its own layout edge (Claude Code indents the continuation, so
+/// the rows are not visually continuous and the wrap whitespace splits the
+/// token) is handled speculatively (P20): a clicked run that starts its
+/// line may continue the previous line's trailing run, one that ends its
+/// line may continue onto the next line's leading run - but a run is only
+/// taken as a continuation when it is indented, which is what separates a
+/// wrapped box (TUIs indent continuation rows) from a flush-left column of
+/// distinct paths. The emitter's wrap point is invisible, so a joining
+/// that does happen is still a guess: each plausible one is a
+/// candidate, longest match first, the plain unjoined match last - the
+/// app-side opener existence-checks them in order, which is what filters
+/// bad guesses (prose gluing `src/app.rs` + `and` loses to `src/app.rs`).
+/// URLs never match across a guessed join: they open without an existence
+/// check, and gluing the next line's word onto a URL would open a wrong
+/// address. Within one logical line (P19) the text really is contiguous,
+/// so URLs still span soft wraps.
 fn link_match_at<T: EventListener>(
     term: &Term<T>,
     point: Point,
     url_regex: &regex::Regex,
     path_regex: &regex::Regex,
-) -> Option<(String, RangeInclusive<Point>)> {
-    let (text, points) = logical_line(term, point.line);
+) -> Option<(Vec<String>, RangeInclusive<Point>)> {
+    let (ltext, lpoints) = logical_line(term, point.line);
+    let lchars: Vec<char> = ltext.chars().collect();
     // Char index of the clicked cell within the reconstructed line.
-    let click = points.iter().position(|p| *p == point)?;
+    let click = lpoints.iter().position(|p| *p == point)?;
+    let runs = runs_of(&lchars);
+    let ci = runs.iter().position(|&(s, e)| (s..e).contains(&click))?;
 
-    let hit = |re: &regex::Regex| -> Option<(String, RangeInclusive<Point>)> {
-        for m in re.find_iter(&text) {
-            let start = text[..m.start()].chars().count();
-            let end = text[..m.end()].chars().count(); // exclusive
-            if (start..end).contains(&click) {
-                return Some((
-                    m.as_str().to_string(),
-                    points[start]..=points[end - 1],
-                ));
+    let run = |chars: &[char], points: &[Point], (s, e): (usize, usize)| {
+        (chars[s..e].iter().collect::<String>(), points[s..e].to_vec())
+    };
+
+    // The chain of runs the clicked token may span. Whitespace between
+    // runs is dropped: a join models the wrap gap (trailing pad + newline
+    // + continuation indent) that the emitter inserted mid-token.
+    let mut chain = vec![run(&lchars, &lpoints, runs[ci])];
+    let mut clicked = 0usize; // index of the clicked run within the chain
+    let click_in_run = click - runs[ci].0;
+
+    // A run only counts as a wrap *continuation* when it is indented: a
+    // boxed TUI indents the rows it wraps onto, while flush-left runs are
+    // separate items (a find/ls column of paths must not glue).
+
+    // Backward: an indented run that starts its line may continue the
+    // previous line's trailing run. Keep walking only through lines that
+    // are themselves a lone indented run (a pure middle segment); the
+    // head line ends the walk.
+    let mut continues = ci == 0 && runs[ci].0 > 0;
+    let mut top = lpoints[0].line;
+    while continues && chain.len() < JOIN_CAP && top > term.topmost_line() {
+        let (ptext, ppoints) = logical_line(term, top - 1i32);
+        let pchars: Vec<char> = ptext.chars().collect();
+        let pruns = runs_of(&pchars);
+        let Some(&last) = pruns.last() else { break };
+        top = ppoints[0].line;
+        chain.insert(0, run(&pchars, &ppoints, last));
+        clicked += 1;
+        continues = pruns.len() == 1 && last.0 > 0;
+    }
+
+    // Forward: a run that ends its line may wrap onto the next line's
+    // leading run, if that run is indented.
+    let mut continues = ci == runs.len() - 1;
+    let mut bottom = lpoints[lpoints.len() - 1].line;
+    while continues && chain.len() < JOIN_CAP && bottom < term.bottommost_line()
+    {
+        let (ntext, npoints) = logical_line(term, bottom + 1i32);
+        let nchars: Vec<char> = ntext.chars().collect();
+        let nruns = runs_of(&nchars);
+        let Some(&first) = nruns.first() else { break };
+        if first.0 == 0 {
+            break;
+        }
+        bottom = npoints[npoints.len() - 1].line;
+        chain.push(run(&nchars, &npoints, first));
+        continues = nruns.len() == 1;
+    }
+
+    // Every contiguous sub-chain around the clicked run is a candidate
+    // joining; a match must cover the clicked cell. Sub-chains that cross
+    // a guessed join match paths only (see above).
+    let mut cands: Vec<(String, RangeInclusive<Point>)> = Vec::new();
+    for i in 0..=clicked {
+        for j in clicked..chain.len() {
+            let text: String =
+                chain[i..=j].iter().map(|(t, _)| t.as_str()).collect();
+            let points: Vec<Point> = chain[i..=j]
+                .iter()
+                .flat_map(|(_, p)| p.iter().copied())
+                .collect();
+            let click_at = click_in_run
+                + chain[i..clicked]
+                    .iter()
+                    .map(|(t, _)| t.chars().count())
+                    .sum::<usize>();
+            let hit = |re: &regex::Regex| {
+                for m in re.find_iter(&text) {
+                    let start = text[..m.start()].chars().count();
+                    let end = text[..m.end()].chars().count(); // exclusive
+                    if (start..end).contains(&click_at) {
+                        return Some((
+                            m.as_str().to_string(),
+                            points[start]..=points[end - 1],
+                        ));
+                    }
+                }
+                None
+            };
+            let found = if i == j {
+                hit(url_regex).or_else(|| hit(path_regex))
+            } else {
+                hit(path_regex)
+            };
+            if let Some(cand) = found {
+                cands.push(cand);
             }
         }
-        None
-    };
-    hit(url_regex).or_else(|| hit(path_regex))
+    }
+
+    // Longest match first; hover shows the best candidate's span.
+    cands.sort_by_key(|(t, _)| std::cmp::Reverse(t.chars().count()));
+    let mut texts: Vec<String> = Vec::new();
+    let mut span = None;
+    for (text, s) in cands {
+        if !texts.contains(&text) {
+            span.get_or_insert(s);
+            texts.push(text);
+        }
+    }
+    Some((texts, span?))
 }
 
 pub struct RenderableContent {
@@ -743,8 +881,13 @@ mod tests {
     use super::*;
     use alacritty_terminal::term::test::mock_term;
 
-    /// The link text found when clicking (line, col) of `content`.
-    fn link_at(content: &str, line: i32, col: usize) -> Option<String> {
+    /// The link candidates found when clicking (line, col) of `content`,
+    /// most complete first (P20).
+    fn link_candidates(
+        content: &str,
+        line: i32,
+        col: usize,
+    ) -> Option<Vec<String>> {
         let term = mock_term(content);
         link_match_at(
             &term,
@@ -752,7 +895,12 @@ mod tests {
             &url_regex(),
             &path_regex(),
         )
-        .map(|(text, _)| text)
+        .map(|(texts, _)| texts)
+    }
+
+    /// The best link text found when clicking (line, col) of `content`.
+    fn link_at(content: &str, line: i32, col: usize) -> Option<String> {
+        link_candidates(content, line, col).map(|mut texts| texts.remove(0))
     }
 
     #[test]
@@ -837,5 +985,85 @@ mod tests {
         assert_eq!(link_at(content, 0, 5), whole);
         // ...and clicking the continuation on the second row.
         assert_eq!(link_at(content, 1, 1), whole);
+    }
+
+    // muxterm patch P20: Claude-Code-style hard wrap - the TUI broke a long
+    // path at its own layout edge and indented the continuation, so row 0
+    // stops short of the grid width (row 1 is longer) and no soft-wrap
+    // heuristic applies. The clicked run rejoins with the adjacent line's
+    // edge run; the unjoined run stays as the opener's fallback candidate.
+    #[test]
+    fn indent_wrapped_paths_join_across_lines() {
+        let content =
+            "a [img/tmp/deft-swan/fa76\r\n    db05/badges.png (21.6KB) x";
+        let joined = "img/tmp/deft-swan/fa76db05/badges.png";
+        // Clicking the head on row 0...
+        assert_eq!(
+            link_candidates(content, 0, 10),
+            Some(vec![joined.into(), "img/tmp/deft-swan/fa76".into()])
+        );
+        // ...and the tail on row 1.
+        assert_eq!(
+            link_candidates(content, 1, 6),
+            Some(vec![joined.into(), "db05/badges.png".into()])
+        );
+    }
+
+    // muxterm patch P20: a middle row that is a lone indented run chains
+    // both ways; alone it is not even path-shaped, so only joins make it
+    // clickable at all.
+    #[test]
+    fn paths_wrapped_across_three_lines_join_whole() {
+        let content =
+            "x /aa/bb-cc\r\n  dd-ee\r\n  ff/gg.png with trailing words";
+        assert_eq!(
+            link_candidates(content, 1, 4),
+            Some(vec![
+                "/aa/bb-ccdd-eeff/gg.png".into(),
+                "/aa/bb-ccdd-ee".into(),
+                "dd-eeff/gg.png".into(),
+            ])
+        );
+    }
+
+    // muxterm patch P20: joining is a guess, so indented prose that merely
+    // ends a line with a path keeps the plain match as a fallback - the
+    // app-side existence check is what makes `src/app.rsand` lose to
+    // `src/app.rs`.
+    #[test]
+    fn prose_wrap_keeps_the_unjoined_fallback() {
+        let content = "see src/app.rs\r\n  and some more words";
+        assert_eq!(
+            link_candidates(content, 0, 6),
+            Some(vec!["src/app.rsand".into(), "src/app.rs".into()])
+        );
+    }
+
+    // muxterm patch P20: only indented runs count as continuations - a
+    // flush-left column of paths (find/ls output) is distinct items, and
+    // each row must come back alone.
+    #[test]
+    fn flush_left_columns_do_not_glue() {
+        let content = "src/a.rs\r\nsrc/b.rs\r\nsomething-longer-here x";
+        assert_eq!(
+            link_candidates(content, 0, 3),
+            Some(vec!["src/a.rs".into()])
+        );
+        assert_eq!(
+            link_candidates(content, 1, 3),
+            Some(vec!["src/b.rs".into()])
+        );
+    }
+
+    // muxterm patch P20: URLs open without an existence check, so they must
+    // never glue across a guessed wrap - the plain URL stays the best
+    // candidate (any joined form may only be path-shaped, which the opener
+    // existence-checks and discards).
+    #[test]
+    fn urls_do_not_glue_across_a_guessed_wrap() {
+        let content = "go https://x.com/a\r\n  and some more words";
+        let cands = link_candidates(content, 0, 14).unwrap();
+        assert_eq!(cands[0], "https://x.com/a");
+        assert!(!cands.contains(&"https://x.com/aand".to_string()));
     }
 }
