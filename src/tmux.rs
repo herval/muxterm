@@ -468,6 +468,13 @@ impl TmuxCtl {
     }
 }
 
+/// The per-second pane snapshot, shared with the poller threads
+/// (pr_status/git_status): the GUI already pays one `list-panes -a` per
+/// tick for the sidebar dots and workspace-root sync, so the pollers read
+/// this instead of each spawning their own tmux query.
+pub type SharedPanes =
+    std::sync::Arc<std::sync::Mutex<HashMap<String, PaneSnap>>>;
+
 /// One row of the per-second `list-panes -a` snapshot: the foreground
 /// process, root pid, and cwd of a session's active pane.
 #[derive(Clone, Debug, PartialEq)]

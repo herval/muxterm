@@ -24,9 +24,10 @@ use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 pub type TerminalMode = TermMode;
 pub type PtyEvent = Event;
@@ -42,6 +43,30 @@ pub enum BackendCommand {
     ProcessLink(LinkAction, Point),
     MouseReport(MouseButton, Modifiers, Point, bool),
 }
+
+/// muxterm patch P21: how eagerly a pane's PTY output may wake the UI.
+/// The host app knows which panes are visible and whether the window is
+/// focused; it publishes that per pane via `set_repaint_policy`, and the
+/// PTY subscription thread reads it per event. Only flood-class events
+/// (`Wakeup` and friends) honor the policy - rare events stay immediate.
+/// Defaults to `Live`, so a host that never sets a policy keeps
+/// upstream's repaint-per-event behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RepaintPolicy {
+    /// Rendered with the window focused: repaint immediately per event.
+    Live = 0,
+    /// Rendered but the window is unfocused: coalesce output to ~4 Hz.
+    Throttled = 1,
+    /// Not rendered (a background tab): coalesce output to ~2 Hz.
+    Background = 2,
+}
+
+/// P21: coalesced wake cadence under each non-Live policy. egui keeps
+/// only the smallest pending `request_repaint_after`, so concurrent
+/// delayed wakes from many panes collapse into one frame.
+const THROTTLED_WAKE: Duration = Duration::from_millis(250);
+const BACKGROUND_WAKE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub enum MouseMode {
@@ -160,6 +185,17 @@ pub struct TerminalBackend {
     /// by `sync()`. While clear, frames reuse `last_content` instead of
     /// re-cloning the grid under the terminal lock.
     dirty: Arc<AtomicBool>,
+    /// muxterm patch P21: shared with the PTY subscription thread, which
+    /// picks immediate vs coalesced wakes from it per event.
+    repaint_policy: Arc<AtomicU8>,
+    /// muxterm patch P22: bumped by `sync()` whenever it consumes the
+    /// dirty flag - the one place fresh content enters `last_content` -
+    /// so it versions everything the renderer reads from there.
+    generation: u64,
+    /// muxterm patch P22: the last frame's built shapes, replayed by
+    /// `view::show` while its cache key still matches (see
+    /// `view::RenderCache`). Owned here so it dies with the pane.
+    pub(crate) render_cache: Option<crate::view::RenderCache>,
 }
 
 impl TerminalBackend {
@@ -214,6 +250,9 @@ impl TerminalBackend {
         let _pty_event_loop_thread = pty_event_loop.spawn();
         let dirty = Arc::new(AtomicBool::new(true));
         let thread_dirty = dirty.clone();
+        let repaint_policy =
+            Arc::new(AtomicU8::new(RepaintPolicy::Live as u8));
+        let thread_policy = repaint_policy.clone();
         let _pty_event_subscription = std::thread::Builder::new()
             .name(format!("pty_event_subscription_{}", id))
             .spawn(move || loop {
@@ -229,9 +268,38 @@ impl TerminalBackend {
                             break;
                         }
                         // Mark before waking the UI so the repaint that
-                        // follows can never observe a clean flag.
+                        // follows can never observe a clean flag - the
+                        // delayed wakes below included, they always fire
+                        // after this store.
                         thread_dirty.store(true, Ordering::Release);
-                        app_context.request_repaint();
+                        // muxterm patch P21: only flood-class events honor
+                        // the policy; every other event is rare and
+                        // latency-sensitive even when hidden (PtyWrite is
+                        // a blocked DA/DSR reply that only flushes inside
+                        // a frame, Exit/ChildExit tear the pane down, Bell
+                        // alerts, Title relabels, ClipboardStore is an
+                        // OSC 52 copy), so those wake the UI immediately.
+                        // A stale policy read can only misclassify a
+                        // delay, never lose an update: some wake is always
+                        // scheduled and dirty is already set.
+                        let gated = matches!(
+                            event,
+                            Event::Wakeup
+                                | Event::MouseCursorDirty
+                                | Event::CursorBlinkingChange
+                        );
+                        match thread_policy.load(Ordering::Acquire) {
+                            _ if !gated => app_context.request_repaint(),
+                            p if p == RepaintPolicy::Live as u8 => {
+                                app_context.request_repaint()
+                            },
+                            p if p == RepaintPolicy::Throttled as u8 => {
+                                app_context
+                                    .request_repaint_after(THROTTLED_WAKE)
+                            },
+                            _ => app_context
+                                .request_repaint_after(BACKGROUND_WAKE),
+                        }
                         if let Event::Exit = event {
                             break;
                         }
@@ -250,10 +318,36 @@ impl TerminalBackend {
             notifier,
             last_content: initial_content,
             dirty,
+            repaint_policy,
+            generation: 0,
+            render_cache: None,
         })
     }
 
+    /// muxterm patch P22: see the `generation` field.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// muxterm patch P21: publish how eagerly this pane's PTY output may
+    /// wake the UI. `&self` on purpose - the app sweeps every pane once
+    /// per frame, and the store is a single atomic.
+    pub fn set_repaint_policy(&self, policy: RepaintPolicy) {
+        self.repaint_policy.store(policy as u8, Ordering::Release);
+    }
+
     pub fn process_command(&mut self, cmd: BackendCommand) {
+        // muxterm patch P22: the view issues a Resize every frame and the
+        // no-op check reads only self.size - bail before taking the
+        // terminal lock so frames never contend with a streaming parser.
+        if let BackendCommand::Resize(layout_size, font_size) = &cmd {
+            if *layout_size == self.size.layout_size
+                && font_size.width == self.size.cell_width
+                && font_size.height == self.size.cell_height
+            {
+                return;
+            }
+        }
         let term = self.term.clone();
         let mut term = term.lock();
         match cmd {
@@ -332,6 +426,9 @@ impl TerminalBackend {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return &self.last_content;
         }
+        // muxterm patch P22: new content is about to land in last_content;
+        // version it for the render cache.
+        self.generation = self.generation.wrapping_add(1);
         let term = self.term.clone();
         let mut terminal = term.lock();
         let selectable_range = match &terminal.selection {

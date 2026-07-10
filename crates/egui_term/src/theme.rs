@@ -1,8 +1,9 @@
 use alacritty_terminal::vte::ansi::{self, NamedColor};
 use egui::Color32;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct ColorPalette {
     pub foreground: String,
     pub background: String,
@@ -73,23 +74,36 @@ impl Default for ColorPalette {
 pub struct TerminalTheme {
     palette: Box<ColorPalette>,
     ansi256_colors: HashMap<u8, Color32>,
+    /// muxterm patch P22: palette fingerprint for the render cache key.
+    /// Themes only change wholesale (the app rebuilds the theme on config
+    /// reload), so hashing once at construction is enough; the ansi256
+    /// table is derived from nothing and needs no hashing.
+    hash: u64,
 }
 
 impl Default for TerminalTheme {
     fn default() -> Self {
-        Self {
-            palette: Box::<ColorPalette>::default(),
-            ansi256_colors: TerminalTheme::get_ansi256_colors(),
-        }
+        Self::new(Box::default())
     }
 }
 
 impl TerminalTheme {
     pub fn new(palette: Box<ColorPalette>) -> Self {
+        let hash = {
+            let mut hasher = DefaultHasher::new();
+            palette.hash(&mut hasher);
+            hasher.finish()
+        };
         Self {
             palette,
             ansi256_colors: TerminalTheme::get_ansi256_colors(),
+            hash,
         }
+    }
+
+    /// muxterm patch P22: see `hash`.
+    pub fn cache_key(&self) -> u64 {
+        self.hash
     }
 
     fn get_ansi256_colors() -> HashMap<u8, Color32> {

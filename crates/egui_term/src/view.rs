@@ -1,7 +1,9 @@
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point as TerminalGridPoint;
 use alacritty_terminal::term::cell;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use std::ops::RangeInclusive;
 use egui::epaint::RectShape;
 use egui::{Color32, CornerRadius, FontId, Key};
 use egui::Modifiers;
@@ -13,7 +15,9 @@ use egui::{Id, PointerButton};
 
 use crate::backend::BackendCommand;
 use crate::backend::TerminalBackend;
-use crate::backend::{LinkAction, MouseButton, SelectionType};
+use crate::backend::{
+    LinkAction, MouseButton, RenderableContent, SelectionType,
+};
 use crate::bindings::Binding;
 use crate::bindings::{BindingAction, BindingsLayout, InputKind};
 use crate::font::TerminalFont;
@@ -338,7 +342,8 @@ impl<'a> TerminalView<'a> {
         layout: &Response,
         painter: &Painter,
     ) {
-        let content = self.backend.sync();
+        self.backend.sync();
+        let content = self.backend.last_content();
         let layout_min = layout.rect.min;
         let layout_max = layout.rect.max;
         // P17: glyphs, cursor, and hover underlines hang off this inset
@@ -348,6 +353,34 @@ impl<'a> TerminalView<'a> {
         let cell_height = content.terminal_size.cell_height;
         let cell_width = content.terminal_size.cell_width;
         let font_id = self.font.font_type();
+
+        // muxterm patch P22: when nothing the renderer reads has changed
+        // since the last frame, replay that frame's shapes instead of
+        // walking the grid and re-laying-out every galley. On a calm pane
+        // most frames are hits - heartbeat ticks, the sidebar pulse,
+        // another pane's output - and a replay is a Vec clone (galleys
+        // are Arc'd).
+        let hover = content
+            .hovered_hyperlink
+            .clone()
+            .filter(|r| r.contains(&state.current_mouse_position_on_grid));
+        let key = RenderCacheKey {
+            generation: self.backend.generation(),
+            rect: layout.rect,
+            font_id: font_id.clone(),
+            theme_hash: self.theme.cache_key(),
+            ppp_bits: layout.ctx.pixels_per_point().to_bits(),
+            hover,
+        };
+        let atlas_ratio = painter.fonts(|f| f.font_atlas_fill_ratio());
+        if let Some(cache) = &self.backend.render_cache {
+            if cache.key == key && atlas_ratio >= cache.atlas_ratio {
+                painter.extend(cache.shapes.clone());
+                self.emit_ime(layout, content, origin);
+                return;
+            }
+        }
+
         let global_bg =
             self.theme.get_color(Color::Named(NamedColor::Background));
         let is_app_cursor_mode =
@@ -474,18 +507,6 @@ impl<'a> TerminalView<'a> {
                     CornerRadius::default(),
                     cursor_color,
                 )));
-
-                // muxterm patch P6: ask the platform to enable IME while the
-                // terminal has focus, anchored at the cursor, so dead-key and
-                // input-method composition reaches us as Ime events at all.
-                if self.has_focus {
-                    layout.ctx.output_mut(|o| {
-                        o.ime = Some(egui::output::IMEOutput {
-                            rect: layout.rect,
-                            cursor_rect,
-                        });
-                    });
-                }
             }
 
             // Draw text content
@@ -547,10 +568,104 @@ impl<'a> TerminalView<'a> {
         flush_bg(&mut bg_run, &mut bg_shapes, cell_height);
         flush_text(&mut text_run, &mut text_shapes, painter, &font_id);
 
-        painter.extend(bg_shapes);
-        painter.extend(deco_shapes);
-        painter.extend(text_shapes);
+        // P22: one Vec in paint order (bg under deco under text) so next
+        // frame can replay it wholesale on a key match.
+        let mut shapes = bg_shapes;
+        shapes.append(&mut deco_shapes);
+        shapes.append(&mut text_shapes);
+        painter.extend(shapes.clone());
+        self.emit_ime(layout, content, origin);
+        self.backend.render_cache = Some(RenderCache {
+            key,
+            shapes,
+            atlas_ratio,
+        });
     }
+
+    /// muxterm patch P6/P22: emit the platform IME anchor at the cursor.
+    /// It is per-frame platform output, not a shape, so the render-cache
+    /// hit path must issue it too - without this, dead-key and CJK
+    /// composition dies the moment a pane's content goes static. Mirrors
+    /// the grid walk's cursor placement exactly: DECTCEM-visible and on
+    /// screen (a scrolled-back cursor sits below the viewport and gets no
+    /// anchor, just as the walk draws it no rect).
+    fn emit_ime(
+        &self,
+        layout: &Response,
+        content: &RenderableContent,
+        origin: Pos2,
+    ) {
+        if !self.has_focus
+            || !content.terminal_mode.contains(TermMode::SHOW_CURSOR)
+        {
+            return;
+        }
+        let point = content.grid.cursor.point;
+        let line_num = point.line.0 + content.grid.display_offset() as i32;
+        if line_num < 0
+            || line_num >= content.terminal_size.screen_lines() as i32
+        {
+            return;
+        }
+        let cell_width = content.terminal_size.cell_width;
+        let cell_height = content.terminal_size.cell_height;
+        let width = if content.cursor.flags.contains(cell::Flags::WIDE_CHAR)
+        {
+            cell_width * 2.0
+        } else {
+            cell_width
+        };
+        let cursor_rect = Rect::from_min_size(
+            Pos2::new(
+                origin.x + cell_width * point.column.0 as f32,
+                origin.y + cell_height * line_num as f32,
+            ),
+            Vec2::new(width, cell_height),
+        );
+        layout.ctx.output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                rect: layout.rect,
+                cursor_rect,
+            });
+        });
+    }
+}
+
+/// muxterm patch P22: the last frame's rendered shapes plus everything
+/// they were built from. `show()` replays `shapes` while `key` still
+/// matches and the font atlas is still the one the galleys were laid out
+/// against. Owned by the backend so it dies with the pane.
+pub(crate) struct RenderCache {
+    key: RenderCacheKey,
+    /// bg, deco, text shapes concatenated in paint order.
+    shapes: Vec<Shape>,
+    /// `Fonts::font_atlas_fill_ratio()` at build time. The ratio only
+    /// grows within one atlas lifetime; a decrease means egui recreated
+    /// the atlas (ppp change, set_fonts, or >0.8 fill) and every cached
+    /// galley holds UVs into dead texture space.
+    atlas_ratio: f32,
+}
+
+/// P22: every input `show()` reads that isn't already versioned by the
+/// backend's generation (grid, selection, cursor, mode, and size all are:
+/// they only change under the dirty flag `sync()` consumes). Focus is
+/// deliberately absent - it affects no shape, only the IME side effect,
+/// which `emit_ime` re-issues on hits.
+#[derive(PartialEq)]
+struct RenderCacheKey {
+    generation: u64,
+    /// Shape positions are absolute, so a moved pane can't replay.
+    rect: Rect,
+    font_id: FontId,
+    theme_hash: u64,
+    /// `pixels_per_point().to_bits()`: glyph layout rounds to physical
+    /// pixels (P12), so a ppp change lays out differently at equal pt.
+    ppp_bits: u32,
+    /// The hover underline actually drawn - the hovered range paints only
+    /// while the mouse sits inside it. In the key rather than the
+    /// generation because the P10 hover re-sync rewrites it on every
+    /// cmd-held frame without marking the backend dirty.
+    hover: Option<RangeInclusive<TerminalGridPoint>>,
 }
 
 /// A horizontal stretch of cells sharing one background color.

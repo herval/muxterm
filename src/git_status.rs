@@ -6,10 +6,12 @@
 //!
 //! Unlike the PR poller this is all local (`git status`), so it just ticks
 //! on a slow cadence with no network and no per-key TTL games; a clean tab
-//! costs one cheap subprocess per unique cwd every few seconds.
+//! costs one cheap subprocess per unique cwd every few seconds. Pane cwds
+//! come from the GUI's shared per-second snapshot (no tmux spawn here),
+//! and the tick stretches while the window is unfocused, like `pr_status`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -19,12 +21,14 @@ use std::time::Duration;
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat};
 
-use muxterm::mesh;
-
 use crate::theme::UiTheme;
+use crate::tmux;
 
-/// Local scan cadence (tmux cwds + `git status`; no network).
+/// Local scan cadence (pane cwds + `git status`; no network).
 const TICK: Duration = Duration::from_secs(5);
+/// While the window is unfocused nobody reads the chips: scan every Nth
+/// tick (30s), and pick a refocus back up within one tick.
+const UNFOCUSED_EVERY: u32 = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Git {
@@ -77,10 +81,12 @@ pub fn spawn(
     ctx: egui::Context,
     tx: Sender<HashMap<String, Git>>,
     enabled: Arc<AtomicBool>,
+    panes: tmux::SharedPanes,
+    focused: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("git-status".into())
-        .spawn(move || run(ctx, tx, enabled))
+        .spawn(move || run(ctx, tx, enabled, panes, focused))
         .expect("spawn git-status thread");
 }
 
@@ -88,11 +94,11 @@ fn run(
     ctx: egui::Context,
     tx: Sender<HashMap<String, Git>>,
     enabled: Arc<AtomicBool>,
+    panes: tmux::SharedPanes,
+    focused: Arc<AtomicBool>,
 ) {
-    let Ok(tmux) = mesh::find_tmux() else {
-        return; // the app itself can't run without tmux either
-    };
     let mut last_sent: Option<HashMap<String, Git>> = None;
+    let mut skipped = 0u32;
 
     loop {
         if !enabled.load(Ordering::Relaxed) {
@@ -105,14 +111,21 @@ fn run(
             continue;
         }
 
+        if !focused.load(Ordering::Relaxed) && skipped + 1 < UNFOCUSED_EVERY {
+            skipped += 1;
+            std::thread::sleep(TICK);
+            continue;
+        }
+        skipped = 0;
+
         // One `git status` per unique cwd, fanned back out to every pane
         // sharing it, so a tab full of panes in one checkout is one call.
-        let mut by_cwd: HashMap<String, Option<Git>> = HashMap::new();
+        let mut by_cwd: HashMap<PathBuf, Option<Git>> = HashMap::new();
         let mut snapshot: HashMap<String, Git> = HashMap::new();
-        for (session, cwd) in pane_cwds(&tmux) {
+        for (session, cwd) in pane_cwds(&panes) {
             let git = by_cwd
-                .entry(cwd.clone())
-                .or_insert_with(|| status(&cwd))
+                .entry(cwd)
+                .or_insert_with_key(|cwd| status(cwd))
                 .clone();
             if let Some(g) = git {
                 snapshot.insert(session, g);
@@ -130,34 +143,24 @@ fn run(
     }
 }
 
-fn pane_cwds(tmux: &Path) -> Vec<(String, String)> {
-    let out = Command::new(tmux)
-        .args([
-            "-L",
-            mesh::SOCKET,
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{pane_current_path}",
-        ])
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (session, cwd) = line.split_once('\t')?;
-            (!cwd.is_empty()).then(|| (session.to_string(), cwd.to_string()))
+/// session -> cwd pairs out of the app's shared per-second pane snapshot.
+/// Collected under a short lock so no subprocess ever runs while holding
+/// it (same as pr_status).
+fn pane_cwds(panes: &tmux::SharedPanes) -> Vec<(String, PathBuf)> {
+    let snap = panes.lock().unwrap();
+    snap.iter()
+        .filter_map(|(session, pane)| {
+            Some((session.clone(), pane.cwd.clone()?))
         })
         .collect()
 }
 
 /// `/usr/bin/git` is the macOS shim and always present (same as pr_status).
-fn status(cwd: &str) -> Option<Git> {
+fn status(cwd: &Path) -> Option<Git> {
     let out = Command::new("/usr/bin/git")
-        .args(["-C", cwd, "status", "--porcelain=v2", "--branch"])
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain=v2", "--branch"])
         .output()
         .ok()?;
     if !out.status.success() {

@@ -193,3 +193,45 @@ tmux-backed design. Local patches:
   contiguous, so URLs still span real soft wraps. Hover highlights the best
   candidate's span, which can overreach into the next line's first word for
   prose; the same wart family as P10's `and/or` (highlights, opens nothing).
+- **P21** (`src/backend/mod.rs`, `src/lib.rs`, pty event subscription
+  thread): visibility-aware repaint gating. Upstream requested an
+  unconditional `request_repaint()` per PTY event, so output on any pane -
+  a background tab, an unfocused window - forced full-window frames at an
+  uncapped rate. New `RepaintPolicy` (`Live`/`Throttled`/`Background`) on
+  an `Arc<AtomicU8>` shared with the subscription thread; the host app
+  publishes it per pane (`set_repaint_policy`, `&self`, one atomic store)
+  and the thread reads it per event. Flood-class events (`Wakeup`,
+  `MouseCursorDirty`, `CursorBlinkingChange`) honor the policy: immediate
+  under `Live`, else coalesced via `request_repaint_after` (250ms
+  throttled / 500ms background - egui keeps only the smallest pending
+  delay, and the call is thread-safe). Every other event (`PtyWrite` query
+  replies that a hidden program blocks on, `Exit`/`ChildExit`, `Bell`,
+  `Title`, OSC 52 clipboard, ...) repaints immediately regardless. The
+  dirty flag is still stored before any wake - delayed ones included - so
+  a repaint can never observe a clean flag; a stale policy read can only
+  misclassify one wake's delay (<=500ms, around a tab/focus flip), never
+  lose an update. Default `Live`: a host that never calls
+  `set_repaint_policy` keeps upstream behavior.
+- **P22** (`src/view.rs`, `src/backend/mod.rs`, `src/theme.rs`): render
+  cache. `show()` rebuilt every shape and re-laid-out every galley each
+  frame even when nothing changed, so cheap wakes (the app's heartbeat,
+  another pane's output) paid a full grid walk per visible pane.
+  `TerminalBackend` now carries a `generation` - bumped only when `sync()`
+  consumes the dirty flag, the one place fresh content enters
+  `last_content` - and a `render_cache` of the last frame's shapes, keyed
+  on (generation, pane rect, `FontId`, palette hash - precomputed in
+  `TerminalTheme::new`, ppp bits, effective hover = hovered range while
+  the mouse is inside it). On a hit the cached shapes are replayed onto
+  the painter (galleys are `Arc`'d, the clone is cheap) and the walk is
+  skipped. Focus is deliberately not in the key: it affects no shapes,
+  only the platform IME anchor (P6), which moved out of the grid walk
+  into `emit_ime` so both the hit and rebuild paths issue it every frame
+  - otherwise dead-key/CJK composition dies once a pane goes static.
+  Hover lives in the key rather than the generation because the P10
+  cmd-held hover re-sync rewrites it every frame without marking dirty.
+  Guard against egui recreating the font atlas (ppp change, `set_fonts`,
+  >0.8 fill - cached galleys would hold UVs into dead texture space):
+  `font_atlas_fill_ratio()` only grows within one atlas lifetime, so a
+  decrease invalidates. Also: the every-frame no-op `Resize` command now
+  bails before taking the terminal lock, so frames never contend with a
+  streaming parser.

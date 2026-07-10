@@ -4,13 +4,15 @@
 //! gh's JSON into a Badge is a pure function so it unit-tests on fixture
 //! strings, like the "?" prompt machine.
 //!
-//! Cost discipline: pane cwds and git branches are local subprocesses on a
-//! slow tick; the network (`gh pr view`) runs at most once per unique
-//! (repo, branch) per TTL, so a tab full of panes in one checkout costs
-//! one API call a minute.
+//! Cost discipline: pane cwds come from the GUI's shared per-second
+//! snapshot (no tmux spawn here), git branches are one local subprocess
+//! per unique cwd on a slow tick - stretched further while the window is
+//! unfocused and nobody reads the chips; the network (`gh pr view`) runs
+//! at most once per unique (repo, branch) per TTL, so a tab full of panes
+//! in one checkout costs one API call a minute.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -19,12 +21,14 @@ use std::time::{Duration, Instant};
 
 use egui::Color32;
 
-use muxterm::mesh;
-
 use crate::theme::UiTheme;
+use crate::tmux;
 
-/// Local scan cadence (tmux cwds + git branches; no network).
+/// Local scan cadence (pane cwds + git branches; no network).
 const LOCAL_TICK: Duration = Duration::from_secs(5);
+/// While the window is unfocused nobody reads the chips: scan every Nth
+/// tick (30s), and pick a refocus back up within one tick.
+const UNFOCUSED_EVERY: u32 = 6;
 /// Re-fetch cadence per (repo, branch) with a PR or none found.
 const FETCH_TTL: Duration = Duration::from_secs(60);
 /// Back-off after a gh failure (unauthenticated, offline, rate-limited).
@@ -68,10 +72,12 @@ pub fn spawn(
     ctx: egui::Context,
     tx: Sender<HashMap<String, Badge>>,
     enabled: Arc<AtomicBool>,
+    panes: tmux::SharedPanes,
+    focused: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("pr-status".into())
-        .spawn(move || run(ctx, tx, enabled))
+        .spawn(move || run(ctx, tx, enabled, panes, focused))
         .expect("spawn pr-status thread");
 }
 
@@ -94,15 +100,15 @@ fn run(
     ctx: egui::Context,
     tx: Sender<HashMap<String, Badge>>,
     enabled: Arc<AtomicBool>,
+    panes: tmux::SharedPanes,
+    focused: Arc<AtomicBool>,
 ) {
-    let Ok(tmux) = mesh::find_tmux() else {
-        return; // the app itself can't run without tmux either
-    };
     let mut gh: Option<PathBuf> = None;
     let mut warned_no_gh = false;
     let mut cache: HashMap<(String, String), (Instant, Fetched)> =
         HashMap::new();
     let mut last_sent: Option<HashMap<String, Badge>> = None;
+    let mut skipped = 0u32;
 
     loop {
         if !enabled.load(Ordering::Relaxed) {
@@ -115,6 +121,13 @@ fn run(
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
+
+        if !focused.load(Ordering::Relaxed) && skipped + 1 < UNFOCUSED_EVERY {
+            skipped += 1;
+            std::thread::sleep(LOCAL_TICK);
+            continue;
+        }
+        skipped = 0;
 
         if gh.is_none() {
             gh = find_gh();
@@ -129,10 +142,18 @@ fn run(
         }
         let gh_bin = gh.as_ref().unwrap();
 
-        // session -> (repo root, branch) for every pane in a checkout.
+        // session -> (repo root, branch) for every pane in a checkout; one
+        // `git rev-parse` per unique cwd, fanned back out to the sessions
+        // sharing it, so a tab of panes in one checkout is one subprocess.
         let mut keys: HashMap<String, (String, String)> = HashMap::new();
-        for (session, cwd) in pane_cwds(&tmux) {
-            if let Some(key) = repo_branch(&cwd) {
+        let mut by_cwd: HashMap<PathBuf, Option<(String, String)>> =
+            HashMap::new();
+        for (session, cwd) in pane_cwds(&panes) {
+            let key = by_cwd
+                .entry(cwd)
+                .or_insert_with_key(|cwd| repo_branch(cwd))
+                .clone();
+            if let Some(key) = key {
                 keys.insert(session, key);
             }
         }
@@ -186,36 +207,25 @@ fn find_gh() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn pane_cwds(tmux: &std::path::Path) -> Vec<(String, String)> {
-    let out = Command::new(tmux)
-        .args([
-            "-L",
-            mesh::SOCKET,
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{pane_current_path}",
-        ])
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (session, cwd) = line.split_once('\t')?;
-            (!cwd.is_empty())
-                .then(|| (session.to_string(), cwd.to_string()))
+/// session -> cwd pairs out of the app's shared per-second pane snapshot.
+/// Collected under a short lock so no subprocess ever runs while holding
+/// it.
+fn pane_cwds(panes: &tmux::SharedPanes) -> Vec<(String, PathBuf)> {
+    let snap = panes.lock().unwrap();
+    snap.iter()
+        .filter_map(|(session, pane)| {
+            Some((session.clone(), pane.cwd.clone()?))
         })
         .collect()
 }
 
 /// (repo root, branch) of a directory; None outside a work tree or on a
 /// detached HEAD. /usr/bin/git is the macOS shim and always present.
-fn repo_branch(cwd: &str) -> Option<(String, String)> {
+fn repo_branch(cwd: &Path) -> Option<(String, String)> {
     let out = Command::new("/usr/bin/git")
-        .args(["-C", cwd, "rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"])
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD"])
         .output()
         .ok()?;
     if !out.status.success() {

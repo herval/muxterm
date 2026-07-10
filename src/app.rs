@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -13,8 +13,8 @@ use egui::{
     StrokeKind, TextFormat, Vec2,
 };
 use egui_term::{
-    BackendCommand, FontSettings, PtyEvent, TerminalBackend, TerminalFont,
-    TerminalTheme, TerminalView,
+    BackendCommand, FontSettings, PtyEvent, RepaintPolicy, TerminalBackend,
+    TerminalFont, TerminalTheme, TerminalView,
 };
 
 use muxterm::agent::{self, Agent};
@@ -165,6 +165,15 @@ pub struct App {
     /// claimed directory the workspace doesn't reference yet, so the root
     /// sync must not read that as "the panes left".
     pending_worktrees: HashSet<String>,
+    /// (active tab, window focused) as last published to the panes' repaint
+    /// policies - see `sync_repaint_policies`.
+    policy_state: Option<(usize, bool)>,
+    /// The poll tick's pane snapshot, shared with the pr/git pollers so
+    /// they never spawn their own `tmux list-panes`.
+    pane_snap_shared: tmux::SharedPanes,
+    /// Window focus, shared with the pr/git pollers: they stretch their
+    /// scan cadence while nobody can read the chips.
+    focused_flag: Arc<AtomicBool>,
 }
 
 impl App {
@@ -186,12 +195,26 @@ impl App {
         }
 
         let (pty_tx, pty_rx) = mpsc::channel();
+        let pane_snap_shared: tmux::SharedPanes = Default::default();
+        let focused_flag = Arc::new(AtomicBool::new(true));
         let (pr_tx, pr_rx) = mpsc::channel();
         let pr_enabled = Arc::new(AtomicBool::new(style.pr_status));
-        pr_status::spawn(cc.egui_ctx.clone(), pr_tx, pr_enabled.clone());
+        pr_status::spawn(
+            cc.egui_ctx.clone(),
+            pr_tx,
+            pr_enabled.clone(),
+            pane_snap_shared.clone(),
+            focused_flag.clone(),
+        );
         let (git_tx, git_rx) = mpsc::channel();
         let git_enabled = Arc::new(AtomicBool::new(style.git_status));
-        git_status::spawn(cc.egui_ctx.clone(), git_tx, git_enabled.clone());
+        git_status::spawn(
+            cc.egui_ctx.clone(),
+            git_tx,
+            git_enabled.clone(),
+            pane_snap_shared.clone(),
+            focused_flag.clone(),
+        );
         let (title_tx, title_rx) = mpsc::channel();
         let (worktree_tx, worktree_rx) = mpsc::channel();
         let (bg_tx, bg_rx) = mpsc::channel();
@@ -255,6 +278,9 @@ impl App {
             worktree_tx,
             worktree_rx,
             pending_worktrees: HashSet::new(),
+            policy_state: None,
+            pane_snap_shared,
+            focused_flag,
         };
 
         // Wire the agents' lifecycle hooks to `mux agent-event` (the sidebar
@@ -691,6 +717,35 @@ impl App {
                 },
             }
             self.dirty = true;
+        }
+    }
+
+    /// Publish every pane's repaint eagerness (egui_term P21): the active
+    /// tab's panes repaint per output event while the window is focused,
+    /// coalesce to ~4 Hz while it isn't, and background tabs' panes to
+    /// ~2 Hz - enough for attention badges without a frame per chunk. Runs
+    /// at the *end* of update() so a tab switch applied this frame (key
+    /// actions apply after the CentralPanel drew) is already reflected; the
+    /// repaint requested on a change is what renders the newly active tab,
+    /// now that PTY events no longer flood frames to hide that gap.
+    fn sync_repaint_policies(&mut self, ctx: &egui::Context) {
+        let focused = ctx.input(|i| i.focused);
+        self.focused_flag.store(focused, Ordering::Relaxed);
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            let policy = if idx != self.active {
+                RepaintPolicy::Background
+            } else if focused {
+                RepaintPolicy::Live
+            } else {
+                RepaintPolicy::Throttled
+            };
+            for pane in tab.panes.values() {
+                pane.backend.set_repaint_policy(policy);
+            }
+        }
+        if self.policy_state != Some((self.active, focused)) {
+            self.policy_state = Some((self.active, focused));
+            ctx.request_repaint();
         }
     }
 
@@ -1708,6 +1763,7 @@ impl eframe::App for App {
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
             self.pane_snap = self.tmux.pane_snapshot();
+            *self.pane_snap_shared.lock().unwrap() = self.pane_snap.clone();
             // Hook-reported agent states, pruned against liveness: a session
             // whose foreground returned to a shell (or vanished) has no live
             // agent - it exited or was killed without firing its end hook.
@@ -2188,6 +2244,8 @@ impl eframe::App for App {
         for action in actions {
             self.apply_action(ctx, action);
         }
+
+        self.sync_repaint_policies(ctx);
 
         if self.dirty {
             self.save_state();
