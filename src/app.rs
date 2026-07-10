@@ -7,10 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use egui::text::LayoutJob;
 use egui::{
     CornerRadius, CursorIcon, FontId, Rect, RichText, Sense, Stroke,
-    StrokeKind, TextFormat, Vec2,
+    StrokeKind, Vec2,
 };
 use egui_term::{
     BackendCommand, FontSettings, PtyEvent, RepaintPolicy, TerminalBackend,
@@ -100,12 +99,16 @@ pub struct App {
     /// session -> registered agent (mesh registry, polled like the config).
     agents: HashMap<String, mesh::AgentInfo>,
     agents_mtime: Option<SystemTime>,
-    /// session -> GitHub PR badge (config `pr_status`), streamed in by the
-    /// pr_status poller thread; the atomic gates that thread live.
-    pr: HashMap<String, pr_status::Badge>,
-    pr_rx: Receiver<HashMap<String, pr_status::Badge>>,
+    /// session -> GitHub PR badges (config `pr_status`) - every PR the
+    /// session's checkout has touched - streamed in by the pr_status
+    /// poller thread; the atomic gates that thread live.
+    pr: HashMap<String, Vec<pr_status::Badge>>,
+    pr_rx: Receiver<HashMap<String, Vec<pr_status::Badge>>>,
     pr_enabled: Arc<AtomicBool>,
     pr_status: bool,
+    /// Chips right-clicked away, shared with the poller (which forgets
+    /// them) and used to filter snapshots it composed before it did.
+    pr_dismissed: pr_status::Dismissed,
     /// session -> git branch/dirty state (config `git_status`), streamed in
     /// by the git_status poller thread; the atomic gates that thread live.
     git: HashMap<String, git_status::Git>,
@@ -199,12 +202,15 @@ impl App {
         let focused_flag = Arc::new(AtomicBool::new(true));
         let (pr_tx, pr_rx) = mpsc::channel();
         let pr_enabled = Arc::new(AtomicBool::new(style.pr_status));
+        let pr_dismissed: pr_status::Dismissed =
+            Arc::new(Mutex::new(HashSet::new()));
         pr_status::spawn(
             cc.egui_ctx.clone(),
             pr_tx,
             pr_enabled.clone(),
             pane_snap_shared.clone(),
             focused_flag.clone(),
+            pr_dismissed.clone(),
         );
         let (git_tx, git_rx) = mpsc::channel();
         let git_enabled = Arc::new(AtomicBool::new(style.git_status));
@@ -257,6 +263,7 @@ impl App {
             pr_rx,
             pr_enabled,
             pr_status: style.pr_status,
+            pr_dismissed,
             git: HashMap::new(),
             git_rx,
             git_enabled,
@@ -1862,6 +1869,20 @@ impl eframe::App for App {
         }
         while let Ok(snapshot) = self.pr_rx.try_recv() {
             self.pr = snapshot;
+            // A chip dismissed after this snapshot was composed must not
+            // flicker back; the poller empties the set once its memory
+            // has forgotten the key (within a tick).
+            let dismissed = self.pr_dismissed.lock().unwrap();
+            if !dismissed.is_empty() {
+                for badges in self.pr.values_mut() {
+                    badges.retain(|b| {
+                        !dismissed
+                            .iter()
+                            .any(|(r, br)| *r == b.root && *br == b.branch)
+                    });
+                }
+                self.pr.retain(|_, badges| !badges.is_empty());
+            }
         }
         while let Ok(snapshot) = self.git_rx.try_recv() {
             self.git = snapshot;
@@ -2056,6 +2077,9 @@ impl eframe::App for App {
         }
 
         let mut ui_actions = Vec::new();
+        // PR chips right-clicked away this frame; applied after the panel
+        // closure (it holds the tab borrow).
+        let mut pr_dismiss: Vec<(String, String)> = Vec::new();
         // Panes sit flush against the sidebar, exactly like every other
         // edge - the focus ring insets itself where it lacks outside room,
         // the terminal grid carries its own left inset (egui_term), and the
@@ -2127,25 +2151,35 @@ impl eframe::App for App {
                                 StrokeKind::Inside,
                             );
                         }
-                        if self.pane_titles {
-                            for (id, rect) in &rects {
-                                let Some(pane) = tab.panes.get(id) else {
-                                    continue;
-                                };
-                                let label = tab_label(
+                    }
+                    if self.pane_titles {
+                        for (id, rect) in &rects {
+                            let Some(pane) = tab.panes.get(id) else {
+                                continue;
+                            };
+                            // A lone pane is the whole tab - no title
+                            // badge - but its PR/git chips still show.
+                            let label = if tab.panes.len() > 1 {
+                                tab_label(
                                     self.agents.get(&pane.session),
                                     &pane.title,
-                                );
-                                draw_pane_title(
-                                    ui,
-                                    *rect,
-                                    &label,
-                                    self.git.get(&pane.session),
-                                    self.pr.get(&pane.session),
-                                    *id,
-                                    *id == tab.focused,
-                                    &self.ui_theme,
-                                );
+                                )
+                            } else {
+                                String::new()
+                            };
+                            if let Some(key) = draw_pane_title(
+                                ui,
+                                *rect,
+                                &label,
+                                self.git.get(&pane.session),
+                                self.pr
+                                    .get(&pane.session)
+                                    .map_or(&[][..], Vec::as_slice),
+                                *id,
+                                *id == tab.focused,
+                                &self.ui_theme,
+                            ) {
+                                pr_dismiss.push(key);
                             }
                         }
                     }
@@ -2226,6 +2260,19 @@ impl eframe::App for App {
                     self.new_workspace = Some(form);
                 },
             }
+        }
+
+        // Dismissed chips vanish now (the poller's own snapshot lags a
+        // tick) and go to the poller, which forgets them durably.
+        if !pr_dismiss.is_empty() {
+            let mut dismissed = self.pr_dismissed.lock().unwrap();
+            for key in pr_dismiss {
+                for badges in self.pr.values_mut() {
+                    badges.retain(|b| b.root != key.0 || b.branch != key.1);
+                }
+                dismissed.insert(key);
+            }
+            self.pr.retain(|_, badges| !badges.is_empty());
         }
 
         for action in ui_actions {
@@ -2573,57 +2620,66 @@ fn draw_search_bar(
 /// corner, plus the pane's git-branch and PR chips growing toward the
 /// pane's center when those features are on. Only split tabs get badges;
 /// a lone pane's title is already in the tab bar.
+/// One pane's HUD-corner line: the title badge (split tabs only - `label`
+/// arrives empty on a lone pane, which gets chips without a title) and
+/// the PR/git chips beside it. Returns the (root, branch) of a PR chip
+/// right-clicked away, for the App to dismiss (a free function cannot
+/// reach the poller's shared set).
 #[allow(clippy::too_many_arguments)]
 fn draw_pane_title(
     ui: &egui::Ui,
     pane_rect: Rect,
     label: &str,
     git: Option<&git_status::Git>,
-    pr: Option<&pr_status::Badge>,
+    pr: &[pr_status::Badge],
     pane: PaneId,
     focused: bool,
     theme: &UiTheme,
-) {
-    if label.is_empty() {
-        return;
-    }
+) -> Option<(String, String)> {
     let font = FontId::proportional(11.0);
     let color = if focused { theme.text } else { theme.text_dim };
     let painter = ui.painter();
-    let mut galley =
-        painter.layout_no_wrap(label.to_string(), font.clone(), color);
     // Cap the badge at roughly half the pane so it never reads as
-    // terminal content; panes too narrow for even a few characters get
-    // no badge at all.
+    // terminal content; a pane too narrow for even a few characters gets
+    // no title, only chips.
     let max_w = pane_rect.width() * 0.5 - 12.0;
-    if galley.size().x > max_w {
-        let char_w = galley.size().x / label.chars().count().max(1) as f32;
-        let budget = (max_w / char_w) as usize;
-        if budget < 3 {
-            return;
+    let mut galley = (!label.is_empty()).then(|| {
+        painter.layout_no_wrap(label.to_string(), font.clone(), color)
+    });
+    if let Some(g) = &galley {
+        if g.size().x > max_w {
+            let char_w = g.size().x / label.chars().count().max(1) as f32;
+            let budget = (max_w / char_w) as usize;
+            galley = (budget >= 3).then(|| {
+                painter.layout_no_wrap(
+                    elide(label, budget),
+                    font.clone(),
+                    color,
+                )
+            });
         }
-        galley =
-            painter.layout_no_wrap(elide(label, budget), font.clone(), color);
     }
     let pad = Vec2::new(6.0, 2.0);
-    let size = galley.size() + pad * 2.0;
+    let size = galley.as_ref().map_or(Vec2::ZERO, |g| g.size() + pad * 2.0);
     let (rect, dir) = hud_anchor(pane_rect, size, theme.hud_corner);
-    // Translucent theme background: readable over any terminal content
-    // without fully hiding what's underneath.
-    painter.rect_filled(
-        rect,
-        CornerRadius::same(3),
-        theme.bg.gamma_multiply(0.8),
-    );
-    painter.galley(rect.min + pad, galley, color);
+    if let Some(galley) = galley {
+        // Translucent theme background: readable over any terminal content
+        // without fully hiding what's underneath.
+        painter.rect_filled(
+            rect,
+            CornerRadius::same(3),
+            theme.bg.gamma_multiply(0.8),
+        );
+        painter.galley(rect.min + pad, galley, color);
+    }
 
     // Chips stack from the title box toward the pane's center; `edge`
     // tracks the last drawn edge on that side, and a chip that would
-    // spill past either pane edge is dropped rather than clipped. PR sits
-    // nearest the title, the git chip beyond it.
+    // spill past either pane edge is dropped rather than clipped. PR
+    // chips sit nearest the title, the git chip beyond them.
     let mut edge = if dir < 0.0 { rect.min.x } else { rect.max.x };
-    let chip_rect = |galley_size: Vec2, edge: f32| {
-        let size = galley_size + pad * 2.0;
+    let chip_rect = |content: Vec2, edge: f32| {
+        let size = content + pad * 2.0;
         let x = if dir < 0.0 {
             edge - size.x - 4.0
         } else {
@@ -2636,36 +2692,62 @@ fn draw_pane_title(
             && chip.max.x <= pane_rect.max.x - 4.0
     };
 
-    if let Some(b) = pr {
-        let mut job = LayoutJob::default();
-        job.append(
-            "\u{25CF} ",
-            0.0,
-            TextFormat::simple(font.clone(), b.kind.color(theme)),
+    let mut dismissed = None;
+    // Newest PR nearest the title, so on overflow the oldest drop first
+    // (`break`, not per-chip skipping - a gap would misread as order).
+    for b in pr.iter().rev() {
+        let galley = painter.layout_no_wrap(
+            format!("#{}", b.number),
+            font.clone(),
+            color,
         );
-        job.append(
-            &format!("#{}", b.number),
-            0.0,
-            TextFormat::simple(font.clone(), color),
-        );
-        let galley = ui.fonts(|f| f.layout_job(job));
-        let chip = chip_rect(galley.size(), edge);
-        if fits(&chip) {
-            painter.rect_filled(
-                chip,
-                CornerRadius::same(3),
-                theme.bg.gamma_multiply(0.8),
-            );
-            painter.galley(chip.min + pad, galley, color);
-            let resp = ui
-                .interact(chip, ui.id().with(("pr-chip", pane)), Sense::click())
-                .on_hover_text(&b.detail)
-                .on_hover_cursor(CursorIcon::PointingHand);
-            if resp.clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(&b.url));
-            }
-            edge = if dir < 0.0 { chip.min.x } else { chip.max.x };
+        let icon_w = font.size;
+        let content = Vec2::new(icon_w + galley.size().x, galley.size().y);
+        let chip = chip_rect(content, edge);
+        if !fits(&chip) {
+            break;
         }
+        painter.rect_filled(
+            chip,
+            CornerRadius::same(3),
+            theme.bg.gamma_multiply(0.8),
+        );
+        b.kind.draw_icon(
+            painter,
+            egui::pos2(chip.min.x + pad.x + icon_w * 0.38, chip.center().y),
+            font.size,
+            theme,
+        );
+        painter.galley(chip.min + pad + Vec2::new(icon_w, 0.0), galley, color);
+        // A merged/closed chip can be right-clicked away - unless the
+        // pane still sits on its branch (the scan would just re-learn
+        // it next tick, so don't offer).
+        let done = matches!(
+            b.kind,
+            pr_status::Kind::Merged | pr_status::Kind::Neutral
+        );
+        let dismissable =
+            done && !git.is_some_and(|g| g.branch == b.branch);
+        let hover = if dismissable {
+            format!("{}\nright-click to dismiss", b.detail)
+        } else {
+            b.detail.clone()
+        };
+        let resp = ui
+            .interact(
+                chip,
+                ui.id().with(("pr-chip", pane, b.number)),
+                Sense::click(),
+            )
+            .on_hover_text(hover)
+            .on_hover_cursor(CursorIcon::PointingHand);
+        if resp.clicked() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(&b.url));
+        }
+        if dismissable && resp.secondary_clicked() {
+            dismissed = Some((b.root.clone(), b.branch.clone()));
+        }
+        edge = if dir < 0.0 { chip.min.x } else { chip.max.x };
     }
 
     if let Some(g) = git {
@@ -2682,6 +2764,7 @@ fn draw_pane_title(
                 .on_hover_text(&g.detail);
         }
     }
+    dismissed
 }
 
 /// Head-preserving elision: the interesting part of a badge (agent name,
@@ -2922,6 +3005,86 @@ mod tests {
             tab_label(Some(&agent(Some("reviewer"))), "zsh"),
             "● alice · reviewer"
         );
+    }
+
+    /// Every remembered PR paints its own chip, and a lone pane (empty
+    /// label) still gets the chips - just no title box.
+    #[test]
+    fn pane_hud_stacks_all_pr_chips() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let badge = |n: u64, kind| pr_status::Badge {
+            number: n,
+            url: format!("https://github.com/a/b/pull/{n}"),
+            kind,
+            detail: format!("#{n}"),
+            root: "/repo".into(),
+            branch: format!("feat-{n}"),
+        };
+        let badges = vec![
+            badge(4, pr_status::Kind::Merged),
+            badge(9, pr_status::Kind::Ok),
+        ];
+
+        fn collect(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            if let egui::Shape::Vec(v) = shape {
+                for s in v {
+                    collect(s, out);
+                }
+            } else {
+                out.push(shape.clone());
+            }
+        }
+
+        for (label, expect_title) in [("agent-pane", true), ("", false)] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_pane_title(
+                        ui,
+                        Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(880.0, 680.0),
+                        ),
+                        label,
+                        None,
+                        &badges,
+                        PaneId(1),
+                        true,
+                        &th,
+                    );
+                });
+            });
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            let texts: Vec<String> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            for number in ["#4", "#9"] {
+                assert!(
+                    texts.iter().any(|t| t == number),
+                    "chip {number} missing with label {label:?}: {texts:?}"
+                );
+            }
+            assert_eq!(
+                texts.iter().any(|t| t == "agent-pane"),
+                expect_title,
+                "title box wrong for label {label:?}: {texts:?}"
+            );
+        }
     }
 
     #[test]
