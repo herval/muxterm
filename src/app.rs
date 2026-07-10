@@ -117,6 +117,9 @@ pub struct App {
     notifications: bool,
     /// The workspace sidebar's visibility (cmd+\); persisted in state.json.
     sidebar_open: bool,
+    /// Whether the sidebar's archived pile is folded to its header (its
+    /// header click); persisted in state.json like the sidebar itself.
+    archived_collapsed: bool,
     /// The open workspace-creation popup (cmd+n), or None.
     new_workspace: Option<NewWorkspaceForm>,
     /// Folder the creation popup pre-fills - the last one a workspace used.
@@ -237,6 +240,7 @@ impl App {
             git_status: style.git_status,
             notifications: style.notifications,
             sidebar_open: true,
+            archived_collapsed: false,
             new_workspace: None,
             last_workspace_dir: None,
             title_tx,
@@ -260,6 +264,7 @@ impl App {
         match state::load() {
             LoadResult::Loaded(saved) => {
                 app.sidebar_open = saved.sidebar_open;
+                app.archived_collapsed = saved.archived_collapsed;
                 app.last_workspace_dir = saved.last_workspace_dir.clone();
                 let mut referenced = HashSet::new();
                 for window in &saved.windows {
@@ -1331,6 +1336,7 @@ impl App {
             version: state::VERSION,
             last_workspace_dir: self.last_workspace_dir.clone(),
             sidebar_open: self.sidebar_open,
+            archived_collapsed: self.archived_collapsed,
             windows: vec![WindowState {
                 active_tab: self.active,
                 tabs: self
@@ -1958,7 +1964,13 @@ impl eframe::App for App {
                     bt.cmp(&at)
                 },
             });
-            for action in sidebar::show(ctx, &rows, &self.font, &self.ui_theme) {
+            for action in sidebar::show(
+                ctx,
+                &rows,
+                self.archived_collapsed,
+                &self.font,
+                &self.ui_theme,
+            ) {
                 match action {
                     // A row body-click selects; for an archived row that is the
                     // peek (GotoTab just sets `active`, archived or not).
@@ -1970,6 +1982,12 @@ impl eframe::App for App {
                     },
                     SidebarAction::Unarchive(i) => {
                         actions.push(Action::Unarchive(i))
+                    },
+                    // Pure sidebar state, no keybinding: applied here rather
+                    // than through an Action.
+                    SidebarAction::ToggleArchived => {
+                        self.archived_collapsed = !self.archived_collapsed;
+                        self.dirty = true;
                     },
                     SidebarAction::NewWorkspace => {
                         actions.push(Action::NewWorkspace)

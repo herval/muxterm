@@ -20,6 +20,10 @@ pub struct StateFile {
     /// discoverable; toggled by cmd+\.
     #[serde(default = "default_true")]
     pub sidebar_open: bool,
+    /// Whether the sidebar's archived pile is folded to its header. Additive
+    /// with `#[serde(default)]` (expanded), so older state files load as-is.
+    #[serde(default)]
+    pub archived_collapsed: bool,
 }
 
 fn default_true() -> bool {
@@ -236,6 +240,7 @@ mod tests {
             version: VERSION,
             last_workspace_dir: Some("/tmp/proj".into()),
             sidebar_open: true,
+            archived_collapsed: false,
             windows: vec![WindowState {
                 active_tab: 1,
                 tabs: vec![
@@ -318,7 +323,8 @@ mod tests {
         assert_eq!(s.windows[0].tabs.len(), 1);
         assert!(s.windows[0].tabs[0].workspace.is_none());
         assert!(s.last_workspace_dir.is_none());
-        // Sidebar defaults on for discoverability.
+        // Sidebar defaults on for discoverability, archived pile expanded.
         assert!(s.sidebar_open);
+        assert!(!s.archived_collapsed);
     }
 }

@@ -22,6 +22,8 @@ pub enum SidebarAction {
     Archive(usize),
     /// Pull the tab at this index back out of the archived pile (restore icon).
     Unarchive(usize),
+    /// Collapse/expand the archived pile (its header click).
+    ToggleArchived,
     /// Open the creation popup (the header "+").
     NewWorkspace,
     /// Collapse the sidebar (the header "‹").
@@ -59,6 +61,7 @@ pub struct Row {
 pub fn show(
     ctx: &egui::Context,
     rows: &[Row],
+    archived_collapsed: bool,
     font: &FontId,
     t: &UiTheme,
 ) -> Vec<SidebarAction> {
@@ -114,23 +117,31 @@ pub fn show(
                         actions.push(a);
                     }
                 }
-                // Archived pile at the bottom, under a dim header. Rows arrive
-                // already ordered newest-first by the caller.
-                if rows.iter().any(|r| r.archived) {
+                // Archived pile at the bottom, under a dim header that
+                // clicks to collapse the pile (the App persists the fold).
+                // Rows arrive already ordered newest-first by the caller.
+                let archived = rows.iter().filter(|r| r.archived).count();
+                if archived > 0 {
                     ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("Archived")
-                            .font(head_font.clone())
-                            .color(t.text_dim),
-                    );
-                    ui.add_space(4.0);
-                    for row in rows.iter().filter(|r| r.archived) {
-                        let (resp, icon_clicked) =
-                            workspace_row(ui, row, font, t);
-                        if let Some(a) =
-                            row_action(resp.clicked(), icon_clicked, row)
-                        {
-                            actions.push(a);
+                    if archived_header(
+                        ui,
+                        archived,
+                        archived_collapsed,
+                        &head_font,
+                        t,
+                    ) {
+                        actions.push(SidebarAction::ToggleArchived);
+                    }
+                    if !archived_collapsed {
+                        ui.add_space(4.0);
+                        for row in rows.iter().filter(|r| r.archived) {
+                            let (resp, icon_clicked) =
+                                workspace_row(ui, row, font, t);
+                            if let Some(a) =
+                                row_action(resp.clicked(), icon_clicked, row)
+                            {
+                                actions.push(a);
+                            }
                         }
                     }
                 }
@@ -237,6 +248,58 @@ fn status_icon(
             );
         },
     }
+}
+
+/// The archived pile's clickable header: a disclosure triangle (down when
+/// open, right when folded) before the dim "Archived" label, with the hidden
+/// row count while folded. Painter-drawn triangle like `status_icon` - no
+/// font-glyph gambles across terminal fonts. Returns true on click.
+fn archived_header(
+    ui: &mut egui::Ui,
+    count: usize,
+    collapsed: bool,
+    font: &FontId,
+    t: &UiTheme,
+) -> bool {
+    let row_h = ui.fonts(|f| f.row_height(font));
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), row_h),
+        egui::Sense::click(),
+    );
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let color = if resp.hovered() { t.text } else { t.text_dim };
+
+    let r = font.size * 0.26;
+    let c = Pos2::new(rect.min.x + r, rect.center().y);
+    let triangle = if collapsed {
+        vec![
+            Pos2::new(c.x - r * 0.5, c.y - r),
+            Pos2::new(c.x - r * 0.5, c.y + r),
+            Pos2::new(c.x + r * 0.75, c.y),
+        ]
+    } else {
+        vec![
+            Pos2::new(c.x - r, c.y - r * 0.5),
+            Pos2::new(c.x + r, c.y - r * 0.5),
+            Pos2::new(c.x, c.y + r * 0.75),
+        ]
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(triangle, color, Stroke::NONE));
+
+    let label = if collapsed {
+        format!("Archived ({count})")
+    } else {
+        "Archived".to_string()
+    };
+    ui.painter().text(
+        Pos2::new(rect.min.x + font.size * 0.95, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font.clone(),
+        color,
+    );
+    resp.clicked()
 }
 
 fn icon_button(ui: &mut egui::Ui, glyph: &str, t: &UiTheme) -> egui::Response {
@@ -439,7 +502,7 @@ mod tests {
             ..Default::default()
         };
         let mut frame = |ctx: &egui::Context| {
-            let _ = show(ctx, &rows, &font, &th);
+            let _ = show(ctx, &rows, false, &font, &th);
         };
         let _ = ctx.run(input.clone(), &mut frame);
         let output = ctx.run(input, &mut frame);
@@ -480,6 +543,77 @@ mod tests {
         assert!(bang_dot, "blocked exclamation dot not painted");
     }
 
+    /// Folding the archived pile hides its rows but keeps the header, and
+    /// the header advertises how many rows are folded away; expanded, the
+    /// rows are back. Guards the collapse actually gating the render.
+    #[test]
+    fn archived_pile_folds_behind_its_header() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let rows = vec![
+            Row {
+                tab_index: 0,
+                title: "live-ws".into(),
+                subtitle: None,
+                active: true,
+                status: Status::Idle,
+                archived: false,
+            },
+            Row {
+                tab_index: 1,
+                title: "parked-ws".into(),
+                subtitle: None,
+                active: false,
+                status: Status::Idle,
+                archived: true,
+            },
+        ];
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let texts = |collapsed: bool| {
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(ctx, &rows, collapsed, &font, &th);
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let output = ctx.run(input.clone(), &mut frame);
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\u{1}")
+        };
+
+        let open = texts(false);
+        assert!(open.contains("parked-ws"), "expanded pile lost its row");
+        assert!(open.contains("Archived"), "expanded pile lost its header");
+
+        let folded = texts(true);
+        assert!(
+            !folded.contains("parked-ws"),
+            "collapsed pile still renders rows: {folded:?}"
+        );
+        assert!(
+            folded.contains("Archived (1)"),
+            "collapsed header lost the fold count: {folded:?}"
+        );
+        assert!(folded.contains("live-ws"), "collapse ate the active pile");
+    }
+
     /// The breathing pulse (working and background alike) schedules its own
     /// repaints, but throttled (at PULSE_FRAME, never every frame) and only
     /// while the window is focused. Guards the battery contract: agents work
@@ -502,7 +636,7 @@ mod tests {
                 archived: false,
             }];
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, &font, &th);
+                let _ = show(ctx, &rows, false, &font, &th);
             };
             let input = |focused: bool| egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
