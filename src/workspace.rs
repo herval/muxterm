@@ -331,6 +331,56 @@ pub fn repo_toplevel(path: &Path) -> Option<PathBuf> {
     (!top.is_empty()).then(|| PathBuf::from(top))
 }
 
+/// The `origin` remote URL of `path`'s repo, if any (`git remote get-url
+/// origin`). Same bare-`git` reasoning as `is_git_repo`.
+pub fn origin_url(path: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// The setup script a plain cmd+n worktree inherits from the saved
+/// projects, if an unambiguous one exists. A path project matches when its
+/// path equals the picked folder; a repo project when its repo and the
+/// folder's `origin` URL name the same repo (both funneled through
+/// `clone_url` then `clone_dirname`, so "owner/repo", the https URL and
+/// the scp-style remote all converge). All matches must carry the
+/// identical non-empty setup - disagreement or a setup-less match
+/// inherits nothing. Pure: the caller injects the origin URL, so tests
+/// never shell git.
+pub fn inherited_setup<'a>(
+    projects: &'a [Project],
+    root: &Path,
+    origin: Option<&str>,
+) -> Option<&'a str> {
+    let repo_key = |spelling: &str| {
+        clone_dirname(&clone_url(spelling)).to_ascii_lowercase()
+    };
+    let origin_key = origin.map(repo_key);
+    // The (Some, Some) shape is load-bearing: a repo-less project must not
+    // "match" a folder with no origin (None == None).
+    let matches = |p: &&Project| {
+        p.path.as_deref() == Some(root)
+            || match (&p.repo, &origin_key) {
+                (Some(repo), Some(key)) => repo_key(repo) == *key,
+                _ => false,
+            }
+    };
+    let mut matched = projects.iter().filter(matches);
+    let setup = matched.next()?.setup.as_deref()?;
+    matched
+        .all(|p| p.setup.as_deref() == Some(setup))
+        .then_some(setup)
+}
+
 /// The workspace-root sync's decision: given where the sidebar says a
 /// workspace lives (`homes`: the root, plus the worktree when there is one)
 /// and where its panes actually are (`cwds`, focused pane first), is the
@@ -655,51 +705,85 @@ pub fn claim_worktree(root: &Path, choice: &BranchChoice) -> anyhow::Result<Work
     anyhow::bail!("no free worktree name for {base}")
 }
 
-/// Bring the base of a project-mode worktree up to date with its remote
-/// before the checkout, so "continue branch x" continues x's *pushed* work.
-/// Best-effort throughout - offline, no remote, a diverged branch: every
-/// step may fail and the checkout proceeds on local state.
-///
-/// - always: fetch the choice's remote (else origin).
-/// - `Existing`: fast-forward the local ref in place (`fetch <name>:<name>`
-///   moves a non-checked-out branch without touching any working tree; a
-///   checked-out or diverged branch just refuses).
-/// - `Track`: nothing more - the fetch refreshed the remote-tracking ref
-///   `--track -b` will base on.
-/// - `Codename`/`New`: only inside a muxterm-owned clone (always clean,
-///   nobody works in it), fast-forward the clone's checked-out branch so
-///   new branches base on the fresh default; a user repo's HEAD is never
-///   moved.
-fn refresh_base(root: &Path, choice: &BranchChoice) {
-    let remote = match choice {
-        BranchChoice::Track { remote, .. } => remote.as_str(),
-        _ => "origin",
-    };
-    let fetch = Command::new("git")
+/// How long a background fetch may hold up a checkout before it is killed
+/// and the checkout proceeds on local state.
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// One targeted `git fetch`, capped at FETCH_TIMEOUT so a hung remote
+/// degrades to "proceed on local state". GIT_TERMINAL_PROMPT=0 keeps a
+/// credential prompt from silently eating the whole budget.
+fn fetch(root: &Path, remote: &str, refspec: &str) -> bool {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
         .arg("-C")
         .arg(root)
-        .args(["fetch", "--prune", remote])
-        .output();
-    if !fetch.map(|o| o.status.success()).unwrap_or(false) {
-        return; // no remote / offline: nothing to be fresh against
+        .args(["fetch", remote, refspec]);
+    agent::output_with_timeout(&mut cmd, FETCH_TIMEOUT)
+        .ok()
+        .flatten()
+        .is_some_and(|o| o.status.success())
+}
+
+/// The repo's checked-out branch name, if HEAD is on one.
+fn head_branch(root: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty() && name != "HEAD").then_some(name)
+}
+
+/// Bring the base of a project-mode worktree up to date with its remote
+/// before the checkout, so "continue branch x" continues x's *pushed* work.
+/// Fetches only what the choice consumes, each under FETCH_TIMEOUT -
+/// best-effort throughout (offline, no remote, a hung ssh, a diverged
+/// branch: every step may fail or be killed and the checkout proceeds on
+/// local state). `progress` narrates the fetch when one actually happens.
+///
+/// - `Existing`: `fetch name:name` fast-forwards the local ref in place
+///   without touching any working tree (a checked-out or diverged branch
+///   just refuses).
+/// - `Track`: a bare `fetch <remote> <name>` refreshes the remote-tracking
+///   ref `--track -b` will base on.
+/// - `Codename`/`New`: only inside a muxterm-owned clone (always clean,
+///   nobody works in it), fetch the clone's checked-out branch and
+///   fast-forward it so new branches base on the fresh default; a user
+///   repo's HEAD is never moved - and never fetched, nothing would consume
+///   the refs.
+fn refresh_base(
+    root: &Path,
+    choice: &BranchChoice,
+    progress: impl Fn(String),
+) {
     match choice {
         BranchChoice::Existing(name) => {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["fetch", remote])
-                .arg(format!("{name}:{name}"))
-                .output();
+            progress(format!("fetching origin/{name}…"));
+            let _ = fetch(root, "origin", &format!("{name}:{name}"));
+        },
+        BranchChoice::Track { name, remote } => {
+            progress(format!("fetching {remote}/{name}…"));
+            let _ = fetch(root, remote, name);
         },
         BranchChoice::Codename | BranchChoice::New(_)
             if root.starts_with(state::clones_dir()) =>
         {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["merge", "--ff-only", "@{u}"])
-                .output();
+            let Some(branch) = head_branch(root) else {
+                return;
+            };
+            progress(format!("fetching origin/{branch}…"));
+            if fetch(root, "origin", &branch) {
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(root)
+                    .args(["merge", "--ff-only", "@{u}"])
+                    .output();
+            }
         },
         _ => {},
     }
@@ -736,9 +820,18 @@ fn populate_worktree(
     Ok(())
 }
 
+/// One message from a worktree worker thread, keyed by tab id: any number
+/// of Progress lines (what the thread is doing right now, floated over the
+/// pending tab's agent pane by the App), then exactly one Done.
+pub enum WorktreeMsg {
+    Progress(String),
+    Done(Result<Worktree, String>),
+}
+
 /// Run `populate_worktree` off the UI thread - the checkout can be slow on a
-/// large or lfs-heavy repo - and stream the result back to the App by tab id.
-/// Same channel + repaint wiring as the pr_status/git_status pollers.
+/// large or lfs-heavy repo - and stream progress + the result back to the
+/// App by tab id (WorktreeMsg). Same channel + repaint wiring as the
+/// pr_status/git_status pollers.
 /// `fresh_base` (project mode) updates the base branch from its remote first
 /// - network latency lands on this thread, never the UI. A failed checkout
 /// leaves the claimed directory alone (the workspace's shells are booting
@@ -751,18 +844,23 @@ pub fn spawn_worktree(
     worktree: Worktree,
     choice: BranchChoice,
     fresh_base: bool,
-    tx: Sender<(String, Result<Worktree, String>)>,
+    tx: Sender<(String, WorktreeMsg)>,
     ctx: egui::Context,
 ) {
     thread::spawn(move || {
+        let progress = |line: String| {
+            let _ = tx.send((tab_id.clone(), WorktreeMsg::Progress(line)));
+            ctx.request_repaint();
+        };
         if fresh_base {
-            refresh_base(&root, &choice);
+            refresh_base(&root, &choice, &progress);
         }
+        progress("checking out worktree…".into());
         let res = match populate_worktree(&root, &worktree, &choice) {
             Ok(()) => Ok(worktree),
             Err(e) => Err(format!("{e:#}")),
         };
-        let _ = tx.send((tab_id, res));
+        let _ = tx.send((tab_id, WorktreeMsg::Done(res)));
         ctx.request_repaint();
     });
 }
@@ -783,13 +881,24 @@ pub fn spawn_clone_worktree(
     root: PathBuf,
     worktree: Worktree,
     branch_input: String,
-    tx: Sender<(String, Result<Worktree, String>)>,
+    tx: Sender<(String, WorktreeMsg)>,
     ctx: egui::Context,
 ) {
     thread::spawn(move || {
-        let res = clone_and_populate(&repo, &root, worktree, &branch_input)
-            .map_err(|(_, e)| format!("{e:#}"));
-        let _ = tx.send((tab_id, res));
+        let progress = |line: String| {
+            let _ = tx.send((tab_id.clone(), WorktreeMsg::Progress(line)));
+            ctx.request_repaint();
+        };
+        progress(format!("cloning {repo}…"));
+        let res = clone_and_populate(
+            &repo,
+            &root,
+            worktree,
+            &branch_input,
+            &progress,
+        )
+        .map_err(|(_, e)| format!("{e:#}"));
+        let _ = tx.send((tab_id, WorktreeMsg::Done(res)));
         ctx.request_repaint();
     });
 }
@@ -804,6 +913,7 @@ fn clone_and_populate(
     root: &Path,
     worktree: Worktree,
     branch_input: &str,
+    progress: impl Fn(String),
 ) -> Result<Worktree, (Worktree, anyhow::Error)> {
     if let Some(parent) = root.parent() {
         let _ = fs::create_dir_all(parent);
@@ -837,6 +947,7 @@ fn clone_and_populate(
         BranchChoice::Existing(n) | BranchChoice::New(n) => n.clone(),
         BranchChoice::Track { name, .. } => name.clone(),
     };
+    progress("checking out worktree…".into());
     match populate_worktree(root, &wt, &choice) {
         Ok(()) => Ok(wt),
         Err(e) => Err((wt, e)),
@@ -897,9 +1008,16 @@ pub fn spawn_title(
     ctx: egui::Context,
 ) {
     thread::spawn(move || {
-        if let Some(title) =
-            generate(agent, TITLE_INSTRUCTION, &format!("Task: {prompt}"))
-        {
+        let started = std::time::Instant::now();
+        let title =
+            generate(agent, TITLE_INSTRUCTION, &format!("Task: {prompt}"));
+        log::info!(
+            "title one-shot ({}) took {:.1}s (ok={})",
+            agent.id,
+            started.elapsed().as_secs_f32(),
+            title.is_some()
+        );
+        if let Some(title) = title {
             if tx.send((tab_id, title)).is_ok() {
                 ctx.request_repaint();
             }
@@ -1270,6 +1388,121 @@ ffeedd refs/heads/
         );
     }
 
+    fn setup_project(
+        name: &str,
+        path: Option<&str>,
+        repo: Option<&str>,
+        setup: Option<&str>,
+    ) -> Project {
+        Project {
+            name: name.into(),
+            path: path.map(PathBuf::from),
+            repo: repo.map(str::to_string),
+            setup: setup.map(str::to_string),
+            subdir: None,
+        }
+    }
+
+    #[test]
+    fn inherited_setup_matches_by_path() {
+        let projects =
+            [setup_project("dots", Some("/tmp/dots"), None, Some("mise up"))];
+        assert_eq!(
+            inherited_setup(&projects, Path::new("/tmp/dots"), None),
+            Some("mise up")
+        );
+        assert_eq!(
+            inherited_setup(&projects, Path::new("/tmp/other"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn inherited_setup_matches_repo_by_origin_spellings() {
+        let projects = [setup_project(
+            "mono",
+            None,
+            Some("Telepatia-AI/monobloco"),
+            Some("direnv allow"),
+        )];
+        // Shorthand project vs the scp-style remote the checkout actually
+        // has: both funnel through clone_url + clone_dirname.
+        assert_eq!(
+            inherited_setup(
+                &projects,
+                Path::new("/tmp/mono"),
+                Some("git@github.com:Telepatia-AI/monobloco.git"),
+            ),
+            Some("direnv allow")
+        );
+        assert_eq!(
+            inherited_setup(
+                &projects,
+                Path::new("/tmp/mono"),
+                Some("https://github.com/telepatia-ai/monobloco"),
+            ),
+            Some("direnv allow"),
+            "https spelling and case both flatten away"
+        );
+        assert_eq!(
+            inherited_setup(
+                &projects,
+                Path::new("/tmp/mono"),
+                Some("git@github.com:other/repo.git"),
+            ),
+            None
+        );
+        // No origin at all must not match a repo project (the None == None
+        // trap).
+        assert_eq!(
+            inherited_setup(&projects, Path::new("/tmp/mono"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn inherited_setup_requires_unanimity() {
+        let repo = Some("a/mono");
+        let origin = Some("git@github.com:a/mono.git");
+        // Several projects into one repo (monorepo subdirs), same setup:
+        // unanimous, inherits.
+        let same = [
+            setup_project("mono", None, repo, Some("direnv allow")),
+            setup_project("mono/web", None, repo, Some("direnv allow")),
+        ];
+        assert_eq!(
+            inherited_setup(&same, Path::new("/x"), origin),
+            Some("direnv allow")
+        );
+        // Disagreeing setups: ambiguous, inherits nothing.
+        let differ = [
+            setup_project("mono", None, repo, Some("direnv allow")),
+            setup_project("mono/web", None, repo, Some("npm install")),
+        ];
+        assert_eq!(inherited_setup(&differ, Path::new("/x"), origin), None);
+        // A setup-less match: nothing to inherit.
+        let none = [setup_project("mono", None, repo, None)];
+        assert_eq!(inherited_setup(&none, Path::new("/x"), origin), None);
+    }
+
+    #[test]
+    fn origin_url_reads_the_remote() {
+        let (scratch, git) = scratch_git("origintest");
+        let repo = scratch.join("repo");
+        seed_repo(&git, &repo);
+        assert_eq!(origin_url(&repo), None, "no remote yet");
+        git(
+            &repo,
+            &["remote", "add", "origin", "git@github.com:a/b.git"],
+        );
+        assert_eq!(
+            origin_url(&repo).as_deref(),
+            Some("git@github.com:a/b.git"),
+            "the verbatim URL, no normalization here"
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
     #[test]
     fn boot_cd_joins_subdir_under_worktree_then_root() {
         let wt = Path::new("/wt");
@@ -1450,6 +1683,7 @@ ffeedd refs/heads/
             &root,
             wt,
             "feat/x",
+            |_| {},
         )
         .expect("clone + checkout");
         assert_eq!(wt.branch, "feat/x");
@@ -1470,6 +1704,7 @@ ffeedd refs/heads/
             &root2,
             wt,
             "x",
+            |_| {},
         )
         .expect_err("clone must fail");
         assert_eq!(back.path, claim2);
@@ -1511,7 +1746,7 @@ ffeedd refs/heads/
         let new_tip = git(&origin, &["rev-parse", "feat"]);
         assert_ne!(git(&clone, &["rev-parse", "feat"]), new_tip);
 
-        refresh_base(&clone, &BranchChoice::Existing("feat".into()));
+        refresh_base(&clone, &BranchChoice::Existing("feat".into()), |_| {});
         assert_eq!(
             git(&clone, &["rev-parse", "feat"]),
             new_tip,
@@ -1522,6 +1757,144 @@ ffeedd refs/heads/
             git(&clone, &["rev-parse", "--abbrev-ref", "HEAD"]),
             "main"
         );
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// A Track choice refreshes the remote-tracking ref `--track -b` will
+    /// base on, without creating the local branch or moving HEAD.
+    #[test]
+    fn refresh_base_track_updates_remote_ref() {
+        let (scratch, git) = scratch_git("tracktest");
+        let origin = scratch.join("origin");
+        seed_repo(&git, &origin);
+        git(&origin, &["branch", "feat"]);
+
+        let clone = scratch.join("clone");
+        git(
+            &scratch,
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        git(&origin, &["checkout", "feat"]);
+        git(
+            &origin,
+            &[
+                "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "--allow-empty", "-m", "ahead",
+            ],
+        );
+        let new_tip = git(&origin, &["rev-parse", "feat"]);
+        assert_ne!(git(&clone, &["rev-parse", "origin/feat"]), new_tip);
+
+        refresh_base(
+            &clone,
+            &BranchChoice::Track {
+                name: "feat".into(),
+                remote: "origin".into(),
+            },
+            |_| {},
+        );
+        assert_eq!(
+            git(&clone, &["rev-parse", "origin/feat"]),
+            new_tip,
+            "remote-tracking ref refreshed"
+        );
+        // No local feat was created, and HEAD stayed on main.
+        assert!(git(&clone, &["branch", "--list", "feat"]).is_empty());
+        assert_eq!(
+            git(&clone, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main"
+        );
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// Codename/New on a user repo (not under clones_dir) fetches nothing:
+    /// the branch bases on local state and the refs would go unread. The
+    /// unmoved remote-tracking ref is the proof no blanket fetch ran.
+    #[test]
+    fn refresh_base_skips_user_repos() {
+        let (scratch, git) = scratch_git("skiptest");
+        let origin = scratch.join("origin");
+        seed_repo(&git, &origin);
+
+        let clone = scratch.join("clone");
+        git(
+            &scratch,
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        git(
+            &origin,
+            &[
+                "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "--allow-empty", "-m", "ahead",
+            ],
+        );
+        let stale = git(&clone, &["rev-parse", "origin/main"]);
+        assert_ne!(git(&origin, &["rev-parse", "main"]), stale);
+
+        let lines = std::cell::RefCell::new(Vec::new());
+        refresh_base(&clone, &BranchChoice::Codename, |l| {
+            lines.borrow_mut().push(l)
+        });
+        assert_eq!(
+            git(&clone, &["rev-parse", "origin/main"]),
+            stale,
+            "no fetch happened for a user repo's codename branch"
+        );
+        let lines = lines.into_inner();
+        assert!(lines.is_empty(), "and none was narrated: {lines:?}");
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// The worktree worker narrates before it works: Progress lines stream
+    /// ahead of the one Done, so the App has something to float over the
+    /// pane while the checkout runs.
+    #[test]
+    fn spawn_worktree_streams_progress_then_done() {
+        let (scratch, git) = scratch_git("progresstest");
+        let repo = scratch.join("repo");
+        seed_repo(&git, &repo);
+        let claim = scratch.join("wt");
+        fs::create_dir(&claim).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_worktree(
+            "mux-tab-test".into(),
+            repo.clone(),
+            Worktree { path: claim.clone(), branch: "wt".into() },
+            BranchChoice::Codename,
+            false,
+            tx,
+            egui::Context::default(),
+        );
+        let mut msgs = Vec::new();
+        while let Ok((tab, msg)) =
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+        {
+            assert_eq!(tab, "mux-tab-test");
+            let done = matches!(msg, WorktreeMsg::Done(_));
+            msgs.push(msg);
+            if done {
+                break;
+            }
+        }
+        match msgs.as_slice() {
+            [WorktreeMsg::Progress(line), WorktreeMsg::Done(Ok(wt))] => {
+                assert!(line.contains("checking out"), "{line}");
+                assert_eq!(wt.branch, "wt");
+            },
+            other => panic!("expected [Progress, Done(Ok)], got {} msgs", other.len()),
+        }
 
         fs::remove_dir_all(&scratch).unwrap();
     }

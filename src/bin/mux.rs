@@ -1359,33 +1359,6 @@ fn tail_bytes(s: &str, max: usize) -> &str {
 /// the caller's pane forever.
 const RETITLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Run a command to completion under a deadline, killing it on expiry
-/// (None). Polls `try_wait` rather than blocking, which is what makes the
-/// kill possible; the expected output is one short line, so the pipes
-/// cannot fill up and stall the child before the deadline reaps it.
-fn output_with_timeout(
-    cmd: &mut Command,
-    timeout: Duration,
-) -> io::Result<Option<std::process::Output>> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output().map(Some);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait_with_output();
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
 const RETITLE_INSTRUCTION: &str =
     "You are naming a terminal workspace from what is actually happening in \
      its panes. Reply with exactly one line: a short descriptive title of 2 \
@@ -1477,7 +1450,7 @@ fn cmd_retitle(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
     let argv = agent::oneshot_argv(agent, &prompt);
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    let out = output_with_timeout(&mut cmd, RETITLE_TIMEOUT)
+    let out = agent::output_with_timeout(&mut cmd, RETITLE_TIMEOUT)
         .map_err(|e| (EXIT_TMUX, format!("running {}: {e}", agent.bin)))?
         .ok_or((
             EXIT_TMUX,

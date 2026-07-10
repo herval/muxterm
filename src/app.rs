@@ -35,7 +35,7 @@ use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowSta
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
 use crate::tmux::{self, TmuxCtl};
-use crate::workspace::{self, Workspace, Worktree};
+use crate::workspace::{self, Workspace};
 use crate::workspace_popup::{self, NewWorkspaceForm};
 
 const PANE_GAP: f32 = 4.0;
@@ -174,16 +174,21 @@ pub struct App {
     bg_rx: Receiver<HashSet<String>>,
     /// A ps scan is in flight; the tick starts at most one at a time.
     bg_scan_inflight: bool,
-    /// tab_id -> worktree result, streamed in by `workspace::spawn_worktree`.
-    /// The checkout runs off the UI thread into the pre-claimed directory the
-    /// pane already sits in; when it lands we launch the agent, so a big/lfs
-    /// repo never freezes the window.
-    worktree_tx: Sender<(String, Result<Worktree, String>)>,
-    worktree_rx: Receiver<(String, Result<Worktree, String>)>,
+    /// tab_id -> worktree progress/result, streamed in by
+    /// `workspace::spawn_worktree`. The checkout runs off the UI thread into
+    /// the pre-claimed directory the pane already sits in; when it lands we
+    /// launch the agent, so a big/lfs repo never freezes the window.
+    worktree_tx: Sender<(String, workspace::WorktreeMsg)>,
+    worktree_rx: Receiver<(String, workspace::WorktreeMsg)>,
     /// Tabs whose worktree checkout is still in flight: their pane sits in a
     /// claimed directory the workspace doesn't reference yet, so the root
     /// sync must not read that as "the panes left".
     pending_worktrees: HashSet<String>,
+    /// tab_id -> what the checkout thread is doing right now ("cloning …",
+    /// "fetching …", "checking out worktree…"), floated over the agent pane
+    /// while the tab is pending. Seeded at Create, updated on Progress,
+    /// removed on Done - render-only, never persisted.
+    worktree_progress: HashMap<String, String>,
     /// (active tab, window focused) as last published to the panes' repaint
     /// policies - see `sync_repaint_policies`.
     policy_state: Option<(usize, bool)>,
@@ -307,6 +312,7 @@ impl App {
             worktree_tx,
             worktree_rx,
             pending_worktrees: HashSet::new(),
+            worktree_progress: HashMap::new(),
             policy_state: None,
             pane_snap_shared,
             focused_flag,
@@ -642,6 +648,30 @@ impl App {
         } else {
             workspace::placeholder_title(&prompt)
         };
+        // Plain cmd+n on a folder a saved project points at (by path, or by
+        // origin URL for repo projects): inherit that project's setup script,
+        // so the fresh worktree boots the same as a cmd+shift+n one. Subdir
+        // is deliberately not inherited - the user picked the folder, not
+        // the app.
+        let setup = match form.selected_project() {
+            Some(p) => p.setup.clone(),
+            None if want_worktree => {
+                let origin = root
+                    .as_deref()
+                    .filter(|_| self.projects.iter().any(|p| p.repo.is_some()))
+                    .and_then(workspace::origin_url);
+                root.as_deref()
+                    .and_then(|r| {
+                        workspace::inherited_setup(
+                            &self.projects,
+                            r,
+                            origin.as_deref(),
+                        )
+                    })
+                    .map(str::to_string)
+            },
+            None => None,
+        };
         let workspace = Workspace {
             title,
             root: root.clone(),
@@ -654,7 +684,7 @@ impl App {
             archived_at: None,
             // The workspace owns its copies; later project edits don't
             // reach it.
-            setup: form.selected_project().and_then(|p| p.setup.clone()),
+            setup,
             subdir: form.selected_project().and_then(|p| p.subdir.clone()),
         };
 
@@ -687,6 +717,8 @@ impl App {
             // against the fresh clone, then check out - all off-thread, the
             // agent launch waiting at the end (drain_worktrees).
             self.pending_worktrees.insert(tab_id.clone());
+            self.worktree_progress
+                .insert(tab_id.clone(), "preparing worktree…".into());
             workspace::spawn_clone_worktree(
                 tab_id,
                 repo,
@@ -701,6 +733,8 @@ impl App {
             // launch waits for the checkout to land (drain_worktrees).
             // Project mode freshens the base branch from its remote first.
             self.pending_worktrees.insert(tab_id.clone());
+            self.worktree_progress
+                .insert(tab_id.clone(), "preparing worktree…".into());
             workspace::spawn_worktree(
                 tab_id,
                 root.clone().expect("a claim implies a root"),
@@ -840,7 +874,16 @@ impl App {
     /// there, echoing the failure so the user sees why - the workspace
     /// still works, just degraded.
     fn drain_worktrees(&mut self) {
-        while let Ok((tab_id, result)) = self.worktree_rx.try_recv() {
+        while let Ok((tab_id, msg)) = self.worktree_rx.try_recv() {
+            let result = match msg {
+                workspace::WorktreeMsg::Progress(line) => {
+                    // Render-only: must not mark state dirty per line.
+                    self.worktree_progress.insert(tab_id, line);
+                    continue;
+                },
+                workspace::WorktreeMsg::Done(result) => result,
+            };
+            self.worktree_progress.remove(&tab_id);
             self.pending_worktrees.remove(&tab_id);
             match result {
                 Ok(wt) => {
@@ -2293,9 +2336,15 @@ impl eframe::App for App {
                     } else {
                         sidebar::Status::Idle
                     };
+                    // A trailing ellipsis marks the AI title still in flight
+                    // (`naming`), so the placeholder doesn't read as final.
+                    let mut title = ws.title.clone();
+                    if self.naming.contains(&tab.tab_id) {
+                        title.push('…');
+                    }
                     sidebar::Row {
                         tab_index: i,
-                        title: ws.title.clone(),
+                        title,
                         subtitle,
                         active: i == self.active,
                         status,
@@ -2478,6 +2527,22 @@ impl eframe::App for App {
                             ) {
                                 pr_dismiss.push(key);
                             }
+                        }
+                    }
+                    // The checkout thread's current step, floated over the
+                    // agent pane until Done lands (drain_worktrees clears it).
+                    if let Some(line) =
+                        self.worktree_progress.get(&tab.tab_id)
+                    {
+                        if let Some(rect) =
+                            rects.get(&tab.tree.first_leaf())
+                        {
+                            draw_worktree_progress(
+                                ui,
+                                *rect,
+                                line,
+                                &self.ui_theme,
+                            );
                         }
                     }
                     if let ai_prompt::State::Compose { buffer, error } =
@@ -2767,6 +2832,42 @@ fn draw_ai_overlay(
             hint_color,
         );
     }
+}
+
+/// The worktree-progress line, floated over the agent pane's bottom-left
+/// while its clone/fetch/checkout runs off-thread - the only feedback
+/// between Create and the agent command appearing. Painter-drawn like
+/// draw_ai_overlay: reserves no layout space.
+fn draw_worktree_progress(
+    ui: &egui::Ui,
+    pane_rect: Rect,
+    text: &str,
+    theme: &UiTheme,
+) {
+    // A char budget from the pane width (~6px per 11pt proportional char),
+    // so a narrow pane truncates instead of overflowing.
+    let budget = ((pane_rect.width() - 24.0).max(0.0) / 6.0) as usize;
+    let painter = ui.painter();
+    let galley = painter.layout_no_wrap(
+        elide(text, budget),
+        hud_font(),
+        theme.text_dim,
+    );
+    let pad = Vec2::new(6.0, 2.0);
+    let size = galley.size() + pad * 2.0;
+    let rect = Rect::from_min_size(
+        egui::pos2(
+            pane_rect.min.x + 8.0,
+            pane_rect.max.y - size.y - 8.0,
+        ),
+        size,
+    );
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(3),
+        theme::blend(theme.bg, theme.accent, 0.18),
+    );
+    painter.galley(rect.min + pad, galley, theme.text_dim);
 }
 
 /// The HUD's fixed chrome font (title badge, chips, search hints) - a

@@ -52,7 +52,9 @@ pub const AGENTS: &[Agent] = &[
         // print mode a tool attempt has no TTY to approve through and can
         // stall the whole one-shot; capping turns makes it return (possibly
         // empty - the caller treats that as a clean failure) instead.
-        oneshot_args: &["-p", "--max-turns", "1"],
+        // --strict-mcp-config: ignore user/project MCP servers - a title
+        // needs no tools and must not pay their startup.
+        oneshot_args: &["-p", "--max-turns", "1", "--strict-mcp-config"],
     },
     Agent {
         id: "codex",
@@ -200,9 +202,60 @@ pub fn binary_available(bin: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Run a command to completion under a deadline, killing it on expiry
+/// (None). Polls `try_wait` rather than blocking, which is what makes the
+/// kill possible; the expected output is one short line, so the pipes
+/// cannot fill up and stall the child before the deadline reaps it.
+pub fn output_with_timeout(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait_with_output();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_with_timeout_kills_on_deadline() {
+        use std::time::{Duration, Instant};
+        // A child outliving its budget is killed and reads as None, well
+        // before its own runtime would have elapsed.
+        let started = Instant::now();
+        let out = output_with_timeout(
+            Command::new("sleep").arg("5"),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // A child finishing in time comes back whole.
+        let out = output_with_timeout(
+            Command::new("echo").arg("hi"),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .expect("echo finishes");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
 
     #[test]
     fn quoting_handles_embedded_quotes() {
@@ -263,7 +316,7 @@ mod tests {
         let claude = by_id("claude").unwrap();
         assert_eq!(
             oneshot_command(claude, "name this"),
-            "claude -p --max-turns 1 --model haiku 'name this'"
+            "claude -p --max-turns 1 --strict-mcp-config --model haiku 'name this'"
         );
         let codex = by_id("codex").unwrap();
         assert_eq!(
@@ -289,6 +342,7 @@ mod tests {
                 "-p",
                 "--max-turns",
                 "1",
+                "--strict-mcp-config",
                 "--model",
                 "haiku",
                 "it's a name"
@@ -297,7 +351,7 @@ mod tests {
         // The command form is the same tokens with the prompt quoted.
         assert_eq!(
             oneshot_command(claude, "it's a name"),
-            "claude -p --max-turns 1 --model haiku 'it'\\''s a name'"
+            "claude -p --max-turns 1 --strict-mcp-config --model haiku 'it'\\''s a name'"
         );
     }
 
