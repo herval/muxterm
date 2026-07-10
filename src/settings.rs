@@ -43,6 +43,9 @@ pub enum Tab {
 pub struct ProjectDraft {
     pub name: String,
     pub location: String,
+    /// Repo-relative subfolder (monorepo apps): the workspace worktrees
+    /// the whole repo, then cd's here before the setup script.
+    pub subfolder: String,
     pub setup: String,
 }
 
@@ -341,6 +344,7 @@ fn show_projects(
                 (None, Some(repo)) => repo.clone(),
                 (None, None) => String::new(),
             };
+            draft.subfolder = p.subdir.clone().unwrap_or_default();
             draft.setup = p.setup.clone().unwrap_or_default();
         }
     }
@@ -353,8 +357,14 @@ fn show_projects(
         "folder path or github owner/repo",
         1,
     );
+    grid.input_row(
+        ui,
+        &mut draft.subfolder,
+        "subfolder within the repo (optional)",
+        1,
+    );
     grid.input_row(ui, &mut draft.setup, "setup script (optional)", 2);
-    grid.hint(ui, "setup runs in the new workspace's pane");
+    grid.hint(ui, "new panes cd to the subfolder, then setup");
 
     let ready = !matches!(
         parse_location(&draft.location),
@@ -413,8 +423,11 @@ fn parse_location(input: &str) -> Location {
 }
 
 /// The name `[ add ]` will use: the typed one, else the location's last
-/// segment ("owner/repo" -> "repo", "/a/b" -> "b").
+/// segment ("owner/repo" -> "repo", "/a/b" -> "b") - plus the subfolder
+/// when one is set ("monobloco/apps/web"), since that's what the project
+/// *is* to the user.
 fn derive_name(draft: &ProjectDraft) -> Option<String> {
+    let sub = draft.subfolder.trim().trim_matches('/');
     let typed = draft.name.trim();
     if !typed.is_empty() {
         return Some(typed.to_string());
@@ -426,7 +439,14 @@ fn derive_name(draft: &ProjectDraft) -> Option<String> {
     };
     let base = base.trim_end_matches('/').trim_end_matches(".git");
     let name = base.rsplit('/').next().unwrap_or(base).trim();
-    (!name.is_empty()).then(|| name.to_string())
+    if name.is_empty() {
+        return None;
+    }
+    if sub.is_empty() {
+        Some(name.to_string())
+    } else {
+        Some(format!("{name}/{sub}"))
+    }
 }
 
 /// Build the Project the draft describes, or None while it's incomplete.
@@ -438,17 +458,20 @@ fn draft_project(draft: &ProjectDraft) -> Option<Project> {
         Location::Path(p) => (Some(workspace::expand_dir(&p)?), None),
     };
     let setup = draft.setup.trim();
+    let sub = draft.subfolder.trim().trim_matches('/');
     Some(Project {
         name,
         path,
         repo,
         setup: (!setup.is_empty()).then(|| setup.to_string()),
+        subdir: (!sub.is_empty()).then(|| sub.to_string()),
     })
 }
 
-/// The dim half of a project row: where it points.
+/// The dim half of a project row: where it points (subfolder included -
+/// that's the part telling monorepo projects apart).
 fn location_label(p: &Project) -> String {
-    match (&p.path, &p.repo) {
+    let base = match (&p.path, &p.repo) {
         (Some(path), _) => {
             let s = path.display().to_string();
             match dirs::home_dir() {
@@ -464,6 +487,10 @@ fn location_label(p: &Project) -> String {
         },
         (None, Some(repo)) => format!("github: {repo}"),
         (None, None) => String::new(),
+    };
+    match &p.subdir {
+        Some(sub) => format!("{base} /{sub}"),
+        None => base,
     }
 }
 
@@ -806,12 +833,14 @@ mod tests {
                 path: Some(dirs::home_dir().unwrap().join("dev/muxterm")),
                 repo: None,
                 setup: Some("direnv allow".into()),
+                subdir: None,
             },
             Project {
                 name: "a-rather-long-project-name".into(),
                 path: None,
                 repo: Some("herval/some-long-repo-name".into()),
                 setup: None,
+                subdir: Some("apps/web".into()),
             },
         ]
     }
@@ -1006,6 +1035,7 @@ mod tests {
         let draft = ProjectDraft {
             name: String::new(),
             location: "herval/dotfiles".into(),
+            subfolder: String::new(),
             setup: "  ".into(),
         };
         assert_eq!(derive_name(&draft).as_deref(), Some("dotfiles"));
@@ -1014,10 +1044,12 @@ mod tests {
         assert_eq!(p.repo.as_deref(), Some("herval/dotfiles"));
         assert_eq!(p.path, None);
         assert_eq!(p.setup, None, "blank setup stays None");
+        assert_eq!(p.subdir, None, "blank subfolder stays None");
 
         let draft = ProjectDraft {
             name: "mux".into(),
             location: "~/dev/muxterm/".into(),
+            subfolder: String::new(),
             setup: "direnv allow\nmake setup".into(),
         };
         assert_eq!(derive_name(&draft).as_deref(), Some("mux"));
@@ -1028,6 +1060,28 @@ mod tests {
             Some(dirs::home_dir().unwrap().join("dev/muxterm"))
         );
         assert_eq!(p.setup.as_deref(), Some("direnv allow\nmake setup"));
+
+        // A subfolder rides into the derived name (repo + folder path)
+        // and onto the project, slash-trimmed.
+        let draft = ProjectDraft {
+            name: String::new(),
+            location: "Telepatia-AI/monobloco".into(),
+            subfolder: "/apps/web/".into(),
+            setup: String::new(),
+        };
+        assert_eq!(
+            derive_name(&draft).as_deref(),
+            Some("monobloco/apps/web")
+        );
+        let p = draft_project(&draft).unwrap();
+        assert_eq!(p.name, "monobloco/apps/web");
+        assert_eq!(p.subdir.as_deref(), Some("apps/web"));
+        // A typed name still wins over the derived one.
+        let named = ProjectDraft {
+            name: "web".into(),
+            ..draft
+        };
+        assert_eq!(derive_name(&named).as_deref(), Some("web"));
 
         let empty = ProjectDraft::default();
         assert_eq!(derive_name(&empty), None);

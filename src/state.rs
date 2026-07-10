@@ -84,6 +84,10 @@ pub struct WorkspaceState {
     /// relaunch mid-checkout still knows what to run).
     #[serde(default)]
     pub setup: Option<String>,
+    /// The project's subfolder, copied in at creation like `setup`: the
+    /// workspace's panes cd here (inside the worktree) before setup runs.
+    #[serde(default)]
+    pub subdir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -94,8 +98,9 @@ pub struct WorktreeState {
 
 /// Serde mirror of the GUI's `workspace::Project`: a saved workspace source -
 /// a folder on disk (`path`) or a GitHub repo (`repo`, cloned on first use
-/// under `~/.muxterm/clones/`), plus an optional setup script typed into a
-/// new workspace's first pane.
+/// under `~/.muxterm/clones/`), plus an optional subfolder the workspace
+/// cd's into and an optional setup script typed into a new workspace's
+/// first pane.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProjectState {
     pub name: String,
@@ -105,6 +110,8 @@ pub struct ProjectState {
     pub repo: Option<String>,
     #[serde(default)]
     pub setup: Option<String>,
+    #[serde(default)]
+    pub subdir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -278,12 +285,14 @@ mod tests {
                     path: Some("/tmp/proj".into()),
                     repo: None,
                     setup: Some("direnv allow".into()),
+                    subdir: None,
                 },
                 ProjectState {
-                    name: "dotfiles".into(),
+                    name: "dotfiles/nvim".into(),
                     path: None,
                     repo: Some("herval/dotfiles".into()),
                     setup: None,
+                    subdir: Some("nvim".into()),
                 },
             ],
             windows: vec![WindowState {
@@ -325,6 +334,7 @@ mod tests {
                             created_at: 123,
                             archived_at: None,
                             setup: Some("direnv allow".into()),
+                            subdir: Some("apps/web".into()),
                         }),
                     },
                 ],
@@ -344,6 +354,7 @@ mod tests {
         assert_eq!(back.projects.len(), 2);
         assert_eq!(back.projects[0].path.as_deref(), Some(Path::new("/tmp/proj")));
         assert_eq!(back.projects[1].repo.as_deref(), Some("herval/dotfiles"));
+        assert_eq!(back.projects[1].subdir.as_deref(), Some("nvim"));
 
         let mut sessions = HashSet::new();
         for tab in &back.windows[0].tabs {

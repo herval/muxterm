@@ -48,6 +48,10 @@ pub struct Workspace {
     /// before the agent launches. The workspace owns its copy, so editing or
     /// removing the project never touches a live tab. None for cmd+n/cmd+t.
     pub setup: Option<String>,
+    /// The project's subfolder (cmd+shift+n, monorepo projects): the panes
+    /// cd here - inside the worktree - before the setup script runs. Owned
+    /// like `setup`. None for cmd+n/cmd+t.
+    pub subdir: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +75,7 @@ impl Workspace {
             created_at: mesh::now(),
             archived_at: None,
             setup: None,
+            subdir: None,
         }
     }
 
@@ -94,6 +99,7 @@ impl Workspace {
             created_at: self.created_at,
             archived_at: self.archived_at,
             setup: self.setup.clone(),
+            subdir: self.subdir.clone(),
         }
     }
 
@@ -114,14 +120,17 @@ impl Workspace {
             created_at: s.created_at,
             archived_at: s.archived_at,
             setup: s.setup,
+            subdir: s.subdir,
         }
     }
 }
 
 /// A saved workspace source (Settings > Projects): the thing cmd+shift+n
 /// starts sessions from. Points at a folder on disk (`path`) or a GitHub
-/// repo (`repo`) cloned on first use under `~/.muxterm/clones/`. The
-/// layout's source of truth is `state::ProjectState`.
+/// repo (`repo`) cloned on first use under `~/.muxterm/clones/`, optionally
+/// narrowed to a `subdir` (a monorepo app): the worktree is still made for
+/// the whole repo, then the panes cd into the subfolder before setup runs.
+/// The layout's source of truth is `state::ProjectState`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     pub name: String,
@@ -133,6 +142,8 @@ pub struct Project {
     /// Bash lines typed into a new workspace's first pane, before the agent
     /// launch (e.g. "direnv allow").
     pub setup: Option<String>,
+    /// Repo-relative subfolder the workspace works in.
+    pub subdir: Option<String>,
 }
 
 impl Project {
@@ -142,6 +153,7 @@ impl Project {
             path: self.path.clone(),
             repo: self.repo.clone(),
             setup: self.setup.clone(),
+            subdir: self.subdir.clone(),
         }
     }
 
@@ -151,16 +163,21 @@ impl Project {
             path: s.path,
             repo: s.repo,
             setup: s.setup,
+            subdir: s.subdir,
         }
     }
 
     /// Where the project lives locally: `path` when set, else the clone
-    /// destination under `~/.muxterm/clones/`, named like a worktree dir
-    /// ('/' becomes '-').
+    /// destination under `~/.muxterm/clones/` - named for the *repo*, not
+    /// the project, so several projects into one monorepo (different
+    /// subdirs) share a single clone.
     pub fn local_root(&self) -> PathBuf {
-        match &self.path {
-            Some(p) => p.clone(),
-            None => state::clones_dir().join(worktree_dirname(&self.name)),
+        match (&self.path, &self.repo) {
+            (Some(p), _) => p.clone(),
+            (None, Some(repo)) => state::clones_dir().join(clone_dirname(repo)),
+            (None, None) => {
+                state::clones_dir().join(worktree_dirname(&self.name))
+            },
         }
     }
 
@@ -192,6 +209,18 @@ pub fn clone_url(repo: &str) -> String {
         );
     }
     r.to_string()
+}
+
+/// A repo's directory name under `~/.muxterm/clones/`: the repo value
+/// minus scheme/`git@`/`.git`, with path separators flattened to '-'
+/// ("https://github.com/a/b" and "a/b" both land on "github.com-a-b" /
+/// "a-b" style names, stable across the ways one repo can be written
+/// *within* each spelling).
+fn clone_dirname(repo: &str) -> String {
+    let r = repo.trim().trim_end_matches('/').trim_end_matches(".git");
+    let r = r.split("://").last().unwrap_or(r);
+    let r = r.strip_prefix("git@").unwrap_or(r);
+    r.replace(['/', ':'], "-")
 }
 
 /// Bare "owner/repo": exactly one interior slash and no path-ish spelling
@@ -358,6 +387,23 @@ pub fn escape_worktree(
         }
     }
     cwd.to_path_buf()
+}
+
+/// Where a workspace's panes should cd once its checkout has landed, if
+/// anywhere: the subdir joined under the worktree (else the root). Panes
+/// spawn *in* the worktree/root, so without a subdir there is nothing to
+/// type. Pure; the caller types the `cd`, so a missing subfolder fails
+/// visibly in the shell instead of silently landing elsewhere.
+pub fn boot_cd(
+    worktree: Option<&Path>,
+    root: Option<&Path>,
+    subdir: Option<&str>,
+) -> Option<PathBuf> {
+    let sub = subdir?.trim().trim_matches('/');
+    if sub.is_empty() {
+        return None;
+    }
+    worktree.or(root).map(|base| base.join(sub))
 }
 
 /// The label shown before the AI title lands - and the fallback if it never
@@ -1022,12 +1068,14 @@ mod tests {
             created_at: 7,
             archived_at: Some(9),
             setup: Some("direnv allow".into()),
+            subdir: Some("apps/web".into()),
         };
         let back = Workspace::from_state(ws.to_state());
         assert_eq!(back.agent, Some("claude"));
         assert_eq!(back.worktree.unwrap().branch, "b");
         assert_eq!(back.archived_at, Some(9));
         assert_eq!(back.setup.as_deref(), Some("direnv allow"));
+        assert_eq!(back.subdir.as_deref(), Some("apps/web"));
         // An unknown agent id resolves to None rather than panicking.
         let mut st = ws.to_state();
         st.agent = Some("nope".into());
@@ -1177,27 +1225,69 @@ ffeedd refs/heads/
             path: Some("/tmp/muxterm".into()),
             repo: None,
             setup: None,
+            subdir: None,
         };
         assert_eq!(local.local_root(), PathBuf::from("/tmp/muxterm"));
         assert_eq!(local.needs_clone(), None);
 
-        // A uuid name guarantees the clone dest doesn't exist on this
+        // A uuid repo guarantees the clone dest doesn't exist on this
         // machine, whatever ~/.muxterm/clones already holds.
-        let name = format!("dot/files-{}", uuid::Uuid::new_v4());
+        let repo_val = format!("herval/dot-{}", uuid::Uuid::new_v4());
         let repo = Project {
-            name: name.clone(),
+            name: "dots/nvim".into(),
             path: None,
-            repo: Some("herval/dotfiles".into()),
+            repo: Some(repo_val.clone()),
             setup: None,
+            subdir: Some("nvim".into()),
         };
-        // Clone dest under ~/.muxterm/clones, slash-sanitized like worktrees.
+        // Clone dest under ~/.muxterm/clones, keyed by the *repo* - two
+        // subdir projects into one monorepo share the clone.
         assert_eq!(
             repo.local_root(),
-            state::clones_dir().join(name.replace('/', "-"))
+            state::clones_dir().join(repo_val.replace('/', "-"))
         );
+        let sibling = Project {
+            name: "dots/zsh".into(),
+            subdir: Some("zsh".into()),
+            ..repo.clone()
+        };
+        assert_eq!(repo.local_root(), sibling.local_root());
         // An un-cloned repo project asks for a clone, by its raw repo
         // value (`clone_url` decides what git is given).
-        assert_eq!(repo.needs_clone().as_deref(), Some("herval/dotfiles"));
+        assert_eq!(repo.needs_clone().as_deref(), Some(repo_val.as_str()));
+    }
+
+    #[test]
+    fn clone_dirname_flattens_all_spellings() {
+        assert_eq!(clone_dirname("herval/dotfiles"), "herval-dotfiles");
+        assert_eq!(
+            clone_dirname("https://github.com/Telepatia-AI/monobloco"),
+            "github.com-Telepatia-AI-monobloco"
+        );
+        assert_eq!(
+            clone_dirname("git@github.com:a/b.git"),
+            "github.com-a-b"
+        );
+    }
+
+    #[test]
+    fn boot_cd_joins_subdir_under_worktree_then_root() {
+        let wt = Path::new("/wt");
+        let root = Path::new("/root");
+        assert_eq!(
+            boot_cd(Some(wt), Some(root), Some("apps/web")),
+            Some(PathBuf::from("/wt/apps/web"))
+        );
+        assert_eq!(
+            boot_cd(None, Some(root), Some("/apps/web/")),
+            Some(PathBuf::from("/root/apps/web")),
+            "stray slashes trimmed so the join stays relative"
+        );
+        // Nothing to type without a subdir (panes spawn in place) or
+        // without anywhere to join it under.
+        assert_eq!(boot_cd(Some(wt), Some(root), None), None);
+        assert_eq!(boot_cd(Some(wt), Some(root), Some("  ")), None);
+        assert_eq!(boot_cd(None, None, Some("x")), None);
     }
 
     /// Real-git round trip for every BranchChoice variant. Git is a hard

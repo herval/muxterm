@@ -652,8 +652,10 @@ impl App {
             model: model.clone(),
             created_at: mesh::now(),
             archived_at: None,
-            // The workspace owns its copy; later project edits don't reach it.
+            // The workspace owns its copies; later project edits don't
+            // reach it.
             setup: form.selected_project().and_then(|p| p.setup.clone()),
+            subdir: form.selected_project().and_then(|p| p.subdir.clone()),
         };
 
         self.tabs.push(Tab {
@@ -709,8 +711,18 @@ impl App {
                 ctx.clone(),
             );
         } else {
-            // No worktree: run the agent straight away in the root.
+            // No worktree: run the agent straight away in the root; a
+            // subfolder project's side shell follows into the subdir (the
+            // agent pane's cd rides launch_agent).
+            let side_cd = workspace::boot_cd(
+                None,
+                root.as_deref(),
+                form.selected_project().and_then(|p| p.subdir.as_deref()),
+            );
             self.launch_agent(&tab_id, None, None);
+            if let Some(dir) = side_cd {
+                self.cd_side_panes(&tab_id, &dir);
+            }
         }
 
         // Project roots (often a ~/.muxterm/clones dest) would make a
@@ -724,18 +736,19 @@ impl App {
     /// Type the workspace's boot sequence into its first pane: an optional
     /// failure notice (echoed so the user sees *why* they're not in a
     /// worktree), an optional `cd`, the project's setup script, then the
-    /// agent's launch command. The pane normally spawns where it belongs
-    /// (root or claimed worktree), so `cd` is only for the failed-checkout
-    /// fallback that walks the pane back - and that fallback dir isn't the
-    /// project, so the setup script is skipped there (a `direnv allow` in
-    /// $HOME is pure noise). Setup lines are typed as-is, one per line,
-    /// exactly like a user would - a slow or failed line delays but never
-    /// blocks the launch. A prompt-less workspace without setup is left as
-    /// a plain shell.
+    /// agent's launch command. The pane spawns where it belongs (root or
+    /// claimed worktree), so the `cd` is either the project's *subfolder*
+    /// (`workspace::boot_cd` - monorepo projects work in a subdir of the
+    /// checkout, entered before setup runs) or, on the failed-checkout
+    /// path, the caller's `fallback` - which isn't the project, so setup
+    /// is skipped there (a `direnv allow` in $HOME is pure noise). Setup
+    /// lines are typed as-is, one per line, exactly like a user would - a
+    /// slow or failed line delays but never blocks the launch. A
+    /// prompt-less workspace without setup is left as a plain shell.
     fn launch_agent(
         &mut self,
         tab_id: &str,
-        cd: Option<&std::path::Path>,
+        fallback: Option<&std::path::Path>,
         notice: Option<&str>,
     ) {
         let Some(tab) = self.tabs.iter().find(|t| t.tab_id == tab_id) else {
@@ -746,6 +759,15 @@ impl App {
         let model = tab.workspace.model.clone();
         let prompt = tab.workspace.prompt.clone();
         let setup = tab.workspace.setup.clone();
+        let failed = fallback.is_some();
+        let cd = match fallback {
+            Some(p) => Some(p.to_path_buf()),
+            None => workspace::boot_cd(
+                tab.workspace.worktree.as_ref().map(|w| w.path.as_path()),
+                tab.workspace.root.as_deref(),
+                tab.workspace.subdir.as_deref(),
+            ),
+        };
 
         let mut lines: Vec<String> = Vec::new();
         if let Some(n) = notice {
@@ -754,13 +776,13 @@ impl App {
                 muxterm::agent::shell_quote(&format!("[muxterm] {n}"))
             ));
         }
-        if let Some(p) = cd {
+        if let Some(p) = &cd {
             lines.push(format!(
                 "cd {}",
                 muxterm::agent::shell_quote(&p.display().to_string())
             ));
         }
-        if let (Some(setup), None) = (&setup, cd) {
+        if let (Some(setup), false) = (&setup, failed) {
             lines.extend(
                 setup.lines().map(str::to_string).filter(|l| !l.is_empty()),
             );
@@ -788,6 +810,29 @@ impl App {
         }
     }
 
+    /// Type a `cd` into every pane of a tab *except* the first leaf (whose
+    /// boot sequence `launch_agent` owns): the side shell follows the
+    /// workspace to its subfolder on success and back out on the
+    /// failed-checkout walk-back.
+    fn cd_side_panes(&mut self, tab_id: &str, dir: &std::path::Path) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
+        else {
+            return;
+        };
+        let agent_pane = tab.tree.first_leaf();
+        let cd = format!(
+            "cd {}\r",
+            muxterm::agent::shell_quote(&dir.display().to_string())
+        );
+        for (pane_id, pane) in tab.panes.iter_mut() {
+            if *pane_id != agent_pane {
+                pane.backend.process_command(BackendCommand::Write(
+                    cd.clone().into_bytes(),
+                ));
+            }
+        }
+    }
+
     /// Apply finished worktree checkouts: the pane opened inside the claimed
     /// directory, so success just records the worktree and launches the agent
     /// in place. A failed checkout cd's the pane back (root, or home when
@@ -799,12 +844,26 @@ impl App {
             self.pending_worktrees.remove(&tab_id);
             match result {
                 Ok(wt) => {
+                    let mut side_cd = None;
                     if let Some(tab) =
                         self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
                     {
                         tab.workspace.worktree = Some(wt);
+                        // A subfolder project's side shell follows into the
+                        // subdir; the agent pane's cd rides launch_agent.
+                        side_cd = workspace::boot_cd(
+                            tab.workspace
+                                .worktree
+                                .as_ref()
+                                .map(|w| w.path.as_path()),
+                            tab.workspace.root.as_deref(),
+                            tab.workspace.subdir.as_deref(),
+                        );
                     }
                     self.launch_agent(&tab_id, None, None);
+                    if let Some(dir) = side_cd {
+                        self.cd_side_panes(&tab_id, &dir);
+                    }
                 },
                 Err(e) => {
                     log::warn!("worktree creation failed: {e}");
@@ -844,26 +903,8 @@ impl App {
                     );
                     // The workspace's other panes (the side shell) sit in
                     // the dead claim dir too; walk them back as well.
-                    if let (Some(fallback), Some(tab)) = (
-                        fallback.as_deref(),
-                        self.tabs.iter_mut().find(|t| t.tab_id == tab_id),
-                    ) {
-                        let agent_pane = tab.tree.first_leaf();
-                        let cd = format!(
-                            "cd {}\r",
-                            muxterm::agent::shell_quote(
-                                &fallback.display().to_string()
-                            )
-                        );
-                        for (pane_id, pane) in tab.panes.iter_mut() {
-                            if *pane_id != agent_pane {
-                                pane.backend.process_command(
-                                    BackendCommand::Write(
-                                        cd.clone().into_bytes(),
-                                    ),
-                                );
-                            }
-                        }
+                    if let Some(fallback) = fallback.as_deref() {
+                        self.cd_side_panes(&tab_id, fallback);
                     }
                 },
             }

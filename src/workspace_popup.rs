@@ -406,10 +406,14 @@ fn project_picker(
     ui.add_space(2.0);
     let mut pick: Option<usize> = None;
     for (i, p) in form.projects.iter().enumerate() {
-        let note = match (&p.path, &p.repo) {
+        let base = match (&p.path, &p.repo) {
             (Some(path), _) => home_abbrev(&path.display().to_string()),
             (None, Some(repo)) => format!("github: {repo}"),
             (None, None) => String::new(),
+        };
+        let note = match &p.subdir {
+            Some(sub) => format!("{base} /{sub}"),
+            None => base,
         };
         if panel
             .option(ui, &p.name, &note, true, i == form.project)
@@ -1094,19 +1098,22 @@ mod tests {
         let (_, ui_theme) = theme::build(preset, &HashMap::new(), 0.12);
         let font = FontId::monospace(14.0);
         // Non-existent paths keep refresh_repo subprocess-free; the uuid
-        // name guarantees the repo project's clone dest is absent.
+        // repo guarantees the clone dest (keyed by repo) is absent.
+        let repo = format!("herval/dots-{}", uuid::Uuid::new_v4());
         let projects = vec![
             Project {
                 name: "local-proj".into(),
                 path: Some("/no/such/dir/local-proj".into()),
                 repo: None,
                 setup: None,
+                subdir: None,
             },
             Project {
-                name: format!("dots-{}", uuid::Uuid::new_v4()),
+                name: "dots/nvim".into(),
                 path: None,
-                repo: Some("herval/dotfiles".into()),
+                repo: Some(repo.clone()),
                 setup: Some("direnv allow".into()),
+                subdir: Some("nvim".into()),
             },
         ];
         let mut form = NewWorkspaceForm::for_project(
@@ -1144,7 +1151,10 @@ mod tests {
         let joined = render(&mut form);
         assert!(joined.contains("[ New workspace from project ]"));
         assert!(joined.contains("local-proj"));
-        assert!(joined.contains("github: herval/dotfiles"));
+        assert!(
+            joined.contains(&format!("github: {repo} /nvim")),
+            "repo note carries the subfolder: {joined}"
+        );
         assert!(
             !joined.contains("Create git worktree"),
             "project mode must not offer the toggle: {joined}"
