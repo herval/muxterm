@@ -7,11 +7,14 @@
 //!
 //! cmd+shift+n opens the same form in *project mode* (`for_project`): the
 //! folder field gives way to rows over the saved projects (Settings >
-//! Projects), the worktree toggle disappears (always on), and a repo project
-//! that hasn't been cloned yet swaps the branch typeahead for a clone notice
-//! with deferred branch resolution.
+//! Projects), and the worktree toggle disappears (always on). A repo project
+//! that hasn't been cloned yet feeds the same branch typeahead from
+//! `git ls-remote` (async; `poll_remote_branches`), falling back to a plain
+//! field with deferred resolution when the probe fails.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use egui::text::LayoutJob;
 use egui::{
@@ -45,9 +48,17 @@ pub struct NewWorkspaceForm {
     is_repo: bool,
     /// Branches of `folder`'s repo, newest commit first; empty when not a
     /// repo. Refreshed together with `is_repo` (same `checked` guard), so it
-    /// can never go stale against the folder.
+    /// can never go stale against the folder. For an un-cloned repo project
+    /// this instead carries the `ls-remote` list (`poll_remote_branches`),
+    /// so the typeahead is one mechanism either way.
     branches: Vec<Branch>,
     checked: String,
+    /// In-flight `ls-remote` probe for an un-cloned repo project, keyed by
+    /// clone URL so a stale answer can't paint another project's list.
+    remote_rx: Option<(String, Receiver<Vec<Branch>>)>,
+    /// url -> fetched remote branch list (empty = probe failed); caches
+    /// across project-row clicks so switching back is instant.
+    remote_branches: HashMap<String, Vec<Branch>>,
 }
 
 impl NewWorkspaceForm {
@@ -64,6 +75,8 @@ impl NewWorkspaceForm {
             is_repo: false,
             branches: Vec::new(),
             checked: String::from("\0"), // force a first check
+            remote_rx: None,
+            remote_branches: HashMap::new(),
         };
         form.refresh_repo();
         // A git repo defaults the checkbox on - the common case for cmd+n.
@@ -124,6 +137,55 @@ impl NewWorkspaceForm {
     pub fn branch_choice(&self) -> BranchChoice {
         crate::workspace::resolve_branch(&self.branch, &self.branches)
     }
+
+    /// Keep the typeahead fed for an un-cloned repo project: kick one
+    /// `ls-remote` probe per clone URL (off-thread - network), drain its
+    /// answer, and surface the cached list through `branches` so
+    /// `branch_picker` works exactly as it does against a local repo. The
+    /// clone-time resolution doesn't change - `clone_and_populate` still
+    /// re-resolves the typed text against the fresh clone; this only makes
+    /// the picker see the same names sooner.
+    fn poll_remote_branches(&mut self, ctx: &egui::Context) {
+        if let Some((url, rx)) = &self.remote_rx {
+            match rx.try_recv() {
+                Ok(bs) => {
+                    self.remote_branches.insert(url.clone(), bs);
+                    self.remote_rx = None;
+                },
+                Err(TryRecvError::Empty) => {},
+                Err(TryRecvError::Disconnected) => self.remote_rx = None,
+            }
+        }
+        let Some(url) = self.clone_needed() else {
+            return;
+        };
+        let probing = self
+            .remote_rx
+            .as_ref()
+            .is_some_and(|(u, _)| *u == url);
+        if !self.remote_branches.contains_key(&url) && !probing {
+            let (tx, rx) = mpsc::channel();
+            crate::workspace::spawn_remote_branches(
+                url.clone(),
+                tx,
+                ctx.clone(),
+            );
+            self.remote_rx = Some((url.clone(), rx));
+        }
+        if self.branches.is_empty() {
+            if let Some(bs) = self.remote_branches.get(&url) {
+                self.branches = bs.clone();
+            }
+        }
+    }
+
+    /// Is the selected project's `ls-remote` probe still in flight?
+    fn probing_remote(&self) -> bool {
+        match (self.clone_needed(), &self.remote_rx) {
+            (Some(url), Some((u, _))) => *u == url,
+            _ => false,
+        }
+    }
 }
 
 pub enum Outcome {
@@ -140,6 +202,9 @@ pub fn show(
     font: &FontId,
 ) -> Outcome {
     form.refresh_repo();
+    if !form.projects.is_empty() {
+        form.poll_remote_branches(ctx);
+    }
     let mut outcome = Outcome::None;
 
     let panel = Panel {
@@ -303,9 +368,10 @@ pub fn show(
 
 /// Project mode's replacement for the Folder section: one row per saved
 /// project, then the worktree area for the picked one - the branch picker
-/// against a local repo, or the clone notice (with a deferred branch field)
-/// when the repo hasn't been cloned yet. There is no worktree toggle in
-/// this mode: a project session always wants one.
+/// against a local repo, or the clone notice for a repo that hasn't been
+/// cloned yet (same picker once `ls-remote` answers; a plain deferred field
+/// until then). There is no worktree toggle in this mode: a project session
+/// always wants one.
 fn project_picker(
     ui: &mut egui::Ui,
     form: &mut NewWorkspaceForm,
@@ -349,21 +415,28 @@ fn project_picker(
             )],
             false,
         );
-        ui.add(
-            egui::TextEdit::singleline(&mut form.branch)
-                .hint_text("branch: random codename - type a name to use")
-                .desired_width(f32::INFINITY),
-        );
-        // No branch list exists to resolve against until the clone lands;
-        // promising "create branch 'x'" here would often be wrong.
-        panel.row(
-            ui,
-            vec![(
-                "-> resolved after clone (empty = codename)".into(),
-                th.text_dim,
-            )],
-            false,
-        );
+        if !form.branches.is_empty() {
+            // ls-remote answered: the same typeahead as against a local
+            // repo, every suggestion a to-be-tracked remote branch.
+            branch_picker(ui, form, panel, th);
+        } else {
+            ui.add(
+                egui::TextEdit::singleline(&mut form.branch)
+                    .hint_text(
+                        "branch: random codename - type a name to use",
+                    )
+                    .desired_width(f32::INFINITY),
+            );
+            let note = if form.probing_remote() {
+                "fetching branches from the remote..."
+            } else {
+                // The probe failed (offline, no creds): nothing to resolve
+                // against until the clone lands; promising "create branch
+                // 'x'" here would often be wrong.
+                "-> resolved after clone (empty = codename)"
+            };
+            panel.row(ui, vec![(note.into(), th.text_dim)], false);
+        }
     } else if form.is_repo {
         form.create_worktree = true;
         branch_picker(ui, form, panel, th);
@@ -1011,18 +1084,40 @@ mod tests {
         );
         assert!(joined.contains("not a git repo - worktree off"));
 
-        // Pick the un-cloned repo project (as project_picker's click does):
-        // the clone notice and the deferred branch caption appear.
+        // Pick the un-cloned repo project (as project_picker's click does).
+        // Seed the ls-remote cache first - a probe must never hit the
+        // network in a test. A failed probe (empty list) falls back to the
+        // plain field with the deferred caption.
         form.project = 1;
         form.folder =
             form.projects[1].local_root().display().to_string();
+        let url = form.clone_needed().expect("repo project needs a clone");
+        form.remote_branches.insert(url.clone(), Vec::new());
         let joined = render(&mut form);
         assert!(
             joined.contains("will clone into "),
             "clone notice missing: {joined}"
         );
         assert!(joined.contains("-> resolved after clone (empty = codename)"));
-        assert!(form.clone_needed().is_some());
+
+        // With an ls-remote answer the same typeahead appears, every
+        // suggestion a to-be-tracked remote branch.
+        form.remote_branches.insert(
+            url,
+            vec![
+                branch("main", Some("origin"), false),
+                branch("feat/api", Some("origin"), false),
+            ],
+        );
+        let joined = render(&mut form);
+        assert!(joined.contains("feat/api"), "remote suggestion: {joined}");
+        assert!(joined.contains("(origin)"), "remote note: {joined}");
+        form.branch = "feat/api".into();
+        let joined = render(&mut form);
+        assert!(
+            joined.contains("-> track origin/feat/api"),
+            "typed name resolves as tracking: {joined}"
+        );
 
         // cmd+Enter still submits in project mode.
         let mut submit = input.clone();
@@ -1040,3 +1135,4 @@ mod tests {
         assert!(matches!(outcome, Outcome::Create));
     }
 }
+

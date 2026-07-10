@@ -426,6 +426,55 @@ pub fn parse_branches(out: &str) -> Vec<Branch> {
     branches
 }
 
+/// Branch names straight off an un-cloned remote (`git ls-remote --heads`),
+/// for the cmd+shift+n typeahead when a repo project has no clone yet - so
+/// picking a base branch works the same as against a local repo. Network;
+/// run via `spawn_remote_branches`, never on the UI thread. Failure (offline,
+/// no creds) is an empty list - the popup falls back to a plain field.
+pub fn list_remote_branches(url: &str) -> Vec<Branch> {
+    let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["ls-remote", "--heads"])
+        .arg(url)
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            parse_ls_remote(&String::from_utf8_lossy(&out.stdout))
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Fold `ls-remote --heads` output (`sha TAB refs/heads/name`) into the
+/// popup's branch list. Every entry is remote-only ("origin" - what the
+/// clone will name it), none in use; alphabetical, as ls-remote sorts (no
+/// commit dates without a clone). Pure; fixture-tested.
+pub fn parse_ls_remote(out: &str) -> Vec<Branch> {
+    out.lines()
+        .filter_map(|l| l.split('\t').nth(1))
+        .filter_map(|r| r.strip_prefix("refs/heads/"))
+        .filter(|name| !name.is_empty())
+        .map(|name| Branch {
+            name: name.to_string(),
+            remote: Some("origin".to_string()),
+            in_use: false,
+        })
+        .collect()
+}
+
+/// `list_remote_branches` off-thread, streamed back to the popup's poll.
+/// Same channel + repaint wiring as spawn_worktree.
+pub fn spawn_remote_branches(
+    url: String,
+    tx: Sender<Vec<Branch>>,
+    ctx: egui::Context,
+) {
+    thread::spawn(move || {
+        let _ = tx.send(list_remote_branches(&url));
+        ctx.request_repaint();
+    });
+}
+
 /// What the popup's branch field means, decided against the enumerated
 /// branch list (`resolve_branch`).
 #[derive(Clone, Debug, PartialEq)]
@@ -1008,6 +1057,27 @@ refs/heads/quiet\t
         assert_eq!(worktree_dirname("main"), "main");
         assert_eq!(worktree_dirname("feat/x"), "feat-x");
         assert_eq!(worktree_dirname("a/b/c"), "a-b-c");
+    }
+
+    #[test]
+    fn parse_ls_remote_fixture() {
+        let out = "\
+9f3c0a refs/heads/main
+aa11bb refs/heads/feat/x
+ccddee refs/tags/v1.0
+ffeedd refs/heads/
+";
+        // ls-remote separates with tabs; the fixture's spaces stand in.
+        let out = out.replace(' ', "\t");
+        let bs = parse_ls_remote(&out);
+        assert_eq!(
+            bs.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            vec!["main", "feat/x"],
+            "heads only, empty names dropped"
+        );
+        assert!(bs.iter().all(|b| b.remote.as_deref() == Some("origin")));
+        assert!(bs.iter().all(|b| !b.in_use));
+        assert!(parse_ls_remote("").is_empty());
     }
 
     #[test]
