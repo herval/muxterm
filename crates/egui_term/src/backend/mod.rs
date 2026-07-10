@@ -22,6 +22,7 @@ use egui::Modifiers;
 use settings::BackendSettings;
 use std::borrow::Cow;
 use std::cmp::min;
+use std::collections::HashSet;
 use std::io::Result;
 use std::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -170,6 +171,11 @@ pub struct TerminalBackend {
     // muxterm patch P10: file paths are links too (iTerm's semantic
     // history). Kept separate from url_regex so URLs win when both match.
     pub path_regex: regex::Regex,
+    /// muxterm patch P24: `#<number>` tokens are links when the number is
+    /// in the app-registered set (`set_pr_links`); `None` - the default -
+    /// keeps them inert, so hosts that never call the setter see no change.
+    pr_regex: regex::Regex,
+    pr_links: Option<Arc<HashSet<u64>>>,
     /// muxterm patch P10/P20: where a cmd+clicked link's candidate texts
     /// go, most complete first (P20 rejoins tokens a TUI hard-wrapped, so a
     /// guess and its unjoined fallback travel together). The app decides
@@ -312,6 +318,8 @@ impl TerminalBackend {
             id,
             url_regex,
             path_regex,
+            pr_regex: pr_regex(),
+            pr_links: None,
             link_opener: None,
             term: term.clone(),
             size: terminal_size,
@@ -457,13 +465,31 @@ impl TerminalBackend {
         self.link_opener = Some(Box::new(opener));
     }
 
+    /// muxterm patch P24: which PR numbers a `#<number>` token may link
+    /// to; `None` turns PR tokens off entirely. Arc'd so the app shares
+    /// one set across every pane of a repo.
+    pub fn set_pr_links(&mut self, links: Option<Arc<HashSet<u64>>>) {
+        self.pr_links = links;
+    }
+
+    /// muxterm patch P24: the pr argument `link_match_at` expects.
+    fn pr_param(&self) -> Option<(&regex::Regex, &HashSet<u64>)> {
+        self.pr_links.as_deref().map(|set| (&self.pr_regex, set))
+    }
+
     /// muxterm patch P10: is there a URL or path-shaped token under this
     /// grid point right now? The view asks at press time to decide whether
     /// a cmd+click bypasses tmux mouse reporting.
     pub fn has_link_at(&self, point: Point) -> bool {
         let terminal = self.term.lock();
-        link_match_at(&terminal, point, &self.url_regex, &self.path_regex)
-            .is_some()
+        link_match_at(
+            &terminal,
+            point,
+            &self.url_regex,
+            &self.path_regex,
+            self.pr_param(),
+        )
+        .is_some()
     }
 
     fn process_link_action(
@@ -475,9 +501,14 @@ impl TerminalBackend {
         match link_action {
             LinkAction::Hover => {
                 // muxterm patch P10: paths hover like URLs, URLs win ties.
-                self.last_content.hovered_hyperlink =
-                    link_match_at(terminal, point, &self.url_regex, &self.path_regex)
-                        .map(|(_, range)| range);
+                self.last_content.hovered_hyperlink = link_match_at(
+                    terminal,
+                    point,
+                    &self.url_regex,
+                    &self.path_regex,
+                    self.pr_param(),
+                )
+                .map(|(_, range)| range);
             },
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
@@ -487,9 +518,14 @@ impl TerminalBackend {
                 // from the live terminal instead of trusting the last hover
                 // (which may be stale or unset if the mouse never moved),
                 // and never panic on a failed open.
-                let texts =
-                    link_match_at(terminal, point, &self.url_regex, &self.path_regex)
-                        .map(|(texts, _)| texts);
+                let texts = link_match_at(
+                    terminal,
+                    point,
+                    &self.url_regex,
+                    &self.path_regex,
+                    self.pr_param(),
+                )
+                .map(|(texts, _)| texts);
                 if let Some(texts) = texts {
                     match &self.link_opener {
                         Some(opener) => opener(&texts),
@@ -735,6 +771,15 @@ fn path_regex() -> regex::Regex {
     .unwrap()
 }
 
+/// muxterm patch P24: `#<digits>` ending at a word boundary - the boundary
+/// is what keeps a hex color like `#0044aa` from matching (backtracking
+/// cannot shorten its way to a hit: every digit prefix still ends
+/// digit-to-word). Which numbers actually link is the app's call
+/// (`set_pr_links`); the grid knows nothing about PRs.
+fn pr_regex() -> regex::Regex {
+    regex::Regex::new(r"#\d+\b").unwrap()
+}
+
 /// muxterm patch P19: a grid row wraps into the next when it carries the
 /// WRAPLINE flag (native alacritty soft-wrap) *or* its last column holds a
 /// glyph (a full row). tmux repaints soft-wrapped output as discrete
@@ -846,6 +891,7 @@ fn link_match_at<T: EventListener>(
     point: Point,
     url_regex: &regex::Regex,
     path_regex: &regex::Regex,
+    pr: Option<(&regex::Regex, &HashSet<u64>)>,
 ) -> Option<(Vec<String>, RangeInclusive<Point>)> {
     let (ltext, lpoints) = logical_line(term, point.line);
     let lchars: Vec<char> = ltext.chars().collect();
@@ -938,8 +984,34 @@ fn link_match_at<T: EventListener>(
                 }
                 None
             };
+            // muxterm patch P24: a `#<number>` token is a link only when
+            // the app registered the number as a known PR. Below URLs (the
+            // URL char class allows `#`, so a fragment must not hijack its
+            // URL), above paths; never joined across guessed wraps.
+            let hit_pr = || {
+                let (re, set) = pr?;
+                for m in re.find_iter(&text) {
+                    let known = m.as_str()[1..]
+                        .parse::<u64>()
+                        .is_ok_and(|n| set.contains(&n));
+                    if !known {
+                        continue;
+                    }
+                    let start = text[..m.start()].chars().count();
+                    let end = text[..m.end()].chars().count(); // exclusive
+                    if (start..end).contains(&click_at) {
+                        return Some((
+                            m.as_str().to_string(),
+                            points[start]..=points[end - 1],
+                        ));
+                    }
+                }
+                None
+            };
             let found = if i == j {
-                hit(url_regex, true).or_else(|| hit(path_regex, false))
+                hit(url_regex, true)
+                    .or_else(hit_pr)
+                    .or_else(|| hit(path_regex, false))
             } else {
                 hit(path_regex, false)
             };
@@ -1018,6 +1090,7 @@ mod tests {
             Point::new(Line(line), Column(col)),
             &url_regex(),
             &path_regex(),
+            None,
         )
         .map(|(texts, _)| texts)
     }
@@ -1025,6 +1098,26 @@ mod tests {
     /// The best link text found when clicking (line, col) of `content`.
     fn link_at(content: &str, line: i32, col: usize) -> Option<String> {
         link_candidates(content, line, col).map(|mut texts| texts.remove(0))
+    }
+
+    /// The best link text at (line, col) with `prs` registered as the
+    /// known PR numbers (P24).
+    fn pr_link_at(
+        content: &str,
+        line: i32,
+        col: usize,
+        prs: &[u64],
+    ) -> Option<String> {
+        let term = mock_term(content);
+        let set: HashSet<u64> = prs.iter().copied().collect();
+        link_match_at(
+            &term,
+            Point::new(Line(line), Column(col)),
+            &url_regex(),
+            &path_regex(),
+            Some((&pr_regex(), &set)),
+        )
+        .map(|(mut texts, _)| texts.remove(0))
     }
 
     #[test]
@@ -1105,6 +1198,42 @@ mod tests {
     fn bare_words_do_not_match() {
         assert_eq!(link_at("just some words", 0, 6), None);
         assert_eq!(link_at("Makefile", 0, 3), None);
+    }
+
+    // muxterm patch P24: `#<number>` tokens link to known PRs.
+    #[test]
+    fn known_pr_numbers_link() {
+        let line = "Merge pull request #123 from x (#45)";
+        assert_eq!(pr_link_at(line, 0, 20, &[123, 45]), Some("#123".into()));
+        // Inside punctuation too, and the token comes back bare.
+        assert_eq!(pr_link_at(line, 0, 33, &[123, 45]), Some("#45".into()));
+        // Prose around them is not a link.
+        assert_eq!(pr_link_at(line, 0, 25, &[123, 45]), None);
+    }
+
+    #[test]
+    fn unknown_pr_numbers_stay_inert() {
+        assert_eq!(pr_link_at("see #999 here", 0, 5, &[123]), None);
+        // No registered set at all (the plain helper passes None).
+        assert_eq!(link_at("see #123 here", 0, 5), None);
+    }
+
+    #[test]
+    fn hex_colors_and_spaced_hashes_are_not_prs() {
+        // No word boundary splits #0044aa into a match, even with 44
+        // registered.
+        assert_eq!(pr_link_at("color #0044aa set", 0, 8, &[44, 4]), None);
+        assert_eq!(pr_link_at("# 123 heading", 0, 0, &[123]), None);
+        assert_eq!(pr_link_at("# 123 heading", 0, 2, &[123]), None);
+    }
+
+    #[test]
+    fn url_fragment_beats_pr_number() {
+        let line = "open https://x.com/a#123 now";
+        assert_eq!(
+            pr_link_at(line, 0, 21, &[123]),
+            Some("https://x.com/a#123".into())
+        );
     }
 
     // muxterm patch P11: the view's cursor gate rests on SHOW_CURSOR

@@ -15,8 +15,26 @@ use crate::tmux::TmuxCtl;
 /// The pane's link opener: the first candidate that resolves wins. Off the
 /// render thread: resolving a relative path shells out to tmux for the
 /// pane's cwd, and `open` itself can take tens of ms.
-pub fn spawn_open(tmux: TmuxCtl, session: String, texts: Vec<String>) {
+///
+/// `pr_base` is the pane repo's GitHub web base when the PR detector is on
+/// (config `pr_detector`) and the repo has known PRs: a `#123` candidate
+/// (egui_term P24 emits one only for a known PR number) then opens
+/// `<base>/pull/123`. PR-first is safe: a `#N` candidate can only coexist
+/// with speculative path-join guesses, never a URL.
+pub fn spawn_open(
+    tmux: TmuxCtl,
+    session: String,
+    texts: Vec<String>,
+    pr_base: Option<String>,
+) {
     std::thread::spawn(move || {
+        if let Some(url) = pr_base
+            .as_deref()
+            .and_then(|base| texts.iter().find_map(|t| pr_url(t, base)))
+        {
+            let _ = Command::new("/usr/bin/open").arg(&url).status();
+            return;
+        }
         // One cwd fetch serves every candidate.
         let cwd = texts
             .iter()
@@ -38,6 +56,19 @@ pub fn spawn_open(tmux: TmuxCtl, session: String, texts: Vec<String>) {
             let _ = Command::new("/usr/bin/open").arg(&target).status();
         }
     });
+}
+
+/// The repo web base of a PR URL, as GitHub's API hands them out:
+/// "https://github.com/owner/repo/pull/12" -> "https://github.com/owner/repo".
+pub fn pr_base(url: &str) -> Option<&str> {
+    url.find("/pull/").map(|i| &url[..i])
+}
+
+/// "#123" -> "<base>/pull/123"; any other token shape is None.
+fn pr_url(text: &str, base: &str) -> Option<String> {
+    let digits = text.strip_prefix('#')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("{base}/pull/{digits}"))
 }
 
 /// Mirrors the scheme list of egui_term's URL regex: text the widget
@@ -145,6 +176,23 @@ fn expand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_urls_build_from_the_badge_base() {
+        let badge = "https://github.com/herval/muxterm/pull/12";
+        let base = pr_base(badge).unwrap();
+        assert_eq!(base, "https://github.com/herval/muxterm");
+        assert_eq!(
+            pr_url("#123", base).as_deref(),
+            Some("https://github.com/herval/muxterm/pull/123")
+        );
+        // Only a bare #digits token qualifies.
+        assert_eq!(pr_url("123", base), None);
+        assert_eq!(pr_url("#", base), None);
+        assert_eq!(pr_url("#12a", base), None);
+        // No /pull/ segment, no base.
+        assert_eq!(pr_base("https://github.com/herval/muxterm"), None);
+    }
 
     #[test]
     fn urls_are_recognized() {

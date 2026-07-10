@@ -55,6 +55,7 @@ pub struct Outcome {
     pub pane_titles: Option<bool>,
     pub git_status: Option<bool>,
     pub pr_status: Option<bool>,
+    pub pr_detector: Option<bool>,
     pub notifications: Option<bool>,
     pub font_size: Option<f32>,
     /// A project to add - or to replace, when a saved project already has
@@ -76,6 +77,7 @@ pub fn show(
     pane_titles: bool,
     git_status: bool,
     pr_status: bool,
+    pr_detector: bool,
     notifications: bool,
     tab: &mut Tab,
     projects: &[Project],
@@ -122,6 +124,7 @@ pub fn show(
                     pane_titles,
                     git_status,
                     pr_status,
+                    pr_detector,
                     notifications,
                     &mut out,
                 ),
@@ -174,6 +177,7 @@ fn show_preferences(
     pane_titles: bool,
     git_status: bool,
     pr_status: bool,
+    pr_detector: bool,
     notifications: bool,
     out: &mut Outcome,
 ) {
@@ -240,6 +244,21 @@ fn show_preferences(
         out.pr_status = Some(!pr_status);
     }
     grid.hint(ui, "branch's PR beside the title; needs gh");
+
+    let mark = if pr_detector { "[x]" } else { "[ ]" };
+    let row = grid.body(
+        ui,
+        vec![
+            (mark.to_string(), th.accent),
+            (" #123 opens the PR".to_string(), th.text),
+        ],
+        true,
+        false,
+    );
+    if row.clicked() {
+        out.pr_detector = Some(!pr_detector);
+    }
+    grid.hint(ui, "for PR numbers the repo is known to have");
 
     grid.divider(ui, "Alerts", th.accent);
     let mark = if notifications { "[x]" } else { "[ ]" };
@@ -828,6 +847,7 @@ mod tests {
                 true,
                 true,
                 false,
+                true,
                 true,
                 &mut tab,
                 &projects,

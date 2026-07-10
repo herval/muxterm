@@ -61,6 +61,10 @@ copy_on_select = false
 # number; click opens the PR page). Needs the gh CLI, authenticated.
 # pr_status = true
 
+# Make "#123" in terminal text cmd+clickable when it matches a PR the
+# pane's repo is known to have (rides the same PR tracking as pr_status).
+# pr_detector = true
+
 # Bounce the dock and post a banner when the muxterm window is unfocused
 # and a background pane rings the terminal bell or an agent runs
 # `mux notify`. Tab badges are always on; this gates only the OS alerts.
@@ -114,6 +118,9 @@ pub struct ConfigFile {
     pub git_status: bool,
     /// Poll `gh` for the current branch's PR and badge it on the tab.
     pub pr_status: bool,
+    /// cmd+click a `#123` token to open the PR when the number matches a
+    /// known PR of the pane's repo.
+    pub pr_detector: bool,
     /// Dock bounce + banner on bell/`mux notify` while unfocused.
     pub notifications: bool,
     /// Pane HUD bar edge: "top" | "bottom"; unset keeps the theme's choice.
@@ -135,6 +142,7 @@ impl Default for ConfigFile {
             copy_on_select: false,
             git_status: true,
             pr_status: true,
+            pr_detector: true,
             notifications: true,
             bar_position: None,
             bar_style: None,
@@ -163,6 +171,7 @@ pub struct Style {
     pub copy_on_select: bool,
     pub git_status: bool,
     pub pr_status: bool,
+    pub pr_detector: bool,
     pub notifications: bool,
 }
 
@@ -274,6 +283,7 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             copy_on_select: cfg.copy_on_select,
             git_status: cfg.git_status,
             pr_status: cfg.pr_status,
+            pr_detector: cfg.pr_detector,
             notifications: cfg.notifications,
         },
         font_data,
@@ -384,6 +394,18 @@ pub fn set_pr_status(on: bool) {
         replace_top_level_line(&text, "pr_status", &line),
     ) {
         log::warn!("could not save pr_status: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's PR-detector checkbox.
+pub fn set_pr_detector(on: bool) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("pr_detector = {on}");
+    if let Err(e) = fs::write(
+        path(),
+        replace_top_level_line(&text, "pr_detector", &line),
+    ) {
+        log::warn!("could not save pr_detector: {e:#}");
     }
 }
 
@@ -745,6 +767,15 @@ mod tests {
         assert!(!cfg.pr_status);
         let (style, _) = resolve(&cfg);
         assert!(!style.pr_status);
+    }
+
+    #[test]
+    fn pr_detector_defaults_on_and_parses() {
+        assert!(ConfigFile::default().pr_detector);
+        let cfg: ConfigFile = toml::from_str("pr_detector = false").unwrap();
+        assert!(!cfg.pr_detector);
+        let (style, _) = resolve(&cfg);
+        assert!(!style.pr_detector);
     }
 
     #[test]

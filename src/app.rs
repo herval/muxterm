@@ -104,13 +104,21 @@ pub struct App {
     /// session -> registered agent (mesh registry, polled like the config).
     agents: HashMap<String, mesh::AgentInfo>,
     agents_mtime: Option<SystemTime>,
-    /// session -> GitHub PR badges (config `pr_status`) - every PR the
-    /// session's checkout has touched - streamed in by the pr_status
-    /// poller thread; the atomic gates that thread live.
+    /// session -> GitHub PR badges - every PR the session's checkout has
+    /// touched - streamed in by the pr_status poller thread; the atomic
+    /// gates that thread live. One poller feeds two features: the HUD
+    /// chips (config `pr_status`) and the cmd+clickable `#123` tokens
+    /// (config `pr_detector`), each gated at its own consumer.
     pr: HashMap<String, Vec<pr_status::Badge>>,
     pr_rx: Receiver<HashMap<String, Vec<pr_status::Badge>>>,
     pr_enabled: Arc<AtomicBool>,
     pr_status: bool,
+    pr_detector: bool,
+    /// session -> the repo's GitHub web base ("https://github.com/o/r"),
+    /// derived from its badges; the pane link openers resolve a clicked
+    /// `#123` through it. Arc'd into those `Send + Sync` closures - both
+    /// sides run on the UI thread, the lock is never contended.
+    pr_link_bases: Arc<Mutex<HashMap<String, String>>>,
     /// Chips right-clicked away, shared with the poller (which forgets
     /// them) and used to filter snapshots it composed before it did.
     pr_dismissed: pr_status::Dismissed,
@@ -209,7 +217,8 @@ impl App {
         let pane_snap_shared: tmux::SharedPanes = Default::default();
         let focused_flag = Arc::new(AtomicBool::new(true));
         let (pr_tx, pr_rx) = mpsc::channel();
-        let pr_enabled = Arc::new(AtomicBool::new(style.pr_status));
+        let pr_enabled =
+            Arc::new(AtomicBool::new(style.pr_status || style.pr_detector));
         let pr_dismissed: pr_status::Dismissed =
             Arc::new(Mutex::new(HashSet::new()));
         pr_status::spawn(
@@ -273,6 +282,8 @@ impl App {
             pr_rx,
             pr_enabled,
             pr_status: style.pr_status,
+            pr_detector: style.pr_detector,
+            pr_link_bases: Arc::new(Mutex::new(HashMap::new())),
             pr_dismissed,
             git: HashMap::new(),
             git_rx,
@@ -398,13 +409,20 @@ impl App {
                 .spawn_settings(&session, start_dir, !theme::is_light(self.ui_theme.bg)),
         )?;
         // cmd+clicked URLs/paths: relative paths resolve against this
-        // pane's cwd, so the opener is tied to the session.
+        // pane's cwd, so the opener is tied to the session. A `#123`
+        // candidate (config `pr_detector`) resolves through the shared
+        // base map instead - looked up at click time, so a repo learned
+        // after the pane opened still resolves.
         let (tmux, opener_session) = (self.tmux.clone(), session.clone());
+        let pr_bases = self.pr_link_bases.clone();
         backend.set_link_opener(move |texts| {
+            let base =
+                pr_bases.lock().unwrap().get(&opener_session).cloned();
             crate::links::spawn_open(
                 tmux.clone(),
                 opener_session.clone(),
                 texts.to_vec(),
+                base,
             )
         });
         Ok(Pane {
@@ -1586,15 +1604,22 @@ impl App {
         self.agent = style.agent;
         self.agent_context_lines = style.agent_context_lines;
         self.pr_status = style.pr_status;
-        self.pr_enabled.store(style.pr_status, Ordering::Relaxed);
+        self.pr_detector = style.pr_detector;
+        // One poller serves both the chips and the `#123` links; it only
+        // stops when neither wants its badges.
+        self.pr_enabled.store(
+            style.pr_status || style.pr_detector,
+            Ordering::Relaxed,
+        );
         self.git_status = style.git_status;
         self.git_enabled.store(style.git_status, Ordering::Relaxed);
         self.notifications = style.notifications;
-        if !style.pr_status {
+        if !style.pr_status && !style.pr_detector {
             // The poller also sends a clearing snapshot, but drop the
             // badges now so the toggle feels instant.
             self.pr.clear();
         }
+        self.sync_pr_links();
         if !style.git_status {
             self.git.clear();
         }
@@ -1610,6 +1635,42 @@ impl App {
             Ok(true) => self.tmux.source_conf(),
             Ok(false) => {},
             Err(e) => log::error!("failed to write tmux.conf: {e:#}"),
+        }
+    }
+
+    /// Push each pane's clickable PR numbers into its terminal backend
+    /// (egui_term P24) and refresh the session -> repo-web-base map the
+    /// link openers read (config `pr_detector`). Derived from the current
+    /// badge snapshot, so a dismissed chip's number goes inert with it.
+    fn sync_pr_links(&mut self) {
+        let mut sets: HashMap<&str, Arc<HashSet<u64>>> = HashMap::new();
+        {
+            let mut bases = self.pr_link_bases.lock().unwrap();
+            bases.clear();
+            if self.pr_detector {
+                for (session, badges) in &self.pr {
+                    sets.insert(
+                        session,
+                        Arc::new(
+                            badges.iter().map(|b| b.number).collect(),
+                        ),
+                    );
+                    if let Some(base) = badges
+                        .iter()
+                        .find_map(|b| crate::links::pr_base(&b.url))
+                    {
+                        bases.insert(session.clone(), base.to_string());
+                    }
+                }
+            }
+        }
+        log::debug!("pr_links: {sets:?}");
+        for tab in &mut self.tabs {
+            for pane in tab.panes.values_mut() {
+                pane.backend.set_pr_links(
+                    sets.get(pane.session.as_str()).cloned(),
+                );
+            }
         }
     }
 
@@ -1856,6 +1917,7 @@ impl App {
             self.pane_titles,
             self.git_status,
             self.pr_status,
+            self.pr_detector,
             self.notifications,
             &mut self.settings_tab,
             &self.projects,
@@ -1899,6 +1961,10 @@ impl App {
         }
         if let Some(on) = out.pr_status {
             config::set_pr_status(on);
+            self.reload_config(ctx);
+        }
+        if let Some(on) = out.pr_detector {
+            config::set_pr_detector(on);
             self.reload_config(ctx);
         }
         if let Some(on) = out.notifications {
@@ -2033,8 +2099,10 @@ impl eframe::App for App {
                 }
             }
         }
+        let mut pr_changed = false;
         while let Ok(snapshot) = self.pr_rx.try_recv() {
             self.pr = snapshot;
+            pr_changed = true;
             // A chip dismissed after this snapshot was composed must not
             // flicker back; the poller empties the set once its memory
             // has forgotten the key (within a tick).
@@ -2049,6 +2117,9 @@ impl eframe::App for App {
                 }
                 self.pr.retain(|_, badges| !badges.is_empty());
             }
+        }
+        if pr_changed {
+            self.sync_pr_links();
         }
         while let Ok(snapshot) = self.git_rx.try_recv() {
             self.git = snapshot;
@@ -2350,9 +2421,15 @@ impl eframe::App for App {
                                 *rect,
                                 &label,
                                 self.git.get(&pane.session),
-                                self.pr
-                                    .get(&pane.session)
-                                    .map_or(&[][..], Vec::as_slice),
+                                // The badge map also feeds pr_detector, so
+                                // chips gate on their own config here.
+                                if self.pr_status {
+                                    self.pr
+                                        .get(&pane.session)
+                                        .map_or(&[][..], Vec::as_slice)
+                                } else {
+                                    &[]
+                                },
                                 *id,
                                 *id == tab.focused,
                                 &self.ui_theme,
@@ -2465,6 +2542,8 @@ impl eframe::App for App {
                 dismissed.insert(key);
             }
             self.pr.retain(|_, badges| !badges.is_empty());
+            drop(dismissed);
+            self.sync_pr_links();
         }
 
         for action in ui_actions {

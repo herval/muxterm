@@ -245,3 +245,15 @@ tmux-backed design. Local patches:
   within the match, keeping Wikipedia-style "..._(disambiguation)" URLs
   whole. Paths are exempt: the app-side opener already strips their
   punctuation candidate-by-candidate under an existence check.
+- **P24** (`src/backend/mod.rs`, `pr_regex`, `set_pr_links`,
+  `link_match_at`): PR-number tokens as links. A `#<digits>` token (word
+  boundary after the digits, so a hex color like `#0044aa` never matches)
+  is a link when its number is in an app-registered `Arc<HashSet<u64>>`
+  (`set_pr_links`; `None` - the default - keeps `#N` inert, so hosts that
+  never call the setter are unaffected). The grid knows nothing about
+  PRs: which numbers qualify and what a click opens are both the app's
+  call - the match just travels to the P10/P20 `link_opener` as its bare
+  `#N` text. Ranked below URLs (the URL char class allows `#`, a
+  fragment must not hijack its URL) and above paths, single-run only
+  (never joined across P20's guessed wraps); hover underline, press
+  swallow, and open all ride the existing P10/P19/P20 machinery.
