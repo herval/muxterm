@@ -21,7 +21,7 @@ use std::time::Duration;
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, TextFormat};
 
-use crate::theme::UiTheme;
+use crate::theme::HudColors;
 use crate::tmux;
 
 /// Local scan cadence (pane cwds + `git status`; no network).
@@ -43,26 +43,26 @@ pub struct Git {
 
 impl Git {
     /// The dot's color: yellow when the tree is dirty, green when clean.
-    fn dot(&self, th: &UiTheme) -> Color32 {
+    fn dot(&self, hud: &HudColors) -> Color32 {
         if self.dirty > 0 {
-            th.status_warn
+            hud.warn
         } else {
-            th.status_ok
+            hud.ok
         }
     }
 
     /// The chip as a colored run: a state dot, the branch, then compact
     /// `*dirty`/`↑ahead`/`↓behind` markers (zero parts omitted). `base` is
     /// the branch/marker text color (active vs. dim tab).
-    pub fn chip_job(&self, font: FontId, base: Color32, th: &UiTheme) -> LayoutJob {
+    pub fn chip_job(&self, font: FontId, base: Color32, hud: &HudColors) -> LayoutJob {
         let mut job = LayoutJob::default();
         let seg = |job: &mut LayoutJob, s: &str, c: Color32| {
             job.append(s, 0.0, TextFormat::simple(font.clone(), c));
         };
-        seg(&mut job, "\u{25CF} ", self.dot(th));
+        seg(&mut job, "\u{25CF} ", self.dot(hud));
         seg(&mut job, &self.branch, base);
         if self.dirty > 0 {
-            seg(&mut job, &format!("  *{}", self.dirty), th.status_warn);
+            seg(&mut job, &format!("  *{}", self.dirty), hud.warn);
         }
         if self.ahead > 0 {
             seg(&mut job, &format!("  \u{2191}{}", self.ahead), base);

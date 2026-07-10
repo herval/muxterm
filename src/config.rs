@@ -66,6 +66,13 @@ copy_on_select = false
 # `mux notify`. Tab badges are always on; this gates only the OS alerts.
 # notifications = true
 
+# The per-pane title/status bar (pane title + git/PR chips). Each theme
+# picks a style and edge; override with "chips" (floating corner badges)
+# or "solid" (a full-width strip that reserves a row above/below the
+# terminal), and "top" or "bottom".
+# bar_style = "chips"
+# bar_position = "top"
+
 [font]
 # Each theme picks its own font; set either key to override it for every
 # theme. A family is a name searched in the macOS font folders, or a path
@@ -80,6 +87,9 @@ copy_on_select = false
 # accent = "#4a90d9"        # focused-pane border + tab highlight
 # black = "#000000"         # also: red green yellow blue magenta cyan white
 # bright_black = "#686868"  # also: bright_red ... bright_white
+# bar_background = "#00aa00" # the pane title/status bar: strip fill (or
+# bar_foreground = "#000000" # chip tint), its text, and its highlight
+# bar_accent = "#ffff55"     # (search cursor)
 "##
     )
 }
@@ -106,6 +116,10 @@ pub struct ConfigFile {
     pub pr_status: bool,
     /// Dock bounce + banner on bell/`mux notify` while unfocused.
     pub notifications: bool,
+    /// Pane HUD bar edge: "top" | "bottom"; unset keeps the theme's choice.
+    pub bar_position: Option<String>,
+    /// Pane HUD style: "chips" | "solid"; unset keeps the theme's choice.
+    pub bar_style: Option<String>,
     pub font: FontConfig,
     pub colors: HashMap<String, String>,
 }
@@ -122,6 +136,8 @@ impl Default for ConfigFile {
             git_status: true,
             pr_status: true,
             notifications: true,
+            bar_position: None,
+            bar_style: None,
             font: FontConfig::default(),
             colors: HashMap::new(),
         }
@@ -200,8 +216,26 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             ("iterm-dark".to_string(), theme::preset("iterm-dark").unwrap())
         },
     };
-    let (term_theme, ui) =
+    let (term_theme, mut ui) =
         theme::build(preset, &cfg.colors, cfg.dim_inactive_panes);
+    // Flat bar knobs override the theme's choice; bar colors ride
+    // `[colors]` into build above.
+    match cfg.bar_position.as_deref() {
+        None => {},
+        Some("top") => ui.bar_edge = theme::BarEdge::Top,
+        Some("bottom") => ui.bar_edge = theme::BarEdge::Bottom,
+        Some(other) => log::warn!(
+            "config: bar_position must be \"top\" or \"bottom\", got {other:?}"
+        ),
+    }
+    match cfg.bar_style.as_deref() {
+        None => {},
+        Some("chips") => ui.bar_style = theme::BarStyle::Chips,
+        Some("solid") => ui.bar_style = theme::BarStyle::Solid,
+        Some(other) => log::warn!(
+            "config: bar_style must be \"chips\" or \"solid\", got {other:?}"
+        ),
+    }
 
     let agent = agent::by_id(&cfg.agent).unwrap_or_else(|| {
         log::warn!(
@@ -601,6 +635,43 @@ mod tests {
         let cfg: ConfigFile = toml::from_str(&default_config()).unwrap();
         assert_eq!(cfg.font.size, None);
         assert_eq!(cfg.font.family, None);
+        assert_eq!(cfg.bar_position, None);
+        assert_eq!(cfg.bar_style, None);
+    }
+
+    #[test]
+    fn bar_keys_override_the_theme_and_invalid_values_warn() {
+        // Unset keeps each theme's own choice.
+        let (style, _) = resolve(&ConfigFile::default());
+        assert_eq!(style.ui.bar_style, theme::BarStyle::Chips);
+        assert_eq!(style.ui.bar_edge, theme::BarEdge::Top);
+        let cfg = ConfigFile {
+            theme: "github-light".into(),
+            ..ConfigFile::default()
+        };
+        let (style, _) = resolve(&cfg);
+        assert_eq!(style.ui.bar_style, theme::BarStyle::Solid);
+        assert_eq!(style.ui.bar_edge, theme::BarEdge::Bottom);
+
+        // Valid values flip both knobs on any theme...
+        let cfg = ConfigFile {
+            bar_position: Some("bottom".into()),
+            bar_style: Some("solid".into()),
+            ..ConfigFile::default()
+        };
+        let (style, _) = resolve(&cfg);
+        assert_eq!(style.ui.bar_style, theme::BarStyle::Solid);
+        assert_eq!(style.ui.bar_edge, theme::BarEdge::Bottom);
+
+        // ...and junk warns, keeping the theme's choice.
+        let cfg = ConfigFile {
+            bar_position: Some("middle".into()),
+            bar_style: Some("floaty".into()),
+            ..ConfigFile::default()
+        };
+        let (style, _) = resolve(&cfg);
+        assert_eq!(style.ui.bar_style, theme::BarStyle::Chips);
+        assert_eq!(style.ui.bar_edge, theme::BarEdge::Top);
     }
 
     #[test]

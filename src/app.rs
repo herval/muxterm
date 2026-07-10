@@ -2209,6 +2209,17 @@ impl eframe::App for App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
                     let mut rects = HashMap::new();
+                    // A solid HUD strip reserves layout space (floating
+                    // chips reserve none), gated on pane_titles - the HUD
+                    // loop below is the only thing that paints the strip,
+                    // so never reserve a row nothing will fill.
+                    let bar_h = (self.pane_titles
+                        && self.ui_theme.bar_style == theme::BarStyle::Solid)
+                        .then(|| {
+                            bar_height(
+                                ui.fonts(|f| f.row_height(&hud_font())),
+                            )
+                        });
                     // A peeked archived workspace is a read-only preview: no
                     // pane is interactive and none holds keyboard focus.
                     let archived = tab.workspace.is_archived();
@@ -2237,6 +2248,7 @@ impl eframe::App for App {
                         &self.ui_theme,
                         self.copy_on_select,
                         !archived,
+                        bar_h,
                         &mut rects,
                         &mut ui_actions,
                     );
@@ -2296,6 +2308,7 @@ impl eframe::App for App {
                                 *id,
                                 *id == tab.focused,
                                 &self.ui_theme,
+                                bar_h,
                             ) {
                                 pr_dismiss.push(key);
                             }
@@ -2307,6 +2320,18 @@ impl eframe::App for App {
                         if let Some((rect, pane)) = self.ai.pane.and_then(|p| {
                             Some((*rects.get(&p)?, tab.panes.get(&p)?))
                         }) {
+                            // The grid sits inside the solid strip's inset;
+                            // caret math against the full pane claim would
+                            // land one strip-height off.
+                            let rect = bar_h
+                                .and_then(|h| {
+                                    split_bar(
+                                        rect,
+                                        self.ui_theme.bar_edge,
+                                        h,
+                                    )
+                                })
+                                .map_or(rect, |(_, term)| term);
                             let content = pane.backend.last_content();
                             let size = &content.terminal_size;
                             let point = content.grid.cursor.point;
@@ -2349,6 +2374,7 @@ impl eframe::App for App {
                                 *count,
                                 &self.font,
                                 &self.ui_theme,
+                                bar_h,
                             );
                         }
                     }
@@ -2575,35 +2601,81 @@ fn draw_ai_overlay(
     }
 }
 
-/// Place a HUD box of `size` in the pane corner the theme picked, inset
-/// 4pt. Returns the rect plus the horizontal growth direction toward the
-/// pane's center (+1.0 rightward, -1.0 leftward) for stacking chips.
-fn hud_anchor(
-    pane_rect: Rect,
-    size: Vec2,
-    corner: theme::Corner,
-) -> (Rect, f32) {
-    use theme::Corner::*;
-    let x = match corner {
-        TopLeft | BottomLeft => pane_rect.min.x + 4.0,
-        TopRight | BottomRight => pane_rect.max.x - size.x - 4.0,
-    };
-    let y = match corner {
-        TopLeft | TopRight => pane_rect.min.y + 4.0,
-        BottomLeft | BottomRight => pane_rect.max.y - size.y - 4.0,
-    };
-    let dir = match corner {
-        TopLeft | BottomLeft => 1.0,
-        TopRight | BottomRight => -1.0,
-    };
-    (Rect::from_min_size(egui::pos2(x, y), size), dir)
+/// The HUD's fixed chrome font (title badge, chips, search hints) - a
+/// proportional face independent of the terminal font, so a chunky theme
+/// font never inflates the chrome.
+fn hud_font() -> FontId {
+    FontId::proportional(11.0)
 }
 
-/// The cmd+f search bar, a strip over the theme's HUD corner (the
-/// pane-title spot - it covers the badge and, top-right, tmux's own
+/// Height of the solid HUD strip: one HUD text row plus breathing room,
+/// ceil'd so the terminal inset lands on a whole pixel.
+fn bar_height(hud_row_h: f32) -> f32 {
+    (hud_row_h + 8.0).ceil()
+}
+
+/// Split a pane into (strip, terminal) at the theme's bar edge. None when
+/// the pane is too short to give up a strip - the terminal keeps the
+/// whole rect and the HUD is skipped entirely. Every consumer of the
+/// solid bar's geometry must come through here: grid math against a
+/// diverging rect paints one strip-height off.
+fn split_bar(
+    pane: Rect,
+    edge: theme::BarEdge,
+    bar_h: f32,
+) -> Option<(Rect, Rect)> {
+    if pane.height() < bar_h * 5.0 {
+        return None;
+    }
+    Some(match edge {
+        theme::BarEdge::Top => (
+            Rect::from_min_max(
+                pane.min,
+                egui::pos2(pane.max.x, pane.min.y + bar_h),
+            ),
+            Rect::from_min_max(
+                egui::pos2(pane.min.x, pane.min.y + bar_h),
+                pane.max,
+            ),
+        ),
+        theme::BarEdge::Bottom => (
+            Rect::from_min_max(
+                egui::pos2(pane.min.x, pane.max.y - bar_h),
+                pane.max,
+            ),
+            Rect::from_min_max(
+                pane.min,
+                egui::pos2(pane.max.x, pane.max.y - bar_h),
+            ),
+        ),
+    })
+}
+
+/// The y where the HUD line (title box, chips, search bar) sits: 4pt
+/// inside the pane's bar edge when the chips float, or vertically
+/// centered when a solid strip is the `area`.
+fn hud_line_y(
+    area: Rect,
+    line_h: f32,
+    edge: theme::BarEdge,
+    solid: bool,
+) -> f32 {
+    if solid {
+        area.center().y - line_h / 2.0
+    } else {
+        match edge {
+            theme::BarEdge::Top => area.min.y + 4.0,
+            theme::BarEdge::Bottom => area.max.y - line_h - 4.0,
+        }
+    }
+}
+
+/// The cmd+f search bar, a strip over the theme's HUD line (the
+/// pane-title spot - it covers the badge and, up top, tmux's own
 /// copy-mode indicator, both redundant while searching). tmux draws the
 /// matches and moves the viewport; this is only the query line and
 /// counter.
+#[allow(clippy::too_many_arguments)]
 fn draw_search_bar(
     ui: &egui::Ui,
     pane_rect: Rect,
@@ -2611,10 +2683,12 @@ fn draw_search_bar(
     count: Option<search::MatchCount>,
     font: &FontId,
     theme: &UiTheme,
+    bar_h: Option<f32>,
 ) {
+    let hud = theme::hud_colors(theme);
     let painter = ui.painter();
     let probe =
-        painter.layout_no_wrap("M".into(), font.clone(), theme.text);
+        painter.layout_no_wrap("M".into(), font.clone(), hud.fg);
     let char_w = probe.size().x.max(1.0);
     let row_h = probe.size().y.max(1.0);
 
@@ -2625,25 +2699,28 @@ fn draw_search_bar(
         return;
     }
     let pad = Vec2::new(8.0, 3.0);
-    let (rect, _) = hud_anchor(
-        pane_rect,
-        Vec2::new(width, row_h + pad.y * 2.0),
-        theme.hud_corner,
+    let strip = bar_h.and_then(|h| split_bar(pane_rect, theme.bar_edge, h));
+    let area = strip.map_or(pane_rect, |(bar, _)| bar);
+    let line_h = row_h + pad.y * 2.0;
+    let y = hud_line_y(area, line_h, theme.bar_edge, strip.is_some());
+    let rect = Rect::from_min_size(
+        egui::pos2(area.max.x - width - 4.0, y),
+        Vec2::new(width, line_h),
     );
     painter.rect_filled(
         rect,
         CornerRadius::same(3),
-        theme::blend(theme.bg, theme.accent, 0.18),
+        theme::blend(theme.bar_bg, theme.bar_accent, 0.18),
     );
 
     let mid = rect.center().y;
     let prefix =
-        painter.layout_no_wrap("/ ".into(), font.clone(), theme.accent);
+        painter.layout_no_wrap("/ ".into(), font.clone(), theme.bar_accent);
     let text_left = rect.min.x + pad.x + prefix.size().x;
     painter.galley(
         egui::pos2(rect.min.x + pad.x, mid - prefix.size().y / 2.0),
         prefix,
-        theme.accent,
+        theme.bar_accent,
     );
 
     // Right-aligned: the match counter, then the key hint while the bar
@@ -2657,28 +2734,28 @@ fn draw_search_bar(
     if !count_text.is_empty() {
         let counter = painter.layout_no_wrap(
             count_text,
-            FontId::proportional(11.0),
-            theme.text_dim,
+            hud_font(),
+            hud.fg_dim,
         );
         right_limit -= counter.size().x;
         painter.galley(
             egui::pos2(right_limit, mid - counter.size().y / 2.0),
             counter,
-            theme.text_dim,
+            hud.fg_dim,
         );
         right_limit -= char_w;
     }
     let hint = painter.layout_no_wrap(
         "esc close · ⏎ next · ⇧⏎ prev".into(),
-        FontId::proportional(11.0),
-        theme.text_dim,
+        hud_font(),
+        hud.fg_dim,
     );
     if right_limit - hint.size().x - text_left >= 12.0 * char_w {
         right_limit -= hint.size().x;
         painter.galley(
             egui::pos2(right_limit, mid - hint.size().y / 2.0),
             hint,
-            theme.text_dim,
+            hud.fg_dim,
         );
         right_limit -= char_w;
     }
@@ -2695,8 +2772,8 @@ fn draw_search_bar(
         query.to_string()
     };
     let query_color = match count {
-        Some(c) if c.total == 0 => theme.status_err,
-        _ => theme.text,
+        Some(c) if c.total == 0 => hud.err,
+        _ => hud.fg,
     };
     let text =
         painter.layout_no_wrap(visible, font.clone(), query_color);
@@ -2712,19 +2789,16 @@ fn draw_search_bar(
             Vec2::new(char_w, row_h),
         ),
         CornerRadius::ZERO,
-        theme.accent,
+        theme.bar_accent,
     );
 }
 
-/// Small badge naming what a pane runs, drawn over the theme's HUD
-/// corner, plus the pane's git-branch and PR chips growing toward the
-/// pane's center when those features are on. Only split tabs get badges;
-/// a lone pane's title is already in the tab bar.
-/// One pane's HUD-corner line: the title badge (split tabs only - `label`
+/// One pane's HUD line: the title badge (split tabs only - `label`
 /// arrives empty on a lone pane, which gets chips without a title) and
-/// the PR/git chips beside it. Returns the (root, branch) of a PR chip
-/// right-clicked away, for the App to dismiss (a free function cannot
-/// reach the poller's shared set).
+/// the PR/git chips beside it, floating in a corner or laid on the solid
+/// strip (`bar_h` set when the strip reserved layout space this frame).
+/// Returns the (root, branch) of a PR chip right-clicked away, for the
+/// App to dismiss (a free function cannot reach the poller's shared set).
 #[allow(clippy::too_many_arguments)]
 fn draw_pane_title(
     ui: &egui::Ui,
@@ -2735,10 +2809,24 @@ fn draw_pane_title(
     pane: PaneId,
     focused: bool,
     theme: &UiTheme,
+    bar_h: Option<f32>,
 ) -> Option<(String, String)> {
-    let font = FontId::proportional(11.0);
-    let color = if focused { theme.text } else { theme.text_dim };
+    let font = hud_font();
+    let hud = theme::hud_colors(theme);
+    let color = if focused { hud.fg } else { hud.fg_dim };
     let painter = ui.painter();
+    let (area, solid) = match bar_h {
+        Some(h) => match split_bar(pane_rect, theme.bar_edge, h) {
+            Some((bar, _)) => (bar, true),
+            // Too short for a strip: the terminal kept the whole rect
+            // (same split_bar verdict), so no HUD at all.
+            None => return None,
+        },
+        None => (pane_rect, false),
+    };
+    if solid {
+        painter.rect_filled(area, CornerRadius::ZERO, theme.bar_bg);
+    }
     // Cap the badge at roughly half the pane so it never reads as
     // terminal content; a pane too narrow for even a few characters gets
     // no title, only chips.
@@ -2760,32 +2848,36 @@ fn draw_pane_title(
         }
     }
     let pad = Vec2::new(6.0, 2.0);
+    // The line's y comes from the font's row height, not the title galley
+    // (a lone pane has no title but its chips still sit on the line).
+    let line_h = ui.fonts(|f| f.row_height(&font)) + pad.y * 2.0;
+    let y = hud_line_y(area, line_h, theme.bar_edge, solid);
     let size = galley.as_ref().map_or(Vec2::ZERO, |g| g.size() + pad * 2.0);
-    let (rect, dir) = hud_anchor(pane_rect, size, theme.hud_corner);
+    let rect = Rect::from_min_size(
+        egui::pos2(area.max.x - size.x - 4.0, y),
+        size,
+    );
     if let Some(galley) = galley {
         // Translucent theme background: readable over any terminal content
-        // without fully hiding what's underneath.
-        painter.rect_filled(
-            rect,
-            CornerRadius::same(3),
-            theme.bg.gamma_multiply(0.8),
-        );
+        // without fully hiding what's underneath. The solid strip already
+        // supplied one.
+        if let Some(fill) = hud.chip_fill {
+            painter.rect_filled(rect, CornerRadius::same(3), fill);
+        }
         painter.galley(rect.min + pad, galley, color);
     }
 
     // Chips stack from the title box toward the pane's center; `edge`
-    // tracks the last drawn edge on that side, and a chip that would
-    // spill past either pane edge is dropped rather than clipped. PR
-    // chips sit nearest the title, the git chip beyond them.
-    let mut edge = if dir < 0.0 { rect.min.x } else { rect.max.x };
+    // tracks the last drawn edge, and a chip that would spill past the
+    // pane's far side is dropped rather than clipped. PR chips sit
+    // nearest the title, the git chip beyond them.
+    let mut edge = rect.min.x;
     let chip_rect = |content: Vec2, edge: f32| {
         let size = content + pad * 2.0;
-        let x = if dir < 0.0 {
-            edge - size.x - 4.0
-        } else {
-            edge + 4.0
-        };
-        Rect::from_min_size(egui::pos2(x, rect.min.y), size)
+        Rect::from_min_size(
+            egui::pos2(edge - size.x - 4.0, rect.min.y),
+            size,
+        )
     };
     let fits = |chip: &Rect| {
         chip.min.x >= pane_rect.min.x + 4.0
@@ -2807,16 +2899,14 @@ fn draw_pane_title(
         if !fits(&chip) {
             break;
         }
-        painter.rect_filled(
-            chip,
-            CornerRadius::same(3),
-            theme.bg.gamma_multiply(0.8),
-        );
+        if let Some(fill) = hud.chip_fill {
+            painter.rect_filled(chip, CornerRadius::same(3), fill);
+        }
         b.kind.draw_icon(
             painter,
             egui::pos2(chip.min.x + pad.x + icon_w * 0.38, chip.center().y),
             font.size,
-            theme,
+            &hud,
         );
         painter.galley(chip.min + pad + Vec2::new(icon_w, 0.0), galley, color);
         // A merged/closed chip can be right-clicked away - unless the
@@ -2847,18 +2937,16 @@ fn draw_pane_title(
         if dismissable && resp.secondary_clicked() {
             dismissed = Some((b.root.clone(), b.branch.clone()));
         }
-        edge = if dir < 0.0 { chip.min.x } else { chip.max.x };
+        edge = chip.min.x;
     }
 
     if let Some(g) = git {
-        let galley = ui.fonts(|f| f.layout_job(g.chip_job(font, color, theme)));
+        let galley = ui.fonts(|f| f.layout_job(g.chip_job(font, color, &hud)));
         let chip = chip_rect(galley.size(), edge);
         if fits(&chip) {
-            painter.rect_filled(
-                chip,
-                CornerRadius::same(3),
-                theme.bg.gamma_multiply(0.8),
-            );
+            if let Some(fill) = hud.chip_fill {
+                painter.rect_filled(chip, CornerRadius::same(3), fill);
+            }
             painter.galley(chip.min + pad, galley, color);
             ui.interact(chip, ui.id().with(("git-chip", pane)), Sense::hover())
                 .on_hover_text(&g.detail);
@@ -2896,19 +2984,26 @@ fn show_node(
     // False for a peeked archived workspace: panes render as a dimmed,
     // read-only preview - no input, no divider drag, no focus ring.
     interactive: bool,
+    // Some = the theme's solid HUD strip reserves this much of each pane.
+    bar_h: Option<f32>,
     rects: &mut HashMap<PaneId, Rect>,
     ui_actions: &mut Vec<UiAction>,
 ) {
     match node {
         Node::Leaf(id) => {
+            // The pane's full screen claim (focus ring, neighbor math,
+            // washes); grid coordinates must go through split_bar.
             rects.insert(*id, rect);
             let Some(pane) = panes.get_mut(id) else {
                 return;
             };
+            let split =
+                bar_h.and_then(|h| split_bar(rect, ui_theme.bar_edge, h));
+            let term_rect = split.map_or(rect, |(_, term)| term);
             let mut child =
-                ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                ui.new_child(egui::UiBuilder::new().max_rect(term_rect));
             let view = TerminalView::new(&mut child, &mut pane.backend)
-                .set_size(rect.size())
+                .set_size(term_rect.size())
                 .set_focus(*id == focused)
                 .set_font(TerminalFont::new(FontSettings {
                     font_type: font.clone(),
@@ -2939,6 +3034,22 @@ fn show_node(
             }
             if interactive && response.clicked() {
                 ui_actions.push(UiAction::FocusPane(*id));
+            }
+            // The strip sits outside the TerminalView's response; a click
+            // there must still focus the pane. (The chips' interacts
+            // register later in the frame, so they win hits over this.)
+            if let Some((bar, _)) = split {
+                if interactive
+                    && ui
+                        .interact(
+                            bar,
+                            ui.id().with(("pane-bar", *id)),
+                            Sense::click(),
+                        )
+                        .clicked()
+                {
+                    ui_actions.push(UiAction::FocusPane(*id));
+                }
             }
         },
         Node::Split {
@@ -2996,8 +3107,8 @@ fn show_node(
             );
             show_node(
                 ui, first, first_rect, path << 1, panes, focused, font,
-                term_theme, ui_theme, copy_on_select, interactive, rects,
-                ui_actions,
+                term_theme, ui_theme, copy_on_select, interactive, bar_h,
+                rects, ui_actions,
             );
             show_node(
                 ui,
@@ -3011,6 +3122,7 @@ fn show_node(
                 ui_theme,
                 copy_on_select,
                 interactive,
+                bar_h,
                 rects,
                 ui_actions,
             );
@@ -3159,6 +3271,7 @@ mod tests {
                         PaneId(1),
                         true,
                         &th,
+                        None,
                     );
                 });
             });
@@ -3240,28 +3353,124 @@ mod tests {
     }
 
     #[test]
-    fn hud_anchor_places_every_corner_inset_and_growing_inward() {
+    fn split_bar_reserves_the_edge_and_skips_short_panes() {
+        use crate::theme::BarEdge::*;
         let pane = Rect::from_min_max(
             egui::pos2(100.0, 200.0),
             egui::pos2(300.0, 400.0),
         );
-        let size = Vec2::new(50.0, 20.0);
-        use crate::theme::Corner::*;
-        let (r, dir) = hud_anchor(pane, size, TopRight);
-        assert_eq!(r.min, egui::pos2(246.0, 204.0));
-        assert_eq!(dir, -1.0);
-        let (r, dir) = hud_anchor(pane, size, TopLeft);
-        assert_eq!(r.min, egui::pos2(104.0, 204.0));
-        assert_eq!(dir, 1.0);
-        let (r, dir) = hud_anchor(pane, size, BottomRight);
-        assert_eq!(r.min, egui::pos2(246.0, 376.0));
-        assert_eq!(dir, -1.0);
-        let (r, dir) = hud_anchor(pane, size, BottomLeft);
-        assert_eq!(r.min, egui::pos2(104.0, 376.0));
-        assert_eq!(dir, 1.0);
-        for corner in [TopLeft, TopRight, BottomLeft, BottomRight] {
-            let (r, _) = hud_anchor(pane, size, corner);
-            assert!(pane.contains_rect(r), "{corner:?} spills the pane");
+        let (bar, term) = split_bar(pane, Top, 24.0).unwrap();
+        assert_eq!(bar, Rect::from_min_max(pane.min, egui::pos2(300.0, 224.0)));
+        assert_eq!(
+            term,
+            Rect::from_min_max(egui::pos2(100.0, 224.0), pane.max)
+        );
+        let (bar, term) = split_bar(pane, Bottom, 24.0).unwrap();
+        assert_eq!(bar, Rect::from_min_max(egui::pos2(100.0, 376.0), pane.max));
+        assert_eq!(
+            term,
+            Rect::from_min_max(pane.min, egui::pos2(300.0, 376.0))
+        );
+        // The two halves partition the pane exactly.
+        for edge in [Top, Bottom] {
+            let (bar, term) = split_bar(pane, edge, 24.0).unwrap();
+            assert_eq!(bar.width(), pane.width());
+            assert_eq!(bar.height() + term.height(), pane.height());
+        }
+        // Too short to give up a strip: the terminal keeps everything.
+        let short = Rect::from_min_size(pane.min, Vec2::new(200.0, 100.0));
+        assert!(split_bar(short, Top, 24.0).is_none());
+    }
+
+    #[test]
+    fn hud_line_y_matches_old_corners_and_centers_solid() {
+        use crate::theme::BarEdge::*;
+        let pane = Rect::from_min_max(
+            egui::pos2(100.0, 200.0),
+            egui::pos2(300.0, 400.0),
+        );
+        // Floating chips keep the classic 4pt corner inset.
+        assert_eq!(hud_line_y(pane, 20.0, Top, false), 204.0);
+        assert_eq!(hud_line_y(pane, 20.0, Bottom, false), 376.0);
+        // A solid strip centers the line inside itself.
+        let (bar, _) = split_bar(pane, Top, 24.0).unwrap();
+        assert_eq!(hud_line_y(bar, 20.0, Top, true), 202.0);
+    }
+
+    /// The solid strip fills the pane's full width, and the chips shed
+    /// their own translucent boxes (the strip is the background).
+    #[test]
+    fn solid_bar_paints_strip_without_chip_boxes() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("bbs").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let badges = vec![pr_status::Badge {
+            number: 7,
+            url: "https://github.com/a/b/pull/7".into(),
+            kind: pr_status::Kind::Ok,
+            detail: "#7".into(),
+            root: "/repo".into(),
+            branch: "feat-7".into(),
+        }];
+        let pane =
+            Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(880.0, 680.0));
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draw_pane_title(
+                    ui,
+                    pane,
+                    "agent-pane",
+                    None,
+                    &badges,
+                    PaneId(1),
+                    true,
+                    &th,
+                    Some(24.0),
+                );
+            });
+        });
+        fn collect(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            if let egui::Shape::Vec(v) = shape {
+                for s in v {
+                    collect(s, out);
+                }
+            } else {
+                out.push(shape.clone());
+            }
+        }
+        let mut shapes = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut shapes);
+        }
+        let strip = shapes.iter().any(|s| {
+            matches!(s, egui::Shape::Rect(r)
+                if r.fill == th.bar_bg && r.rect.width() == pane.width())
+        });
+        assert!(strip, "full-width strip missing");
+        let chip_box = shapes.iter().any(|s| {
+            matches!(s, egui::Shape::Rect(r)
+                if r.fill == th.bar_bg.gamma_multiply(0.8))
+        });
+        assert!(!chip_box, "translucent chip box painted on the strip");
+        let texts: Vec<String> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        for t in ["#7", "agent-pane"] {
+            assert!(
+                texts.iter().any(|x| x == t),
+                "{t} missing on the strip: {texts:?}"
+            );
         }
     }
 }

@@ -31,7 +31,7 @@ use egui::{Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 
 use muxterm::state;
 
-use crate::theme::UiTheme;
+use crate::theme::HudColors;
 use crate::tmux;
 
 /// Local scan cadence (pane cwds + git branches; no network).
@@ -82,14 +82,14 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn color(self, th: &UiTheme) -> Color32 {
+    pub fn color(self, hud: &HudColors) -> Color32 {
         match self {
-            Kind::Err => th.status_err,
-            Kind::Warn => th.status_warn,
-            Kind::Ok => th.status_ok,
-            Kind::Merged => th.status_merged,
-            Kind::Draft => th.text_dim,
-            Kind::Neutral => th.text_dim,
+            Kind::Err => hud.err,
+            Kind::Warn => hud.warn,
+            Kind::Ok => hud.ok,
+            Kind::Merged => hud.merged,
+            Kind::Draft => hud.fg_dim,
+            Kind::Neutral => hud.fg_dim,
         }
     }
 
@@ -103,11 +103,11 @@ impl Kind {
         painter: &egui::Painter,
         center: Pos2,
         font_size: f32,
-        th: &UiTheme,
+        hud: &HudColors,
     ) {
         let r = font_size * 0.30;
         let stroke =
-            Stroke::new((font_size * 0.12).max(1.0), self.color(th));
+            Stroke::new((font_size * 0.12).max(1.0), self.color(hud));
         match self {
             Kind::Err => {
                 let d = r * 0.8;
@@ -127,7 +127,7 @@ impl Kind {
                 );
             },
             Kind::Warn => {
-                painter.circle_filled(center, r * 0.62, self.color(th));
+                painter.circle_filled(center, r * 0.62, self.color(hud));
             },
             Kind::Ok => {
                 let mid = Pos2::new(center.x - r * 0.25, center.y + r * 0.8);
@@ -906,6 +906,7 @@ mod tests {
         let ctx = egui::Context::default();
         let preset = theme::preset("iterm-dark").unwrap();
         let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let hud = theme::hud_colors(&th);
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
@@ -930,7 +931,7 @@ mod tests {
                         ui.painter(),
                         Pos2::new(20.0 + 30.0 * i as f32, 50.0),
                         11.0,
-                        &th,
+                        &hud,
                     );
                 }
             });

@@ -16,8 +16,18 @@ pub struct UiTheme {
     pub accent: Color32,
     /// Focused-pane border stroke width in points (color: `accent`).
     pub border_width: f32,
-    /// Pane corner the title badge, status chips, and search bar anchor to.
-    pub hud_corner: Corner,
+    /// How the pane HUD renders (floating chips or a solid strip).
+    pub bar_style: BarStyle,
+    /// Pane edge the title badge, status chips, and search bar sit on.
+    pub bar_edge: BarEdge,
+    /// Solid-strip fill. In chips mode this equals `bg` unless overridden;
+    /// chips apply their own translucency at paint time, keeping the old
+    /// pixels.
+    pub bar_bg: Color32,
+    pub bar_fg: Color32,
+    pub bar_fg_dim: Color32,
+    /// Highlight color inside the bar (search-bar prefix and cursor).
+    pub bar_accent: Color32,
     /// Translucent wash painted over unfocused panes (bg at some alpha).
     pub dim_overlay: Color32,
     /// Heavier wash over every pane of a peeked *archived* workspace, marking
@@ -52,18 +62,44 @@ pub struct FontSpec {
     pub size: f32,
 }
 
-/// Which pane corner the title badge, status chips, and search bar
-/// anchor to. Bottom corners are supported but sit over the prompt line,
-/// so preset defaults stay on top. Only TopRight is used by the built-in
-/// presets today; the other variants are the knob future looks turn.
-#[allow(dead_code)]
+/// Which pane edge the HUD (title badge, status chips, search bar) sits
+/// on. In chips mode Bottom floats the badges over the prompt line and
+/// tmux's copy-mode indicator, so bottom looks want the solid style.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Corner {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
+pub enum BarEdge {
+    Top,
+    Bottom,
 }
+
+/// How the pane HUD renders: floating translucent chips in a corner
+/// (overlay, no layout space) or a full-width solid strip that reserves
+/// layout space so it never covers terminal content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarStyle {
+    Chips,
+    Solid,
+}
+
+/// A preset's HUD bar. Colors are None = derive from the theme, which in
+/// chips mode reproduces the classic translucent-bg / chrome-text look
+/// exactly.
+pub struct BarSpec {
+    pub style: BarStyle,
+    pub edge: BarEdge,
+    pub bg: Option<&'static str>,
+    pub fg: Option<&'static str>,
+    pub accent: Option<&'static str>,
+}
+
+/// The all-derived floating-chips bar, the look every theme wore before
+/// bars became part of a preset's wardrobe.
+const CHIPS: BarSpec = BarSpec {
+    style: BarStyle::Chips,
+    edge: BarEdge::Top,
+    bg: None,
+    fg: None,
+    accent: None,
+};
 
 pub struct Preset {
     pub bg: &'static str,
@@ -75,8 +111,8 @@ pub struct Preset {
     pub font: FontSpec,
     /// Focused-pane border stroke width in points (color stays `accent`).
     pub border_width: f32,
-    /// Pane corner for the title badge + chips + search bar.
-    pub hud_corner: Corner,
+    /// The HUD bar: style, edge, and optional explicit colors.
+    pub bar: BarSpec,
 }
 
 /// Px437 IBM VGA 8x16 from the Ultimate Oldschool PC Font Pack
@@ -109,7 +145,7 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
             ],
             font: MONACO,
             border_width: 1.0,
-            hud_corner: Corner::TopRight,
+            bar: CHIPS,
         }),
         // The DOS/VGA text-mode 16-color palette on a pure-black CRT
         // screen — the colors BBS ANSI art was drawn with — but with the
@@ -138,7 +174,16 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
             },
             // A retro slab of a frame, like a DOS double-line box border.
             border_width: 3.0,
-            hud_corner: Corner::TopRight,
+            // Inverse video: the solid ANSI-green status line every DOS
+            // program wore, black text on the green slab, DOS-yellow
+            // highlights.
+            bar: BarSpec {
+                style: BarStyle::Solid,
+                edge: BarEdge::Top,
+                bg: Some("#00aa00"),
+                fg: Some("#000000"),
+                accent: Some("#ffff55"),
+            },
         }),
         "iterm-light" => Some(&Preset {
             bg: "#ffffff",
@@ -152,7 +197,7 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
             ],
             font: MONACO,
             border_width: 1.0,
-            hud_corner: Corner::TopRight,
+            bar: CHIPS,
         }),
         "github-light" => Some(&Preset {
             bg: "#ffffff",
@@ -174,7 +219,16 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 size: 12.0,
             },
             border_width: 1.0,
-            hud_corner: Corner::TopRight,
+            // GitHub's blue as a footer strip. The accent must be explicit:
+            // the derived one is the same blue as the strip, which would
+            // paint the search cursor invisible.
+            bar: BarSpec {
+                style: BarStyle::Solid,
+                edge: BarEdge::Bottom,
+                bg: Some("#0969da"),
+                fg: Some("#ffffff"),
+                accent: Some("#9ecbff"),
+            },
         }),
         _ => None,
     }
@@ -237,7 +291,15 @@ pub fn build(
         colors.insert(key, value.into());
     }
 
+    // Bar colors never enter the seeded map (their defaults are *built*
+    // chrome colors, not preset hex); they resolve after the chrome below.
+    const BAR_KEYS: [&str; 3] =
+        ["bar_background", "bar_foreground", "bar_accent"];
+
     for (key, value) in overrides {
+        if BAR_KEYS.contains(&key.as_str()) {
+            continue;
+        }
         let known = colors.contains_key(key.as_str());
         if !known {
             log::warn!("config: unknown color key {key:?}");
@@ -295,21 +357,59 @@ pub fn build(
     // Chrome must darken subtly on light backgrounds and strongly on dark
     // ones, and text emphasis goes toward the opposite pole of the bg.
     let light = is_light(bg);
+    let text = blend(
+        fg,
+        if light { Color32::BLACK } else { Color32::WHITE },
+        0.2,
+    );
+    let text_dim = blend(fg, bg, 0.45);
+
+    // Bar colors: [colors] override > preset spec > derived from the
+    // chrome. Invalid override hex warns and falls through, like the main
+    // loop above.
+    let bar_over = |key: &str| {
+        overrides.get(key).and_then(|v| {
+            let c = parse_hex(v);
+            if c.is_none() {
+                log::warn!("config: invalid hex {v:?} for {key:?}");
+            }
+            c
+        })
+    };
+    let spec = &preset.bar;
+    let pick = |over: Option<Color32>,
+                hex: Option<&'static str>,
+                derived: Color32| {
+        over.or_else(|| hex.and_then(parse_hex)).unwrap_or(derived)
+    };
+    let bar_bg = pick(bar_over("bar_background"), spec.bg, bg);
+    let bar_fg = pick(bar_over("bar_foreground"), spec.fg, text);
+    let bar_accent = pick(bar_over("bar_accent"), spec.accent, accent);
+    // A fully-derived bar reuses text_dim byte-for-byte (the chips-mode
+    // pixel contract); any explicit half re-derives dim against the
+    // actual pair.
+    let bar_fg_dim = if bar_bg == bg && bar_fg == text {
+        text_dim
+    } else {
+        blend(bar_fg, bar_bg, 0.45)
+    };
+
     let ui = UiTheme {
         bg,
         tab_bar_bg: blend(bg, Color32::BLACK, if light { 0.07 } else { 0.35 }),
         tab_active_bg: blend(bg, fg, 0.13),
         tab_hover_bg: blend(bg, fg, 0.07),
         divider: blend(bg, fg, 0.12),
-        text: blend(
-            fg,
-            if light { Color32::BLACK } else { Color32::WHITE },
-            0.2,
-        ),
-        text_dim: blend(fg, bg, 0.45),
+        text,
+        text_dim,
         accent,
         border_width: preset.border_width,
-        hud_corner: preset.hud_corner,
+        bar_style: spec.style,
+        bar_edge: spec.edge,
+        bar_bg,
+        bar_fg,
+        bar_fg_dim,
+        bar_accent,
         // A wash of the background recedes inactive panes. The same alpha
         // reads far weaker on dark themes — a near-black pour barely touches
         // the sparse bright glyphs, while on a light bg it drops the
@@ -346,9 +446,64 @@ pub fn build(
     (TerminalTheme::new(Box::new(palette)), ui)
 }
 
-pub(crate) fn is_light(c: Color32) -> bool {
+fn luma(c: Color32) -> f32 {
     0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
-        >= 128.0
+}
+
+pub(crate) fn is_light(c: Color32) -> bool {
+    luma(c) >= 128.0
+}
+
+/// Minimum luma distance (of 255) for a status color to read against the
+/// solid strip; anything closer falls back to `bar_fg`. The chip icons
+/// already encode their state as a shape, so the fallback loses only
+/// redundancy.
+const BAR_CONTRAST: f32 = 48.0;
+
+fn on_bar(c: Color32, bar_bg: Color32, bar_fg: Color32) -> Color32 {
+    if (luma(c) - luma(bar_bg)).abs() >= BAR_CONTRAST {
+        c
+    } else {
+        bar_fg
+    }
+}
+
+/// Everything `draw_pane_title` / `draw_search_bar` color with: the
+/// theme-derived translucent chips, or the bar-derived solid strip with
+/// the status-contrast guard applied.
+pub struct HudColors {
+    pub fg: Color32,
+    pub fg_dim: Color32,
+    pub ok: Color32,
+    pub warn: Color32,
+    pub err: Color32,
+    pub merged: Color32,
+    /// Some = each box paints its own translucent rounded fill (chips);
+    /// None = the solid strip already supplied the background.
+    pub chip_fill: Option<Color32>,
+}
+
+pub fn hud_colors(ui: &UiTheme) -> HudColors {
+    match ui.bar_style {
+        BarStyle::Chips => HudColors {
+            fg: ui.bar_fg,
+            fg_dim: ui.bar_fg_dim,
+            ok: ui.status_ok,
+            warn: ui.status_warn,
+            err: ui.status_err,
+            merged: ui.status_merged,
+            chip_fill: Some(ui.bar_bg.gamma_multiply(0.8)),
+        },
+        BarStyle::Solid => HudColors {
+            fg: ui.bar_fg,
+            fg_dim: ui.bar_fg_dim,
+            ok: on_bar(ui.status_ok, ui.bar_bg, ui.bar_fg),
+            warn: on_bar(ui.status_warn, ui.bar_bg, ui.bar_fg),
+            err: on_bar(ui.status_err, ui.bar_bg, ui.bar_fg),
+            merged: on_bar(ui.status_merged, ui.bar_bg, ui.bar_fg),
+            chip_fill: None,
+        },
+    }
 }
 
 pub fn apply_visuals(ctx: &egui::Context, ui: &UiTheme) {
@@ -388,6 +543,13 @@ mod tests {
                 p.border_width > 0.0 && p.border_width <= 8.0,
                 "{name} border width"
             );
+            for (half, hex) in
+                [("bg", p.bar.bg), ("fg", p.bar.fg), ("accent", p.bar.accent)]
+            {
+                if let Some(hex) = hex {
+                    assert!(parse_hex(hex).is_some(), "{name} bar {half}");
+                }
+            }
         }
     }
 
@@ -396,10 +558,61 @@ mod tests {
         let (_, ui) =
             build(preset("iterm-dark").unwrap(), &HashMap::new(), 0.25);
         assert_eq!(ui.border_width, 1.0);
-        assert_eq!(ui.hud_corner, Corner::TopRight);
+        assert_eq!(ui.bar_style, BarStyle::Chips);
+        assert_eq!(ui.bar_edge, BarEdge::Top);
+        // The chips pixel contract: a derived bar IS the chrome, so the
+        // unified paint path reproduces the old look byte-for-byte.
+        assert_eq!(ui.bar_bg, ui.bg);
+        assert_eq!(ui.bar_fg, ui.text);
+        assert_eq!(ui.bar_fg_dim, ui.text_dim);
+        assert_eq!(ui.bar_accent, ui.accent);
         let (_, ui) = build(preset("bbs").unwrap(), &HashMap::new(), 0.25);
         assert_eq!(ui.border_width, 3.0);
-        assert_eq!(ui.hud_corner, Corner::TopRight);
+        assert_eq!(ui.bar_style, BarStyle::Solid);
+        assert_eq!(ui.bar_edge, BarEdge::Top);
+        assert_eq!(ui.bar_bg, Color32::from_rgb(0x00, 0xaa, 0x00));
+        assert_eq!(ui.bar_fg, Color32::from_rgb(0x00, 0x00, 0x00));
+        assert_eq!(ui.bar_fg_dim, blend(ui.bar_fg, ui.bar_bg, 0.45));
+        let (_, ui) =
+            build(preset("github-light").unwrap(), &HashMap::new(), 0.25);
+        assert_eq!(ui.bar_style, BarStyle::Solid);
+        assert_eq!(ui.bar_edge, BarEdge::Bottom);
+    }
+
+    #[test]
+    fn bar_colors_override_and_invalid_fall_through() {
+        let mut overrides = HashMap::new();
+        overrides
+            .insert("bar_background".to_string(), "#123456".to_string());
+        overrides
+            .insert("bar_foreground".to_string(), "nonsense".to_string());
+        let (_, ui) = build(preset("bbs").unwrap(), &overrides, 0.25);
+        assert_eq!(ui.bar_bg, Color32::from_rgb(0x12, 0x34, 0x56));
+        // Invalid hex keeps the preset's half...
+        assert_eq!(ui.bar_fg, Color32::from_rgb(0x00, 0x00, 0x00));
+        // ...and an explicit pair derives dim from what actually built.
+        assert_eq!(ui.bar_fg_dim, blend(ui.bar_fg, ui.bar_bg, 0.45));
+    }
+
+    #[test]
+    fn on_bar_guards_low_contrast() {
+        let (_, ui) = build(preset("bbs").unwrap(), &HashMap::new(), 0.25);
+        let hud = hud_colors(&ui);
+        // ANSI green on the green strip is invisible - the motivating
+        // case - and falls back to the bar's black text.
+        assert_eq!(ui.status_ok, ui.bar_bg);
+        assert_eq!(hud.ok, ui.bar_fg);
+        // A distant color passes through untouched.
+        assert_eq!(
+            on_bar(Color32::WHITE, ui.bar_bg, ui.bar_fg),
+            Color32::WHITE
+        );
+        // Chips mode never rewrites status colors.
+        let (_, ui) =
+            build(preset("iterm-dark").unwrap(), &HashMap::new(), 0.25);
+        let hud = hud_colors(&ui);
+        assert_eq!(hud.ok, ui.status_ok);
+        assert_eq!(hud.chip_fill, Some(ui.bar_bg.gamma_multiply(0.8)));
     }
 
     #[test]
