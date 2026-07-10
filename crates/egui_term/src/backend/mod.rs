@@ -699,6 +699,29 @@ fn url_regex() -> regex::Regex {
     regex::Regex::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\x{0}-\x{1F}\x{7F}-\x{9F}<>"\s{-}\^⟨⟩`]+"#).unwrap()
 }
 
+/// muxterm patch P23: strip the sentence punctuation a URL match swallowed
+/// - `.,;:!?'()` are all legal URL chars, so prose like
+/// "(https://ex.com/tokens/)." matches through the close-paren and dot.
+/// Only the trailing run is shed (a mid-URL `?query` is untouched), and a
+/// closing bracket only while unbalanced, keeping Wikipedia-style
+/// "..._(disambiguation)" URLs whole.
+fn trim_url_punct(text: &str) -> &str {
+    let mut s = text;
+    loop {
+        let Some(c) = s.chars().last() else { return s };
+        let trim = match c {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
+            ')' => s.matches('(').count() < s.matches(')').count(),
+            ']' => s.matches('[').count() < s.matches(']').count(),
+            _ => false,
+        };
+        if !trim {
+            return s;
+        }
+        s = &s[..s.len() - c.len_utf8()];
+    }
+}
+
 /// muxterm patch P10: path-shaped tokens - absolute (`/x/y`), homedir
 /// (`~/x`), dot-relative (`./x`, `../x`), and bare-relative with at least
 /// one slash (`src/app.rs`, as rustc and grep print), optionally carrying a
@@ -898,13 +921,17 @@ fn link_match_at<T: EventListener>(
                     .iter()
                     .map(|(t, _)| t.chars().count())
                     .sum::<usize>();
-            let hit = |re: &regex::Regex| {
+            // URL matches shed trailing sentence punctuation (P23) before
+            // the click test, so the shed chars neither highlight nor open.
+            let hit = |re: &regex::Regex, trim: bool| {
                 for m in re.find_iter(&text) {
+                    let s =
+                        if trim { trim_url_punct(m.as_str()) } else { m.as_str() };
                     let start = text[..m.start()].chars().count();
-                    let end = text[..m.end()].chars().count(); // exclusive
+                    let end = start + s.chars().count(); // exclusive
                     if (start..end).contains(&click_at) {
                         return Some((
-                            m.as_str().to_string(),
+                            s.to_string(),
                             points[start]..=points[end - 1],
                         ));
                     }
@@ -912,9 +939,9 @@ fn link_match_at<T: EventListener>(
                 None
             };
             let found = if i == j {
-                hit(url_regex).or_else(|| hit(path_regex))
+                hit(url_regex, true).or_else(|| hit(path_regex, false))
             } else {
-                hit(path_regex)
+                hit(path_regex, false)
             };
             if let Some(cand) = found {
                 cands.push(cand);
@@ -1019,6 +1046,42 @@ mod tests {
         // come back, not the /a/b tail.
         let text = link_at("https://example.com/a/b", 0, 21).unwrap();
         assert_eq!(text, "https://example.com/a/b");
+    }
+
+    // muxterm patch P23: trailing sentence punctuation is not part of a URL.
+    #[test]
+    fn urls_shed_trailing_punctuation() {
+        let line =
+            "docs (https://docs.slack.dev/authentication/tokens/). here";
+        assert_eq!(
+            link_at(line, 0, 12),
+            Some("https://docs.slack.dev/authentication/tokens/".into())
+        );
+        // The shed close-paren itself is not clickable.
+        assert_eq!(link_at(line, 0, 51), None);
+    }
+
+    #[test]
+    fn balanced_parens_stay_in_the_url() {
+        let line = "see https://en.wikipedia.org/wiki/Rust_(language), ok";
+        assert_eq!(
+            link_at(line, 0, 10),
+            Some("https://en.wikipedia.org/wiki/Rust_(language)".into())
+        );
+    }
+
+    #[test]
+    fn url_punct_trim_edges() {
+        for (raw, trimmed) in [
+            ("https://x.com/a).", "https://x.com/a"),
+            ("https://x.com/docs?", "https://x.com/docs"),
+            ("https://x.com/search?q=foo", "https://x.com/search?q=foo"),
+            ("https://x.com/a_(b)_(c))", "https://x.com/a_(b)_(c)"),
+            ("https://x.com/a],;!'", "https://x.com/a"),
+            ("https://x.com/a:8080", "https://x.com/a:8080"),
+        ] {
+            assert_eq!(trim_url_punct(raw), trimmed, "for {raw:?}");
+        }
     }
 
     #[test]

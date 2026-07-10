@@ -235,3 +235,13 @@ tmux-backed design. Local patches:
   decrease invalidates. Also: the every-frame no-op `Resize` command now
   bails before taking the terminal lock, so frames never contend with a
   streaming parser.
+- **P23** (`src/backend/mod.rs`, `trim_url_punct`): URL matches shed
+  trailing sentence punctuation. `.,;:!?')]` are all legal URL chars, so
+  prose like "(https://ex.com/tokens/)." matched - and opened - through
+  the close-paren and dot. `link_match_at` now trims the trailing
+  punctuation run off a URL match before the click test, so the shed
+  chars neither underline on hover nor open on click; a mid-URL `?query`
+  is untouched, and a closing bracket is shed only while unbalanced
+  within the match, keeping Wikipedia-style "..._(disambiguation)" URLs
+  whole. Paths are exempt: the app-side opener already strips their
+  punctuation candidate-by-candidate under an existence check.
