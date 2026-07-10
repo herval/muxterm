@@ -33,6 +33,9 @@ pub enum SidebarAction {
 pub enum Status {
     /// No agent, or an agent that has gone quiet: a static accent dot.
     Idle,
+    /// An agent's turn ended but a background job it started still runs
+    /// (bg_jobs.rs): the working triangle, hollow.
+    Background,
     /// An agent produced output recently: a pulsating green light.
     Working,
     /// An agent raised its hand / rang the bell and is waiting: steady red.
@@ -176,6 +179,8 @@ fn pulse(bright: Color32, bg: Color32, time: Option<f64>) -> Color32 {
 /// The row's status icon, sized against the row font. One distinct shape
 /// per state - color alone must never be the only signal:
 /// - Idle: a hollow accent ring (nothing running).
+/// - Background: the play-triangle stroked hollow, breathing green - a job
+///   runs, but not the agent's own turn.
 /// - Working: a filled play-triangle breathing green (`pulse`).
 /// - Blocked: a steady red exclamation mark (bar + dot).
 fn status_icon(
@@ -187,6 +192,13 @@ fn status_icon(
     time: Option<f64>,
 ) {
     let r = font_size * 0.30;
+    let triangle = || {
+        vec![
+            Pos2::new(center.x - r * 0.62, center.y - r),
+            Pos2::new(center.x - r * 0.62, center.y + r),
+            Pos2::new(center.x + r * 0.9, center.y),
+        ]
+    };
     match status {
         Status::Idle => {
             painter.circle_stroke(
@@ -195,14 +207,18 @@ fn status_icon(
                 Stroke::new((font_size * 0.09).max(1.0), t.accent),
             );
         },
+        Status::Background => {
+            painter.add(egui::Shape::closed_line(
+                triangle(),
+                Stroke::new(
+                    (font_size * 0.09).max(1.0),
+                    pulse(t.status_ok, t.bg, time),
+                ),
+            ));
+        },
         Status::Working => {
-            let points = vec![
-                Pos2::new(center.x - r * 0.62, center.y - r),
-                Pos2::new(center.x - r * 0.62, center.y + r),
-                Pos2::new(center.x + r * 0.9, center.y),
-            ];
             painter.add(egui::Shape::convex_polygon(
-                points,
+                triangle(),
                 pulse(t.status_ok, t.bg, time),
                 Stroke::NONE,
             ));
@@ -252,18 +268,20 @@ fn workspace_row(
 
     // The leading icon is the status light, and its *shape* carries the
     // state as much as its color (so it reads without color vision): a
-    // quiet ring when idle, a breathing play-triangle while an agent works,
-    // a steady red exclamation while one is blocked waiting. Painter-drawn,
+    // quiet ring when idle, a breathing play-triangle while an agent works
+    // (hollow when only a background job it left behind still runs), a
+    // steady red exclamation while one is blocked waiting. Painter-drawn,
     // not a glyph: advance widths vary across terminal fonts/fallbacks, a
     // fixed band doesn't.
     //
-    // Working animates only while the window has focus, and at PULSE_FRAME
-    // rather than every frame: agents run for hours, so an unthrottled
-    // request_repaint here means the whole app renders at display refresh
-    // rate more or less permanently - even sitting behind other windows.
-    // Unfocused, the triangle holds steady and the light stays honest via
-    // the App's idle heartbeat and PTY-event repaints.
-    let animate = row.status == Status::Working && ui.input(|i| i.focused);
+    // The breathing states animate only while the window has focus, and at
+    // PULSE_FRAME rather than every frame: agents run for hours, so an
+    // unthrottled request_repaint here means the whole app renders at
+    // display refresh rate more or less permanently - even sitting behind
+    // other windows. Unfocused, the triangle holds steady and the light
+    // stays honest via the App's idle heartbeat and PTY-event repaints.
+    let animate = matches!(row.status, Status::Working | Status::Background)
+        && ui.input(|i| i.focused);
     if animate {
         ui.ctx().request_repaint_after(PULSE_FRAME);
     }
@@ -368,8 +386,9 @@ mod tests {
 
     /// Render one row per status headlessly and check each state's shape
     /// actually paints: idle's hollow ring (stroked, unfilled circle),
-    /// working's play-triangle (filled path), blocked's red exclamation
-    /// (a status_err-filled circle for its dot). Guards the "shape, not
+    /// working's play-triangle (filled path), background's hollow triangle
+    /// (stroked, unfilled path), blocked's red exclamation (a
+    /// status_err-filled circle for its dot). Guards the "shape, not
     /// just color" contract.
     #[test]
     fn sidebar_paints_distinct_status_shapes() {
@@ -402,6 +421,14 @@ mod tests {
                 status: Status::Blocked,
                 archived: false,
             },
+            Row {
+                tab_index: 3,
+                title: "bg-ws".into(),
+                subtitle: None,
+                active: false,
+                status: Status::Background,
+                archived: false,
+            },
         ];
 
         let input = egui::RawInput {
@@ -429,7 +456,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\u{1}");
-        for title in ["resting-ws", "busy-ws", "stuck-ws"] {
+        for title in ["resting-ws", "busy-ws", "stuck-ws", "bg-ws"] {
             assert!(texts.contains(title), "missing {title:?} in {texts:?}");
         }
 
@@ -437,66 +464,75 @@ mod tests {
             matches!(s, egui::Shape::Circle(c)
                 if c.fill == Color32::TRANSPARENT && c.stroke.width > 0.0)
         });
-        let triangle =
-            shapes.iter().any(|s| matches!(s, egui::Shape::Path(_)));
+        let triangle = shapes.iter().any(|s| {
+            matches!(s, egui::Shape::Path(p) if p.fill != Color32::TRANSPARENT)
+        });
+        let hollow_triangle = shapes.iter().any(|s| {
+            matches!(s, egui::Shape::Path(p)
+                if p.fill == Color32::TRANSPARENT && p.stroke.width > 0.0)
+        });
         let bang_dot = shapes.iter().any(|s| {
             matches!(s, egui::Shape::Circle(c) if c.fill == th.status_err)
         });
         assert!(ring, "idle ring not painted");
         assert!(triangle, "working play-triangle not painted");
+        assert!(hollow_triangle, "background hollow triangle not painted");
         assert!(bang_dot, "blocked exclamation dot not painted");
     }
 
-    /// The working pulse schedules its own repaints, but throttled (at
-    /// PULSE_FRAME, never every frame) and only while the window is focused.
-    /// Guards the battery contract: agents work for hours, and one working
-    /// row must not keep the render loop at display refresh rate - nor
-    /// render at all while the app sits behind other windows.
+    /// The breathing pulse (working and background alike) schedules its own
+    /// repaints, but throttled (at PULSE_FRAME, never every frame) and only
+    /// while the window is focused. Guards the battery contract: agents work
+    /// for hours, and one breathing row must not keep the render loop at
+    /// display refresh rate - nor render at all while the app sits behind
+    /// other windows.
     #[test]
     fn working_pulse_repaint_is_throttled_and_focus_gated() {
         let ctx = egui::Context::default();
         let preset = theme::preset("iterm-dark").unwrap();
         let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
         let font = FontId::monospace(14.0);
-        let rows = vec![Row {
-            tab_index: 0,
-            title: "busy-ws".into(),
-            subtitle: None,
-            active: false,
-            status: Status::Working,
-            archived: false,
-        }];
-        let mut frame = |ctx: &egui::Context| {
-            let _ = show(ctx, &rows, &font, &th);
-        };
-        let input = |focused: bool| egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                Vec2::new(900.0, 700.0),
-            )),
-            focused,
-            ..Default::default()
-        };
+        for status in [Status::Working, Status::Background] {
+            let rows = vec![Row {
+                tab_index: 0,
+                title: "busy-ws".into(),
+                subtitle: None,
+                active: false,
+                status,
+                archived: false,
+            }];
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(ctx, &rows, &font, &th);
+            };
+            let input = |focused: bool| egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 700.0),
+                )),
+                focused,
+                ..Default::default()
+            };
 
-        let _ = ctx.run(input(true), &mut frame);
-        let out = ctx.run(input(true), &mut frame);
-        let delay =
-            out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
-        assert!(
-            delay > Duration::ZERO,
-            "focused pulse repaints every frame (delay {delay:?})"
-        );
-        assert!(
-            delay <= PULSE_FRAME,
-            "focused pulse stopped animating (delay {delay:?})"
-        );
+            let _ = ctx.run(input(true), &mut frame);
+            let out = ctx.run(input(true), &mut frame);
+            let delay =
+                out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            assert!(
+                delay > Duration::ZERO,
+                "focused pulse repaints every frame (delay {delay:?})"
+            );
+            assert!(
+                delay <= PULSE_FRAME,
+                "focused pulse stopped animating (delay {delay:?})"
+            );
 
-        let out = ctx.run(input(false), &mut frame);
-        let delay =
-            out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
-        assert!(
-            delay > Duration::from_secs(1),
-            "unfocused pulse still schedules repaints (delay {delay:?})"
-        );
+            let out = ctx.run(input(false), &mut frame);
+            let delay =
+                out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+            assert!(
+                delay > Duration::from_secs(1),
+                "unfocused pulse still schedules repaints (delay {delay:?})"
+            );
+        }
     }
 }

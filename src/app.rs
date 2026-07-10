@@ -21,6 +21,7 @@ use muxterm::agent::{self, Agent};
 
 use crate::ai_prompt::{self, LineTracker, PromptMachine, Verdict};
 use crate::attention;
+use crate::bg_jobs;
 use crate::config;
 use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
@@ -139,6 +140,18 @@ pub struct App {
     /// their lifecycle hooks -> `mux agent-event` (installed by
     /// agent_hooks::ensure_installed); non-agent programs never light it.
     agent_states: std::collections::BTreeMap<String, mesh::AgentState>,
+    /// Sessions whose idle agent still has a live Claude-style background
+    /// shell (Bash run_in_background): Stop reported idle but a job is in
+    /// flight. Derived on the poll tick, never written to agent-state. Feeds
+    /// the sidebar's Background status; only idle agent panes are scanned -
+    /// Working and Blocked outrank Background, so scanning them could never
+    /// change a pixel. Refreshed by one-shot bg_jobs::spawn_scan threads: a
+    /// full ps is tens of ms, too slow for the synchronous tick.
+    bg_jobs: HashSet<String>,
+    bg_tx: Sender<HashSet<String>>,
+    bg_rx: Receiver<HashSet<String>>,
+    /// A ps scan is in flight; the tick starts at most one at a time.
+    bg_scan_inflight: bool,
     /// tab_id -> worktree result, streamed in by `workspace::spawn_worktree`.
     /// The checkout runs off the UI thread into the pre-claimed directory the
     /// pane already sits in; when it lands we launch the agent, so a big/lfs
@@ -178,6 +191,7 @@ impl App {
         git_status::spawn(cc.egui_ctx.clone(), git_tx, git_enabled.clone());
         let (title_tx, title_rx) = mpsc::channel();
         let (worktree_tx, worktree_rx) = mpsc::channel();
+        let (bg_tx, bg_rx) = mpsc::channel();
         let (probe_tx, probe_rx) = mpsc::channel();
         // Pre-warm the binary probes for every registry agent so the
         // settings/popup lists can hide uninstalled CLIs. Each probe spawns
@@ -230,6 +244,10 @@ impl App {
             naming: HashSet::new(),
             pane_snap: HashMap::new(),
             agent_states: std::collections::BTreeMap::new(),
+            bg_jobs: HashSet::new(),
+            bg_tx,
+            bg_rx,
+            bg_scan_inflight: false,
             worktree_tx,
             worktree_rx,
             pending_worktrees: HashSet::new(),
@@ -1701,6 +1719,28 @@ impl eframe::App for App {
                 }
                 true
             });
+            // Background-job scan roots: idle hook state AND the agent CLI
+            // still foreground. A shell foreground means the agent exited
+            // (the prune's territory), and a marker match under a *working*
+            // agent is just a foreground Bash tool (bg_jobs.rs).
+            let roots: Vec<(String, u32)> = self
+                .agent_states
+                .iter()
+                .filter(|(_, s)| s.state == "idle")
+                .filter_map(|(session, _)| {
+                    let snap = self.pane_snap.get(session)?;
+                    (!tmux::is_shell(&snap.cmd))
+                        .then_some((session.clone(), snap.pid?))
+                })
+                .collect();
+            // Gate closed (agent resumed or exited) -> lights out on this
+            // tick, not when the next scan lands.
+            self.bg_jobs
+                .retain(|s| roots.iter().any(|(sess, _)| sess == s));
+            if !roots.is_empty() && !self.bg_scan_inflight {
+                self.bg_scan_inflight = true;
+                bg_jobs::spawn_scan(roots, self.bg_tx.clone(), ctx.clone());
+            }
             self.sync_workspace_roots();
         }
 
@@ -1763,6 +1803,12 @@ impl eframe::App for App {
         }
         while let Ok(snapshot) = self.git_rx.try_recv() {
             self.git = snapshot;
+        }
+        // A scan result landing just after its gate closed can be stale for
+        // at most one tick; the tick's retain corrects it.
+        while let Ok(found) = self.bg_rx.try_recv() {
+            self.bg_scan_inflight = false;
+            self.bg_jobs = found;
         }
         while let Ok((bin, ok)) = self.probe_rx.try_recv() {
             self.agent_ok.insert(bin, ok);
@@ -1858,7 +1904,10 @@ impl eframe::App for App {
                     // silent thinking), "attention" when the agent stopped
                     // for a permission/notification. Non-agent programs never
                     // light it. "Blocked" also covers a pane raising its hand
-                    // (bell / `mux notify`), and outranks working.
+                    // (bell / `mux notify`), and outranks working. "Background"
+                    // is the one derived state: an idle agent whose
+                    // run_in_background shell still lives under the pane's
+                    // process tree (bg_jobs.rs) - no hook exists for those.
                     let hook_state = |wanted: &str| {
                         tab.panes.values().any(|p| {
                             self.agent_states
@@ -1874,6 +1923,12 @@ impl eframe::App for App {
                         sidebar::Status::Blocked
                     } else if hook_state("working") {
                         sidebar::Status::Working
+                    } else if tab
+                        .panes
+                        .values()
+                        .any(|p| self.bg_jobs.contains(&p.session))
+                    {
+                        sidebar::Status::Background
                     } else {
                         sidebar::Status::Idle
                     };

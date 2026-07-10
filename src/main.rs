@@ -4,6 +4,7 @@ mod agent_hooks;
 mod ai_prompt;
 mod app;
 mod attention;
+mod bg_jobs;
 mod config;
 mod git_status;
 mod keys;

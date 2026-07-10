@@ -221,10 +221,11 @@ impl TmuxCtl {
         (!cmd.is_empty()).then_some(cmd)
     }
 
-    /// Foreground process + cwd of every session's active pane in one tmux
-    /// round trip. Polled once a second for the sidebar's working-dot ("is
-    /// something other than a shell running?") and the workspace-root sync
-    /// ("did every pane leave the workspace's folder?"), so one subprocess
+    /// Foreground process + pid + cwd of every session's active pane in one
+    /// tmux round trip. Polled once a second for the sidebar's working-dot
+    /// ("is something other than a shell running?"), the workspace-root sync
+    /// ("did every pane leave the workspace's folder?"), and the
+    /// background-job scan's walk roots (bg_jobs), so one subprocess
     /// covering all panes matters - the per-session getters would be N.
     pub fn pane_snapshot(&self) -> HashMap<String, PaneSnap> {
         let out = Command::new(&self.bin)
@@ -234,7 +235,7 @@ impl TmuxCtl {
                 "list-panes",
                 "-a",
                 "-F",
-                "#{session_name}\t#{pane_current_command}\t#{pane_current_path}",
+                "#{session_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}",
             ])
             .output();
         match out {
@@ -468,23 +469,28 @@ impl TmuxCtl {
 }
 
 /// One row of the per-second `list-panes -a` snapshot: the foreground
-/// process and the cwd of a session's active pane.
+/// process, root pid, and cwd of a session's active pane.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaneSnap {
     pub cmd: String,
     /// None when tmux reported no path (a dying pane).
     pub cwd: Option<PathBuf>,
+    /// #{pane_pid}: the pane's root process (the shell tmux spawned), the
+    /// walk root for the background-job scan (bg_jobs). None if the field
+    /// failed to parse - a torn line must not drop the row's cmd/cwd.
+    pub pid: Option<u32>,
 }
 
 /// Parse `list-panes -a` output shaped
-/// `#{session_name}\t#{pane_current_command}\t#{pane_current_path}`.
+/// `#{session_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}`.
 /// Tab-separated: the command keeps any spaces a process title may carry,
 /// and paths routinely contain spaces; neither plausibly carries a tab.
 fn parse_pane_snapshot(text: &str) -> HashMap<String, PaneSnap> {
     text.lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(3, '\t');
+            let mut fields = line.splitn(4, '\t');
             let session = fields.next()?;
+            let pid = fields.next()?.trim().parse::<u32>().ok();
             let cmd = fields.next()?.trim();
             let cwd = fields.next().map(str::trim).filter(|p| !p.is_empty());
             (!session.is_empty() && !cmd.is_empty()).then(|| {
@@ -493,6 +499,7 @@ fn parse_pane_snapshot(text: &str) -> HashMap<String, PaneSnap> {
                     PaneSnap {
                         cmd: cmd.to_string(),
                         cwd: cwd.map(PathBuf::from),
+                        pid,
                     },
                 )
             })
@@ -578,15 +585,18 @@ mod tests {
     fn pane_snapshot_parse() {
         // Claude Code's process title is its version string; commands and
         // paths may carry spaces; blank/malformed lines are dropped and a
-        // missing path becomes None rather than an empty cwd.
+        // missing path becomes None rather than an empty cwd. A garbage pid
+        // field costs only the pid, never the row.
         let map = parse_pane_snapshot(
-            "mux-aaaa1111\tzsh\t/Users/u/dev\n\
-             mux-bbbb2222\t2.1.202\t/Users/u/my repo\n\
-             mux-cccc3333\tgit log\t\n\
+            "mux-aaaa1111\t81234\tzsh\t/Users/u/dev\n\
+             mux-bbbb2222\t81235\t2.1.202\t/Users/u/my repo\n\
+             mux-cccc3333\t81236\tgit log\t\n\
+             mux-dddd4444\tnope\tvim\t/Users/u/dev\n\
              \nbroken\n",
         );
-        assert_eq!(map.len(), 3);
+        assert_eq!(map.len(), 4);
         assert_eq!(map["mux-aaaa1111"].cmd, "zsh");
+        assert_eq!(map["mux-aaaa1111"].pid, Some(81234));
         assert_eq!(
             map["mux-aaaa1111"].cwd.as_deref(),
             Some(Path::new("/Users/u/dev"))
@@ -598,6 +608,8 @@ mod tests {
         );
         assert_eq!(map["mux-cccc3333"].cmd, "git log");
         assert!(map["mux-cccc3333"].cwd.is_none());
+        assert_eq!(map["mux-dddd4444"].cmd, "vim");
+        assert!(map["mux-dddd4444"].pid.is_none());
         assert!(is_shell(&map["mux-aaaa1111"].cmd));
         assert!(!is_shell(&map["mux-bbbb2222"].cmd));
     }
