@@ -54,11 +54,12 @@ pub struct NewWorkspaceForm {
     branches: Vec<Branch>,
     checked: String,
     /// In-flight `ls-remote` probe for an un-cloned repo project, keyed by
-    /// clone URL so a stale answer can't paint another project's list.
-    remote_rx: Option<(String, Receiver<Vec<Branch>>)>,
-    /// url -> fetched remote branch list (empty = probe failed); caches
-    /// across project-row clicks so switching back is instant.
-    remote_branches: HashMap<String, Vec<Branch>>,
+    /// repo so a stale answer can't paint another project's list.
+    remote_rx: Option<(String, Receiver<Option<Vec<Branch>>>)>,
+    /// repo -> preflight result: Some(list) = reachable (list feeds the
+    /// typeahead), None = unreachable (submit refuses - a clone would only
+    /// fail later and messier). Cached across project-row clicks.
+    remote_branches: HashMap<String, Option<Vec<Branch>>>,
 }
 
 impl NewWorkspaceForm {
@@ -138,54 +139,69 @@ impl NewWorkspaceForm {
         crate::workspace::resolve_branch(&self.branch, &self.branches)
     }
 
-    /// Keep the typeahead fed for an un-cloned repo project: kick one
-    /// `ls-remote` probe per clone URL (off-thread - network), drain its
-    /// answer, and surface the cached list through `branches` so
+    /// Keep the preflight fresh for an un-cloned repo project: kick one
+    /// `ls-remote` probe per repo (off-thread - network), drain its answer,
+    /// and surface a reachable repo's branch list through `branches` so
     /// `branch_picker` works exactly as it does against a local repo. The
     /// clone-time resolution doesn't change - `clone_and_populate` still
     /// re-resolves the typed text against the fresh clone; this only makes
-    /// the picker see the same names sooner.
+    /// the picker see the same names sooner (and unreachable repos fail
+    /// *now*, in the popup, instead of after a workspace exists).
     fn poll_remote_branches(&mut self, ctx: &egui::Context) {
-        if let Some((url, rx)) = &self.remote_rx {
+        if let Some((repo, rx)) = &self.remote_rx {
             match rx.try_recv() {
-                Ok(bs) => {
-                    self.remote_branches.insert(url.clone(), bs);
+                Ok(res) => {
+                    self.remote_branches.insert(repo.clone(), res);
                     self.remote_rx = None;
                 },
                 Err(TryRecvError::Empty) => {},
                 Err(TryRecvError::Disconnected) => self.remote_rx = None,
             }
         }
-        let Some(url) = self.clone_needed() else {
+        let Some(repo) = self.clone_needed() else {
             return;
         };
         let probing = self
             .remote_rx
             .as_ref()
-            .is_some_and(|(u, _)| *u == url);
-        if !self.remote_branches.contains_key(&url) && !probing {
+            .is_some_and(|(r, _)| *r == repo);
+        if !self.remote_branches.contains_key(&repo) && !probing {
             let (tx, rx) = mpsc::channel();
             crate::workspace::spawn_remote_branches(
-                url.clone(),
+                repo.clone(),
                 tx,
                 ctx.clone(),
             );
-            self.remote_rx = Some((url.clone(), rx));
+            self.remote_rx = Some((repo.clone(), rx));
         }
         if self.branches.is_empty() {
-            if let Some(bs) = self.remote_branches.get(&url) {
+            if let Some(Some(bs)) = self.remote_branches.get(&repo) {
                 self.branches = bs.clone();
             }
         }
     }
 
-    /// Is the selected project's `ls-remote` probe still in flight?
-    fn probing_remote(&self) -> bool {
-        match (self.clone_needed(), &self.remote_rx) {
-            (Some(url), Some((u, _))) => *u == url,
-            _ => false,
+    /// Why Create must not fire yet, if anything: an un-cloned repo
+    /// project only proceeds once the `ls-remote` preflight has proven the
+    /// URL reachable. Everything else (local projects, cloned repos,
+    /// cmd+n mode) is never blocked.
+    pub fn submit_blocker(&self) -> Option<Blocker> {
+        let repo = self.clone_needed()?;
+        match self.remote_branches.get(&repo) {
+            None => Some(Blocker::Probing),
+            Some(None) => Some(Blocker::Unreachable),
+            Some(Some(_)) => None,
         }
     }
+}
+
+/// What stands between an un-cloned repo project and Create (`submit_blocker`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Blocker {
+    /// The `ls-remote` preflight is still in flight.
+    Probing,
+    /// The preflight failed: this URL can't be cloned from here.
+    Unreachable,
 }
 
 pub enum Outcome {
@@ -339,16 +355,21 @@ pub fn show(
 
             panel.divider(ui, "", th.text_dim);
             ui.add_space(6.0);
+            let blocked = form.submit_blocker().is_some();
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::ZERO;
-                if panel.button(ui, "[ Cancel ]", false).clicked() {
+                if panel.button(ui, "[ Cancel ]", false, true).clicked() {
                     outcome = Outcome::Cancel;
                 }
                 // Right-align the primary action, like the settings config row.
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        if panel.button(ui, "[ Create ]", true).clicked() {
+                        if panel
+                            .button(ui, "[ Create ]", true, !blocked)
+                            .clicked()
+                            && !blocked
+                        {
                             outcome = Outcome::Create;
                         }
                     },
@@ -360,7 +381,10 @@ pub fn show(
 
     // cmd+Enter submits from anywhere in the form (Enter alone is a newline in
     // the prompt field). Esc is handled by the App, like the settings window.
-    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Enter)) {
+    // The preflight blocker gates it exactly like the Create button.
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::Enter))
+        && form.submit_blocker().is_none()
+    {
         outcome = Outcome::Create;
     }
     outcome
@@ -415,27 +439,58 @@ fn project_picker(
             )],
             false,
         );
-        if !form.branches.is_empty() {
-            // ls-remote answered: the same typeahead as against a local
-            // repo, every suggestion a to-be-tracked remote branch.
-            branch_picker(ui, form, panel, th);
-        } else {
-            ui.add(
-                egui::TextEdit::singleline(&mut form.branch)
-                    .hint_text(
-                        "branch: random codename - type a name to use",
-                    )
-                    .desired_width(f32::INFINITY),
-            );
-            let note = if form.probing_remote() {
-                "fetching branches from the remote..."
-            } else {
-                // The probe failed (offline, no creds): nothing to resolve
-                // against until the clone lands; promising "create branch
-                // 'x'" here would often be wrong.
-                "-> resolved after clone (empty = codename)"
-            };
-            panel.row(ui, vec![(note.into(), th.text_dim)], false);
+        match form.submit_blocker() {
+            None if !form.branches.is_empty() => {
+                // The preflight answered: the same typeahead as against a
+                // local repo, every suggestion a to-be-tracked remote branch.
+                branch_picker(ui, form, panel, th);
+            },
+            // Reachable but branchless (a freshly created repo): nothing
+            // to suggest, but nothing to block either.
+            None => {
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.branch)
+                        .hint_text(
+                            "branch: random codename - type a name to use",
+                        )
+                        .desired_width(f32::INFINITY),
+                );
+                panel.row(
+                    ui,
+                    vec![(
+                        "-> resolved after clone (empty = codename)".into(),
+                        th.text_dim,
+                    )],
+                    false,
+                );
+            },
+            Some(Blocker::Probing) => {
+                panel.row(
+                    ui,
+                    vec![("checking the remote...".into(), th.text_dim)],
+                    false,
+                );
+            },
+            // The preflight failed: creating a workspace would only hit
+            // the same wall at clone time - refuse, and say why here.
+            Some(Blocker::Unreachable) => {
+                panel.row(
+                    ui,
+                    vec![(
+                        "can't reach the remote with this URL".into(),
+                        th.status_warn,
+                    )],
+                    false,
+                );
+                panel.row(
+                    ui,
+                    vec![(
+                        "check access - private repos may need git@".into(),
+                        th.text_dim,
+                    )],
+                    false,
+                );
+            },
         }
     } else if form.is_repo {
         form.create_worktree = true;
@@ -776,17 +831,21 @@ impl Panel<'_> {
 
     /// A `[ bracketed ]` action button. The primary one carries a standing
     /// accent wash; both deepen on hover.
+    /// A disabled button paints dim with no wash and doesn't invite a
+    /// click (the popup shows *why* next to the field it gates).
     fn button(
         &self,
         ui: &mut egui::Ui,
         text: &str,
         primary: bool,
+        enabled: bool,
     ) -> Response {
         let w = text.chars().count() as f32 * self.char_w;
+        let sense = if enabled { Sense::click() } else { Sense::hover() };
         let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(w, self.row_h), Sense::click());
-        let base = if primary { 0.20 } else { 0.0 };
-        let hover = if resp.hovered() { 0.12 } else { 0.0 };
+            ui.allocate_exact_size(Vec2::new(w, self.row_h), sense);
+        let base = if primary && enabled { 0.20 } else { 0.0 };
+        let hover = if enabled && resp.hovered() { 0.12 } else { 0.0 };
         if base + hover > 0.0 {
             ui.painter().rect_filled(
                 rect,
@@ -794,7 +853,11 @@ impl Panel<'_> {
                 theme::blend(self.th.bg, self.th.accent, base + hover),
             );
         }
-        let color = if primary { self.th.accent } else { self.th.text };
+        let color = match (enabled, primary) {
+            (false, _) => self.th.text_dim,
+            (true, true) => self.th.accent,
+            (true, false) => self.th.text,
+        };
         ui.painter().text(
             rect.min,
             Align2::LEFT_TOP,
@@ -802,7 +865,11 @@ impl Panel<'_> {
             self.font.clone(),
             color,
         );
-        resp.on_hover_cursor(CursorIcon::PointingHand)
+        if enabled {
+            resp.on_hover_cursor(CursorIcon::PointingHand)
+        } else {
+            resp
+        }
     }
 }
 
@@ -1085,29 +1152,51 @@ mod tests {
         assert!(joined.contains("not a git repo - worktree off"));
 
         // Pick the un-cloned repo project (as project_picker's click does).
-        // Seed the ls-remote cache first - a probe must never hit the
-        // network in a test. A failed probe (empty list) falls back to the
-        // plain field with the deferred caption.
+        // Seed the preflight cache first - a probe must never hit the
+        // network in a test. `None` = unreachable: the popup must say so
+        // and refuse to create.
         form.project = 1;
         form.folder =
             form.projects[1].local_root().display().to_string();
-        let url = form.clone_needed().expect("repo project needs a clone");
-        form.remote_branches.insert(url.clone(), Vec::new());
+        let repo = form.clone_needed().expect("repo project needs a clone");
+        form.remote_branches.insert(repo.clone(), None);
         let joined = render(&mut form);
         assert!(
             joined.contains("will clone into "),
             "clone notice missing: {joined}"
         );
-        assert!(joined.contains("-> resolved after clone (empty = codename)"));
+        assert!(
+            joined.contains("can't reach the remote with this URL"),
+            "unreachable warning missing: {joined}"
+        );
+        assert_eq!(form.submit_blocker(), Some(Blocker::Unreachable));
 
-        // With an ls-remote answer the same typeahead appears, every
-        // suggestion a to-be-tracked remote branch.
+        // cmd+Enter must NOT submit while the preflight says unreachable.
+        let mut submit = input.clone();
+        submit.events.push(egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let mut outcome = Outcome::None;
+        let _ = ctx.run(submit.clone(), |ctx| {
+            outcome = show(ctx, &mut form, &agents, &ui_theme, &font);
+        });
+        assert!(
+            matches!(outcome, Outcome::None),
+            "an unreachable remote must block Create"
+        );
+
+        // A reachable preflight feeds the same typeahead, every suggestion
+        // a to-be-tracked remote branch - and Create unblocks.
         form.remote_branches.insert(
-            url,
-            vec![
+            repo,
+            Some(vec![
                 branch("main", Some("origin"), false),
                 branch("feat/api", Some("origin"), false),
-            ],
+            ]),
         );
         let joined = render(&mut form);
         assert!(joined.contains("feat/api"), "remote suggestion: {joined}");
@@ -1118,16 +1207,8 @@ mod tests {
             joined.contains("-> track origin/feat/api"),
             "typed name resolves as tracking: {joined}"
         );
+        assert_eq!(form.submit_blocker(), None);
 
-        // cmd+Enter still submits in project mode.
-        let mut submit = input.clone();
-        submit.events.push(egui::Event::Key {
-            key: Key::Enter,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::COMMAND,
-        });
         let mut outcome = Outcome::None;
         let _ = ctx.run(submit, |ctx| {
             outcome = show(ctx, &mut form, &agents, &ui_theme, &font);

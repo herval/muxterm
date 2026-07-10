@@ -538,6 +538,13 @@ impl App {
     /// which is also what defers the agent launch until the files exist.
     /// Without a worktree the agent launches straight away.
     fn create_workspace(&mut self, ctx: &egui::Context, form: NewWorkspaceForm) {
+        if form.submit_blocker().is_some() {
+            // The popup gates Create on the same check; anything arriving
+            // here anyway is stale. Never create a workspace whose clone
+            // is already known to fail.
+            log::warn!("refusing workspace: remote preflight not passed");
+            return;
+        }
         let root = workspace::expand_dir(&form.folder);
         let prompt = form.prompt.trim().to_string();
         let agent = muxterm::agent::by_id(form.agent);
