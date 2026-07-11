@@ -605,39 +605,20 @@ impl App {
             .or_else(|| root.clone())
             .map(|p| p.display().to_string());
 
-        let pane = match self.create_pane(ctx, None, start_dir.clone()) {
+        let pane = match self.create_pane(ctx, None, start_dir) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("failed to open workspace pane: {e:#}");
                 return;
             },
         };
-        // A workspace opens as a pair: the agent on the left, a free shell
-        // on the right, both in the same folder (the claimed worktree when
-        // there is one). The agent launch types into the tree's *first*
-        // leaf, so the agent pane must be `first`; focus starts there too.
-        // Best-effort - if the shell pane fails, the workspace still works
-        // single-pane.
-        let shell = self
-            .create_pane(ctx, None, start_dir)
-            .map_err(|e| log::warn!("failed to open workspace shell pane: {e:#}"))
-            .ok();
+        // A workspace opens as a single agent pane (split later with cmd+d);
+        // the agent launch types into the tree's *first* leaf, which a lone
+        // leaf trivially is.
         let id = pane.id;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
-        let tree = match shell {
-            Some(shell) => {
-                let shell_id = shell.id;
-                panes.insert(shell_id, shell);
-                Node::Split {
-                    axis: SplitAxis::SideBySide,
-                    ratio: 0.5,
-                    first: Box::new(Node::Leaf(id)),
-                    second: Box::new(Node::Leaf(shell_id)),
-                }
-            },
-            None => Node::Leaf(id),
-        };
+        let tree = Node::Leaf(id);
         let tab_id = mesh::new_tab_id();
 
         // A prompt-derived placeholder shows instantly; the AI title upgrades
@@ -745,18 +726,9 @@ impl App {
                 ctx.clone(),
             );
         } else {
-            // No worktree: run the agent straight away in the root; a
-            // subfolder project's side shell follows into the subdir (the
-            // agent pane's cd rides launch_agent).
-            let side_cd = workspace::boot_cd(
-                None,
-                root.as_deref(),
-                form.selected_project().and_then(|p| p.subdir.as_deref()),
-            );
+            // No worktree: run the agent straight away in the root (its cd
+            // into a subfolder project's subdir rides launch_agent).
             self.launch_agent(&tab_id, None, None);
-            if let Some(dir) = side_cd {
-                self.cd_side_panes(&tab_id, &dir);
-            }
         }
 
         // Project roots (often a ~/.muxterm/clones dest) would make a
@@ -845,9 +817,9 @@ impl App {
     }
 
     /// Type a `cd` into every pane of a tab *except* the first leaf (whose
-    /// boot sequence `launch_agent` owns): the side shell follows the
-    /// workspace to its subfolder on success and back out on the
-    /// failed-checkout walk-back.
+    /// boot sequence `launch_agent` owns): panes the user split while the
+    /// checkout was pending follow the workspace to its subfolder on
+    /// success and back out on the failed-checkout walk-back.
     fn cd_side_panes(&mut self, tab_id: &str, dir: &std::path::Path) {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
         else {
@@ -892,8 +864,9 @@ impl App {
                         self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
                     {
                         tab.workspace.worktree = Some(wt);
-                        // A subfolder project's side shell follows into the
-                        // subdir; the agent pane's cd rides launch_agent.
+                        // Panes split during the checkout follow into a
+                        // subfolder project's subdir; the agent pane's cd
+                        // rides launch_agent.
                         side_cd = workspace::boot_cd(
                             tab.workspace
                                 .worktree
@@ -944,8 +917,8 @@ impl App {
                         fallback.as_deref(),
                         Some(&notice),
                     );
-                    // The workspace's other panes (the side shell) sit in
-                    // the dead claim dir too; walk them back as well.
+                    // Any panes split while the checkout ran sit in the
+                    // dead claim dir too; walk them back as well.
                     if let Some(fallback) = fallback.as_deref() {
                         self.cd_side_panes(&tab_id, fallback);
                     }
