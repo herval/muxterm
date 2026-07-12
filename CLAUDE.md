@@ -20,6 +20,8 @@ make install                 # bundle muxterm.app (make app) + ship to /Applicat
 
 The bundle recipe lives in the Makefile and `packaging/` (Info.plist template, icon generator); `assets/muxterm.icns` is checked in — regenerate with `make icon` only when the icon design changes.
 
+`make cert` (once per machine, `packaging/make-signing-cert.sh`) creates a persistent self-signed `muxterm-local` code-signing identity in the login keychain; `make app` signs with it when present (`SIGN_ID`), else ad-hoc. This is what stops macOS re-prompting for TCC "access data from other apps" on every rebuild (the agent-hook installer touches `~/.claude`/`~/.codex`/`~/.pi` — other apps' dirs — and TCC pins the grant to the *designated requirement*, which for an ad-hoc signature is the ever-changing binary hash but for the cert is the stable bundle-id + cert leaf).
+
 There is no test binary/harness beyond inline unit tests, and no rustfmt/clippy config — match the existing hand-formatted style (notably `},` closing match arms).
 
 ## Architecture

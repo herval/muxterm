@@ -1,8 +1,13 @@
-.PHONY: help setup run app install icon
+.PHONY: help setup run app install icon cert
 .DEFAULT_GOAL := help
 
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 APP := target/release/muxterm.app
+
+# Sign with the persistent local cert when it exists (so macOS remembers
+# permission grants across rebuilds — see `make cert`), else fall back to
+# ad-hoc so builds still work on machines without it.
+SIGN_ID := $(shell security find-identity -p codesigning 2>/dev/null | grep -q '"muxterm-local"' && echo muxterm-local || echo -)
 
 help: ## list available commands (the default)
 	@echo "muxterm $(VERSION) - make <command>"
@@ -15,10 +20,13 @@ setup: ## check the Rust toolchain, install tmux, fetch dependencies
 	@command -v tmux >/dev/null || brew install tmux
 	cargo fetch
 
+cert: ## create a stable local signing cert so macOS remembers permission grants
+	@packaging/make-signing-cert.sh
+
 run: ## build and run the app (release)
 	cargo run --release
 
-# Ad-hoc signed; a bundle is just a directory.
+# A bundle is just a directory; signed with $(SIGN_ID) (muxterm-local or ad-hoc).
 app: ## assemble target/release/muxterm.app
 	cargo build --release
 	rm -rf $(APP)
@@ -26,8 +34,8 @@ app: ## assemble target/release/muxterm.app
 	sed 's/@VERSION@/$(VERSION)/g' packaging/Info.plist > $(APP)/Contents/Info.plist
 	cp target/release/muxterm $(APP)/Contents/MacOS/muxterm
 	cp assets/muxterm.icns $(APP)/Contents/Resources/muxterm.icns
-	codesign --force --sign - $(APP)
-	@echo "built $(APP)"
+	codesign --force --sign $(SIGN_ID) $(APP)
+	@echo "built $(APP) (signed: $(SIGN_ID))"
 
 # Quit muxterm first if it's running; sessions survive, relaunch restores.
 install: app ## ship the .app to /Applications and refresh ~/.cargo/bin/mux
