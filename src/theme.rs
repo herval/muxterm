@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use egui::Color32;
+use egui::{Color32, FontFamily, FontId};
 use egui_term::{ColorPalette, TerminalTheme};
 
 /// Chrome look derived from the terminal palette (plus overrides).
@@ -28,6 +28,10 @@ pub struct UiTheme {
     pub bar_fg_dim: Color32,
     /// Highlight color inside the bar (search-bar prefix and cursor).
     pub bar_accent: Color32,
+    /// The HUD's font (title badge, chips, search-bar hints): the theme's
+    /// own face at the bar's size, registered under `BAR_FONT_FAMILY`.
+    /// Independent of the terminal font — see `config::resolve`.
+    pub bar_font: FontId,
     /// Translucent wash painted over unfocused panes (bg at some alpha).
     pub dim_overlay: Color32,
     /// Heavier wash over every pane of a peeked *archived* workspace, marking
@@ -80,6 +84,10 @@ pub enum BarStyle {
     Solid,
 }
 
+/// The egui font family the HUD text is registered under (seeded from the
+/// theme's own face). Shared with `config::install_fonts`, which fills it.
+pub const BAR_FONT_FAMILY: &str = "muxterm-bar";
+
 /// A preset's HUD bar. Colors are None = derive from the theme, which in
 /// chips mode reproduces the classic translucent-bg / chrome-text look
 /// exactly.
@@ -89,6 +97,10 @@ pub struct BarSpec {
     pub bg: Option<&'static str>,
     pub fg: Option<&'static str>,
     pub accent: Option<&'static str>,
+    /// Point size of the HUD text (the face is the theme's own font). A
+    /// bitmap face like Px437 VGA is only crisp at even multiples of its
+    /// native grid, so the strip themes carry a size the face was cut for.
+    pub font_size: f32,
 }
 
 /// The all-derived floating-chips bar, the look every theme wore before
@@ -99,6 +111,7 @@ const CHIPS: BarSpec = BarSpec {
     bg: None,
     fg: None,
     accent: None,
+    font_size: 11.0,
 };
 
 pub struct Preset {
@@ -183,6 +196,9 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 bg: Some("#00aa00"),
                 fg: Some("#000000"),
                 accent: Some("#ffff55"),
+                // Native VGA size: 2x the 8x16 bitmap on a 2x display, so
+                // the strip's glyphs stay as crisp as the terminal grid's.
+                font_size: 16.0,
             },
         }),
         "iterm-light" => Some(&Preset {
@@ -228,6 +244,7 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 bg: Some("#0969da"),
                 fg: Some("#ffffff"),
                 accent: Some("#9ecbff"),
+                font_size: 11.0,
             },
         }),
         _ => None,
@@ -410,6 +427,13 @@ pub fn build(
         bar_fg,
         bar_fg_dim,
         bar_accent,
+        // The theme's own face at the bar's size. `config::resolve` fills
+        // this family (and overrides the size) when it registers the fonts;
+        // building it here keeps `build`-only callers (tests) valid.
+        bar_font: FontId::new(
+            spec.font_size,
+            FontFamily::Name(BAR_FONT_FAMILY.into()),
+        ),
         // A wash of the background recedes inactive panes. The same alpha
         // reads far weaker on dark themes — a near-black pour barely touches
         // the sparse bright glyphs, while on a light bg it drops the
@@ -542,6 +566,10 @@ mod tests {
             assert!(
                 p.border_width > 0.0 && p.border_width <= 8.0,
                 "{name} border width"
+            );
+            assert!(
+                (6.0..=40.0).contains(&p.bar.font_size),
+                "{name} bar font size"
             );
             for (half, hex) in
                 [("bg", p.bar.bg), ("fg", p.bar.fg), ("accent", p.bar.accent)]

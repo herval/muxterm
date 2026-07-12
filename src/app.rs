@@ -203,8 +203,8 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, tmux: TmuxCtl) -> Self {
         config::ensure_default_file();
-        let (style, custom_font) = config::resolve(&config::load());
-        config::install_fonts(&cc.egui_ctx, custom_font);
+        let (style, custom_font, bar_font) = config::resolve(&config::load());
+        config::install_fonts(&cc.egui_ctx, custom_font, bar_font);
         theme::apply_visuals(&cc.egui_ctx, &style.ui);
         // The server may have survived a previous run (sessions outlive the
         // app), so source the conf when its content changed - a no-op when
@@ -1650,8 +1650,8 @@ impl App {
 
     fn reload_config(&mut self, ctx: &egui::Context) {
         self.config_mtime = config::mtime();
-        let (style, custom_font) = config::resolve(&config::load());
-        config::install_fonts(ctx, custom_font);
+        let (style, custom_font, bar_font) = config::resolve(&config::load());
+        config::install_fonts(ctx, custom_font, bar_font);
         theme::apply_visuals(ctx, &style.ui);
         self.font = style.font;
         self.term_theme = style.term_theme;
@@ -2398,9 +2398,9 @@ impl eframe::App for App {
                     let bar_h = (self.pane_titles
                         && self.ui_theme.bar_style == theme::BarStyle::Solid)
                         .then(|| {
-                            bar_height(
-                                ui.fonts(|f| f.row_height(&hud_font())),
-                            )
+                            bar_height(ui.fonts(|f| {
+                                f.row_height(&self.ui_theme.bar_font)
+                            }))
                         });
                     // A peeked archived workspace is a read-only preview: no
                     // pane is interactive and none holds keyboard focus.
@@ -2757,7 +2757,7 @@ fn draw_ai_overlay(
     };
     let hint = painter.layout_no_wrap(
         hint_text,
-        FontId::proportional(11.0),
+        theme.bar_font.clone(),
         hint_color,
     );
     let show_hint = error.is_some()
@@ -2817,13 +2817,15 @@ fn draw_worktree_progress(
     text: &str,
     theme: &UiTheme,
 ) {
-    // A char budget from the pane width (~6px per 11pt proportional char),
-    // so a narrow pane truncates instead of overflowing.
-    let budget = ((pane_rect.width() - 24.0).max(0.0) / 6.0) as usize;
+    // A char budget from the pane width, scaled by the bar font's size
+    // (~0.55px per pt for a typical face), so a chunky bar font truncates
+    // instead of overflowing.
+    let px_per_char = (theme.bar_font.size * 0.55).max(1.0);
+    let budget = ((pane_rect.width() - 24.0).max(0.0) / px_per_char) as usize;
     let painter = ui.painter();
     let galley = painter.layout_no_wrap(
         elide(text, budget),
-        hud_font(),
+        theme.bar_font.clone(),
         theme.text_dim,
     );
     let pad = Vec2::new(6.0, 2.0);
@@ -2841,13 +2843,6 @@ fn draw_worktree_progress(
         theme::blend(theme.bg, theme.accent, 0.18),
     );
     painter.galley(rect.min + pad, galley, theme.text_dim);
-}
-
-/// The HUD's fixed chrome font (title badge, chips, search hints) - a
-/// proportional face independent of the terminal font, so a chunky theme
-/// font never inflates the chrome.
-fn hud_font() -> FontId {
-    FontId::proportional(11.0)
 }
 
 /// Height of the solid HUD strip: one HUD text row plus breathing room,
@@ -2976,7 +2971,7 @@ fn draw_search_bar(
     if !count_text.is_empty() {
         let counter = painter.layout_no_wrap(
             count_text,
-            hud_font(),
+            theme.bar_font.clone(),
             hud.fg_dim,
         );
         right_limit -= counter.size().x;
@@ -2989,7 +2984,7 @@ fn draw_search_bar(
     }
     let hint = painter.layout_no_wrap(
         "esc close · ⏎ next · ⇧⏎ prev".into(),
-        hud_font(),
+        theme.bar_font.clone(),
         hud.fg_dim,
     );
     if right_limit - hint.size().x - text_left >= 12.0 * char_w {
@@ -3053,7 +3048,7 @@ fn draw_pane_title(
     theme: &UiTheme,
     bar_h: Option<f32>,
 ) -> Option<(String, String)> {
-    let font = hud_font();
+    let font = theme.bar_font.clone();
     let hud = theme::hud_colors(theme);
     let color = if focused { hud.fg } else { hud.fg_dim };
     let painter = ui.painter();
@@ -3466,6 +3461,9 @@ mod tests {
     #[test]
     fn pane_hud_stacks_all_pr_chips() {
         let ctx = egui::Context::default();
+        // Bind the HUD font family (`th.bar_font`); painting its text panics
+        // otherwise. None bar bytes seeds it with the system fallbacks.
+        config::install_fonts(&ctx, None, None);
         let preset = theme::preset("iterm-dark").unwrap();
         let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
         let badge = |n: u64, kind| pr_status::Badge {
@@ -3644,6 +3642,8 @@ mod tests {
     #[test]
     fn solid_bar_paints_strip_without_chip_boxes() {
         let ctx = egui::Context::default();
+        // Bind the HUD font family (`th.bar_font`) before painting its text.
+        config::install_fonts(&ctx, None, None);
         let preset = theme::preset("bbs").unwrap();
         let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
         let badges = vec![pr_status::Badge {

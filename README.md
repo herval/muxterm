@@ -147,6 +147,9 @@ copy_on_select = true       # mouse selections copy to the clipboard as
                             # they finish; off = select, then cmd+c
 pr_status = true            # the branch's GitHub PR beside the tab title
                             # (status dot + number, click opens); needs gh
+bar_font = "Menlo"          # the status line (pane title + chips + search
+bar_font_size = 12.0        # hints); defaults to the theme's own font at a
+                            # size the theme picked, independent of [font]
 
 [font]                 # overrides the theme's font for every theme
 family = "Menlo"       # font name in the macOS font folders, or a file path

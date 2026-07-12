@@ -76,6 +76,11 @@ copy_on_select = false
 # terminal), and "top" or "bottom".
 # bar_style = "chips"
 # bar_position = "top"
+# The status line uses the theme's own font at a size the theme picked;
+# override the face and/or size here, independently of [font] below (same
+# name-or-path rule as [font] family).
+# bar_font = "Menlo"
+# bar_font_size = 12.0
 
 [font]
 # Each theme picks its own font; set either key to override it for every
@@ -127,6 +132,11 @@ pub struct ConfigFile {
     pub bar_position: Option<String>,
     /// Pane HUD style: "chips" | "solid"; unset keeps the theme's choice.
     pub bar_style: Option<String>,
+    /// Status-line font face, independent of the terminal `[font]`; unset
+    /// keeps the theme's own face. A name or path, resolved like `[font]`.
+    pub bar_font: Option<String>,
+    /// Status-line font size; unset keeps the theme's bar size.
+    pub bar_font_size: Option<f32>,
     pub font: FontConfig,
     pub colors: HashMap<String, String>,
 }
@@ -146,6 +156,8 @@ impl Default for ConfigFile {
             notifications: true,
             bar_position: None,
             bar_style: None,
+            bar_font: None,
+            bar_font_size: None,
             font: FontConfig::default(),
             colors: HashMap::new(),
         }
@@ -212,8 +224,10 @@ pub fn load() -> ConfigFile {
 }
 
 /// Resolve a parsed config into applied styles plus (optionally) the bytes
-/// of a custom font to register.
-pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
+/// of the custom terminal font and the status-line (HUD) font to register.
+pub fn resolve(
+    cfg: &ConfigFile,
+) -> (Style, Option<FontData>, Option<FontData>) {
     let (name, preset) = match theme::preset(&cfg.theme) {
         Some(p) => (cfg.theme.clone(), p),
         None => {
@@ -256,20 +270,39 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
         agent::default_agent()
     });
 
-    // The theme's font, with `[font]` as user overrides: family replaces
-    // the face, size the point size. A family that fails to load falls
-    // back to the theme's font, not egui's built-in.
-    let size = cfg.font.size.unwrap_or(preset.font.size).clamp(6.0, 40.0);
-    let theme_font = || match preset.font.source {
+    // The theme's own face, loaded from its source. Used for both the
+    // terminal grid and — by default — the status line, so the closure is
+    // reusable (it only reads the preset).
+    let theme_face = || match preset.font.source {
         theme::FontSource::System(path) => load_font_data(path),
         theme::FontSource::Builtin(bytes) => {
             Some(FontData::from_static(bytes))
         },
     };
+
+    // The theme's font, with `[font]` as user overrides: family replaces
+    // the face, size the point size. A family that fails to load falls
+    // back to the theme's font, not egui's built-in.
+    let size = cfg.font.size.unwrap_or(preset.font.size).clamp(6.0, 40.0);
     let font_data = match cfg.font.family.as_deref() {
-        Some(family) => load_font_data(family).or_else(theme_font),
-        None => theme_font(),
+        Some(family) => load_font_data(family).or_else(|| theme_face()),
+        None => theme_face(),
     };
+
+    // Status-line (HUD) font: the theme's own face at the bar's size, with
+    // `bar_font`/`bar_font_size` overriding each half independently of
+    // `[font]`. A dedicated family (filled in `install_fonts`) keeps it
+    // pinned to the theme even when the terminal font is overridden.
+    let bar_size =
+        cfg.bar_font_size.unwrap_or(preset.bar.font_size).clamp(6.0, 40.0);
+    let bar_font_data = match cfg.bar_font.as_deref() {
+        Some(family) => load_font_data(family).or_else(|| theme_face()),
+        None => theme_face(),
+    };
+    ui.bar_font = FontId::new(
+        bar_size,
+        FontFamily::Name(theme::BAR_FONT_FAMILY.into()),
+    );
 
     (
         Style {
@@ -287,6 +320,7 @@ pub fn resolve(cfg: &ConfigFile) -> (Style, Option<FontData>) {
             notifications: cfg.notifications,
         },
         font_data,
+        bar_font_data,
     )
 }
 
@@ -299,9 +333,13 @@ const FALLBACK_FONTS: &[(&str, &str)] = &[
     ("fallback-apple-symbols", "/System/Library/Fonts/Apple Symbols.ttf"),
 ];
 
-/// Install the custom monospace font (or reset to egui's default fonts when
-/// `custom` is None).
-pub fn install_fonts(ctx: &egui::Context, custom: Option<FontData>) {
+/// Install the custom monospace terminal font and the status-line (HUD)
+/// font (each `None` = fall back to egui's defaults / the fallback faces).
+pub fn install_fonts(
+    ctx: &egui::Context,
+    custom: Option<FontData>,
+    bar: Option<FontData>,
+) {
     let mut defs = egui::FontDefinitions::default();
     if let Some(data) = custom {
         let name = "muxterm-user-font".to_string();
@@ -310,6 +348,17 @@ pub fn install_fonts(ctx: &egui::Context, custom: Option<FontData>) {
             mono.insert(0, name);
         }
     }
+    // The HUD's own family, so its face stays the theme's regardless of the
+    // terminal font. Seeded with the bar face (when it loaded); fallbacks
+    // are appended below so glyphs a bitmap face lacks (⏎ ⇧ ·) still render.
+    let bar_family = FontFamily::Name(theme::BAR_FONT_FAMILY.into());
+    let mut bar_list = Vec::new();
+    if let Some(data) = bar {
+        let name = "muxterm-bar-font".to_string();
+        defs.font_data.insert(name.clone(), Arc::new(data));
+        bar_list.push(name);
+    }
+    defs.families.insert(bar_family.clone(), bar_list);
     for (name, path) in FALLBACK_FONTS {
         let Ok(bytes) = fs::read(path) else {
             log::warn!("fallback font {path} not readable, skipping");
@@ -317,7 +366,9 @@ pub fn install_fonts(ctx: &egui::Context, custom: Option<FontData>) {
         };
         defs.font_data
             .insert((*name).to_string(), Arc::new(FontData::from_owned(bytes)));
-        for family in [FontFamily::Monospace, FontFamily::Proportional] {
+        for family in
+            [FontFamily::Monospace, FontFamily::Proportional, bar_family.clone()]
+        {
             if let Some(list) = defs.families.get_mut(&family) {
                 list.push((*name).to_string());
             }
@@ -548,7 +599,7 @@ mod tests {
         // are outside egui's built-in fonts; without the system fallbacks
         // they render as boxes.
         let ctx = egui::Context::default();
-        install_fonts(&ctx, None);
+        install_fonts(&ctx, None, None);
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         let font = FontId::monospace(14.0);
         ctx.fonts(|f| {
@@ -571,10 +622,10 @@ mod tests {
             font,
             ..ConfigFile::default()
         };
-        let (_, font_data) = resolve(&cfg);
+        let (_, font_data, bar_data) = resolve(&cfg);
         assert!(font_data.is_some(), "{theme}: no font resolved");
         let ctx = egui::Context::default();
-        install_fonts(&ctx, font_data);
+        install_fonts(&ctx, font_data, bar_data);
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         ctx
     }
@@ -613,16 +664,38 @@ mod tests {
     }
 
     #[test]
+    fn bar_font_family_carries_the_theme_face() {
+        // The status line must render in the theme's own face: bbs's bar
+        // family should carry the bundled Px437 VGA glyphs (CP437 art), not
+        // a generic fallback. Proves the theme bytes reach `muxterm-bar` and
+        // that `ui.bar_font` (a Name-family FontId) resolves to them.
+        let cfg = ConfigFile {
+            theme: "bbs".into(),
+            ..ConfigFile::default()
+        };
+        let (style, font_data, bar_data) = resolve(&cfg);
+        let ctx = egui::Context::default();
+        install_fonts(&ctx, font_data, bar_data);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        ctx.fonts(|f| {
+            assert!(
+                f.has_glyphs(&style.ui.bar_font, "░▒▓█│┤╣╬"),
+                "bbs bar font missing CP437 art (theme face not in bar family)"
+            );
+        });
+    }
+
+    #[test]
     fn theme_font_yields_to_config_overrides() {
         // No overrides: the theme's own font and size.
-        let (style, font_data) = resolve(&ConfigFile::default());
+        let (style, font_data, _) = resolve(&ConfigFile::default());
         assert_eq!(style.font.size, 12.0); // iterm-dark = Monaco 12
         assert!(font_data.is_some(), "Monaco failed to load");
         let bbs = ConfigFile {
             theme: "bbs".into(),
             ..ConfigFile::default()
         };
-        let (style, _) = resolve(&bbs);
+        let (style, _, _) = resolve(&bbs);
         assert_eq!(style.font.size, 16.0);
 
         // [font] size wins over the theme's.
@@ -634,7 +707,7 @@ mod tests {
             },
             ..ConfigFile::default()
         };
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert_eq!(style.font.size, 13.0);
 
         // A [font] family that fails to load falls back to the theme's
@@ -647,7 +720,7 @@ mod tests {
             },
             ..ConfigFile::default()
         };
-        let (style, font_data) = resolve(&cfg);
+        let (style, font_data, _) = resolve(&cfg);
         assert!(font_data.is_some(), "theme font fallback lost");
         assert_eq!(style.font.size, 16.0);
     }
@@ -659,19 +732,60 @@ mod tests {
         assert_eq!(cfg.font.family, None);
         assert_eq!(cfg.bar_position, None);
         assert_eq!(cfg.bar_style, None);
+        assert_eq!(cfg.bar_font, None);
+        assert_eq!(cfg.bar_font_size, None);
+    }
+
+    #[test]
+    fn bar_font_defaults_to_theme_size_and_overrides_independently() {
+        // Unset: the status-line font is the theme's bar size, and its
+        // face is the theme's own (bar bytes resolved).
+        let (style, _, bar_data) = resolve(&ConfigFile::default());
+        assert_eq!(style.ui.bar_font.size, 11.0); // iterm-dark CHIPS
+        assert!(bar_data.is_some(), "theme bar face lost");
+        let bbs = ConfigFile {
+            theme: "bbs".into(),
+            ..ConfigFile::default()
+        };
+        let (style, _, _) = resolve(&bbs);
+        assert_eq!(style.ui.bar_font.size, 16.0); // bbs solid strip
+
+        // bar_font_size overrides the bar size, independently of [font] size.
+        let cfg = ConfigFile {
+            theme: "bbs".into(),
+            font: FontConfig {
+                family: None,
+                size: Some(20.0),
+            },
+            bar_font_size: Some(9.0),
+            ..ConfigFile::default()
+        };
+        let (style, _, _) = resolve(&cfg);
+        assert_eq!(style.font.size, 20.0); // terminal font unaffected
+        assert_eq!(style.ui.bar_font.size, 9.0); // bar font follows its own key
+
+        // A bar_font family that fails to load falls back to the theme face,
+        // never to None (which would leave the family fallbacks-only).
+        let cfg = ConfigFile {
+            theme: "bbs".into(),
+            bar_font: Some("NoSuchFace".into()),
+            ..ConfigFile::default()
+        };
+        let (_, _, bar_data) = resolve(&cfg);
+        assert!(bar_data.is_some(), "bar font fallback lost");
     }
 
     #[test]
     fn bar_keys_override_the_theme_and_invalid_values_warn() {
         // Unset keeps each theme's own choice.
-        let (style, _) = resolve(&ConfigFile::default());
+        let (style, _, _) = resolve(&ConfigFile::default());
         assert_eq!(style.ui.bar_style, theme::BarStyle::Chips);
         assert_eq!(style.ui.bar_edge, theme::BarEdge::Top);
         let cfg = ConfigFile {
             theme: "github-light".into(),
             ..ConfigFile::default()
         };
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert_eq!(style.ui.bar_style, theme::BarStyle::Solid);
         assert_eq!(style.ui.bar_edge, theme::BarEdge::Bottom);
 
@@ -681,7 +795,7 @@ mod tests {
             bar_style: Some("solid".into()),
             ..ConfigFile::default()
         };
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert_eq!(style.ui.bar_style, theme::BarStyle::Solid);
         assert_eq!(style.ui.bar_edge, theme::BarEdge::Bottom);
 
@@ -691,7 +805,7 @@ mod tests {
             bar_style: Some("floaty".into()),
             ..ConfigFile::default()
         };
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert_eq!(style.ui.bar_style, theme::BarStyle::Chips);
         assert_eq!(style.ui.bar_edge, theme::BarEdge::Top);
     }
@@ -735,14 +849,14 @@ mod tests {
     #[test]
     fn pane_titles_default_on_and_resolved() {
         assert!(ConfigFile::default().pane_titles);
-        let (style, _) = resolve(&ConfigFile::default());
+        let (style, _, _) = resolve(&ConfigFile::default());
         assert!(style.pane_titles);
 
         let cfg = ConfigFile {
             pane_titles: false,
             ..ConfigFile::default()
         };
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert!(!style.pane_titles);
     }
 
@@ -751,7 +865,7 @@ mod tests {
         assert!(!ConfigFile::default().copy_on_select);
         let cfg: ConfigFile = toml::from_str("copy_on_select = true").unwrap();
         assert!(cfg.copy_on_select);
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert!(style.copy_on_select);
 
         // The default config file documents the real default.
@@ -765,7 +879,7 @@ mod tests {
         assert!(ConfigFile::default().pr_status);
         let cfg: ConfigFile = toml::from_str("pr_status = false").unwrap();
         assert!(!cfg.pr_status);
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert!(!style.pr_status);
     }
 
@@ -774,7 +888,7 @@ mod tests {
         assert!(ConfigFile::default().pr_detector);
         let cfg: ConfigFile = toml::from_str("pr_detector = false").unwrap();
         assert!(!cfg.pr_detector);
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert!(!style.pr_detector);
     }
 
@@ -783,7 +897,7 @@ mod tests {
         assert!(ConfigFile::default().git_status);
         let cfg: ConfigFile = toml::from_str("git_status = false").unwrap();
         assert!(!cfg.git_status);
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert!(!style.git_status);
     }
 
@@ -793,7 +907,7 @@ mod tests {
         let cfg: ConfigFile =
             toml::from_str("notifications = false").unwrap();
         assert!(!cfg.notifications);
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert!(!style.notifications);
     }
 
@@ -816,7 +930,7 @@ mod tests {
             agent: "gpt".into(),
             ..ConfigFile::default()
         };
-        let (style, _) = resolve(&cfg);
+        let (style, _, _) = resolve(&cfg);
         assert_eq!(style.agent.id, "claude");
     }
 
