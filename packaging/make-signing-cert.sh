@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Create a stable, self-signed code-signing identity ("muxterm-local") in the
-# login keychain, so `make app` can sign the bundle with a fixed designated
-# requirement instead of an ad-hoc signature.
+# login keychain AND trust it for code signing, so `make app` can sign the
+# bundle with a fixed designated requirement that macOS actually honors.
 #
 # Why this matters: macOS TCC ("<app> would like to access data from other
 # apps", triggered by muxterm installing agent lifecycle hooks into ~/.claude,
@@ -9,17 +9,51 @@
 # An ad-hoc signature's requirement is the raw binary hash, which changes on
 # every rebuild - so every `make install` makes macOS forget the grant and
 # re-prompt. Signing with a persistent certificate anchors the requirement on
-# the cert instead, so the grant survives rebuilds. Allow it once, never again.
+# the cert instead — BUT only if the cert is *trusted* for code signing. An
+# untrusted self-signed cert is rejected by `spctl`, and TCC then refuses to
+# anchor the grant on it, falling back to the per-build hash and re-prompting
+# forever. Trusting the cert is the step that makes the grant stick. Allow it
+# once, never again.
 #
-# Idempotent: if the identity already exists this is a no-op, so re-running it
-# never rotates the cert (which would itself cost one more prompt).
+# Idempotent, and self-repairing: if the identity exists but isn't trusted
+# (the state older versions of this script left behind), it just adds the
+# trust setting.
 set -euo pipefail
 
 NAME="muxterm-local"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+BUNDLE_ID="dev.herval.muxterm"
 
-if security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "\"$NAME\""; then
-    echo "code-signing identity \"$NAME\" already present — nothing to do"
+# Mark the cert as a trusted code-signing anchor in the login (user) keychain.
+# Self-signed → it is its own root, so trustRoot. Prompts once for your login
+# password; re-adding an existing setting is harmless.
+trust_cert() {
+    security add-trusted-cert -r trustRoot -p codeSign -k "$KEYCHAIN" "$1"
+}
+
+is_trusted() {
+    security dump-trust-settings 2>/dev/null | grep -q "$NAME"
+}
+
+reset_hint() {
+    echo "one-time cleanup so the fresh (now trusted) grant is the one that sticks:"
+    echo "  tccutil reset SystemPolicyAppData $BUNDLE_ID"
+    echo "then relaunch muxterm and click Allow once."
+}
+
+if security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null \
+    | grep -q "\"$NAME\""; then
+    if is_trusted; then
+        echo "code-signing identity \"$NAME\" already present and trusted — nothing to do"
+        exit 0
+    fi
+    echo "identity \"$NAME\" exists but is NOT trusted (this is the state that keeps re-prompting) — adding code-signing trust"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    security find-certificate -c "$NAME" -p "$KEYCHAIN" > "$tmp/cert.pem"
+    trust_cert "$tmp/cert.pem"
+    echo "trusted \"$NAME\" for code signing."
+    reset_hint
     exit 0
 fi
 
@@ -56,6 +90,7 @@ openssl pkcs12 -export "${p12_flags[@]}" -name "$NAME" \
 # -T /usr/bin/codesign pre-authorizes codesign to use the key without a
 # keychain GUI prompt at signing time.
 security import "$tmp/id.p12" -k "$KEYCHAIN" -T /usr/bin/codesign -P "$pass"
+trust_cert "$tmp/cert.pem"
 
-echo "created code-signing identity \"$NAME\" in the login keychain"
+echo "created and trusted code-signing identity \"$NAME\" in the login keychain"
 echo "next: make install, then Allow the one-time macOS prompt — it will stick."
