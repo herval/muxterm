@@ -27,9 +27,9 @@ fn default_config() -> String {
     format!(
         r##"# muxterm configuration - edits apply live while the app is running.
 
-# Built-in themes: "iterm-dark", "bbs", "iterm-light", "github-light".
-# Each is a full look: palette plus its own font (Monaco for the iterms,
-# IBM VGA for bbs, SF Mono for github-light).
+# Built-in themes: "iterm-dark", "bbs", "amber", "iterm-light",
+# "github-light". Each is a full look: palette plus its own font (Monaco for
+# the iterms, IBM VGA for bbs and amber, SF Mono for github-light).
 theme = "iterm-dark"
 
 # Agent CLI behind the "?" prompt line (type "?" at an empty shell

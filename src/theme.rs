@@ -142,7 +142,7 @@ const MONACO: FontSpec = FontSpec {
 };
 
 pub const PRESET_NAMES: &[&str] =
-    &["iterm-dark", "bbs", "iterm-light", "github-light"];
+    &["iterm-dark", "bbs", "amber", "iterm-light", "github-light"];
 
 pub fn preset(name: &str) -> Option<&'static Preset> {
     match name {
@@ -198,6 +198,48 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 accent: Some("#ffff55"),
                 // Native VGA size: 2x the 8x16 bitmap on a 2x display, so
                 // the strip's glyphs stay as crisp as the terminal grid's.
+                font_size: 16.0,
+            },
+        }),
+        // The amber-phosphor monochrome monitor — bbs's sibling. Where bbs
+        // is a green-screen, this is the warm amber CRT (DEC VT220, the old
+        // DOS boxes people picked for the lowest eye strain of the phosphor
+        // types). The bg is a warm near-black rather than pure #000, so the
+        // glow softens instead of glaring. Default text is classic amber
+        // phosphor; the accent (borders, highlights) is a brighter gold.
+        // The palette is *not* true monochrome: a real amber monitor renders
+        // red and green as the same amber, which would make `git`/`ls
+        // --color` output unreadable — the one thing a coding terminal can't
+        // afford. So the 16 colors keep genuine hue separation but are all
+        // warmed toward gold (whites go cream, the yellow slot *is* the amber
+        // itself), so the monochrome identity reads without eating legibility.
+        "amber" => Some(&Preset {
+            bg: "#17120a",
+            fg: "#ffb000",
+            accent: "#ffcf6b",
+            ansi: [
+                "#2a2118", "#ff5c47", "#8fc740", "#ffb000", "#5b8fd6",
+                "#d98cc4", "#4fbfa8", "#ffe0b0", "#6b5a44", "#ff7a5c",
+                "#b6e05a", "#ffcf6b", "#7fb0f0", "#ffa8de", "#6fe0c8",
+                "#fff2dc",
+            ],
+            // Reuses bbs's bundled Px437 VGA face, keeping the retro-monitor
+            // pair visually matched (crisp at 16pt = 2x the 8x16 bitmap).
+            font: FontSpec {
+                label: "VGA 8x16",
+                source: FontSource::Builtin(PX437_VGA),
+                size: 16.0,
+            },
+            // A retro frame, a touch lighter than bbs's DOS slab.
+            border_width: 2.0,
+            // Inverse video, like bbs's green strip but amber: a solid amber
+            // slab, near-black text, cream highlights.
+            bar: BarSpec {
+                style: BarStyle::Solid,
+                edge: BarEdge::Top,
+                bg: Some("#cc7a00"),
+                fg: Some("#17120a"),
+                accent: Some("#fff2dc"),
                 font_size: 16.0,
             },
         }),
@@ -601,6 +643,13 @@ mod tests {
         assert_eq!(ui.bar_bg, Color32::from_rgb(0x00, 0xaa, 0x00));
         assert_eq!(ui.bar_fg, Color32::from_rgb(0x00, 0x00, 0x00));
         assert_eq!(ui.bar_fg_dim, blend(ui.bar_fg, ui.bar_bg, 0.45));
+        // Amber wears bbs's inverse-video solid strip, in its own amber.
+        let (_, ui) = build(preset("amber").unwrap(), &HashMap::new(), 0.25);
+        assert_eq!(ui.border_width, 2.0);
+        assert_eq!(ui.bar_style, BarStyle::Solid);
+        assert_eq!(ui.bar_edge, BarEdge::Top);
+        assert_eq!(ui.bar_bg, Color32::from_rgb(0xcc, 0x7a, 0x00));
+        assert_eq!(ui.bar_fg, Color32::from_rgb(0x17, 0x12, 0x0a));
         let (_, ui) =
             build(preset("github-light").unwrap(), &HashMap::new(), 0.25);
         assert_eq!(ui.bar_style, BarStyle::Solid);
