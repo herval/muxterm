@@ -201,6 +201,20 @@ pub fn tab_of_session(
     None
 }
 
+/// The workspace title of the tab with `tab_id`, if it carries a workspace
+/// (bare shell tabs and pre-workspace state files don't). Lets the CLI show an
+/// agent its own tab name - and tell whether it's still a `random_title`
+/// codename (`state::is_codename`).
+pub fn title_of_tab(state: &StateFile, tab_id: &str) -> Option<String> {
+    state
+        .windows
+        .iter()
+        .flat_map(|w| &w.tabs)
+        .find(|t| t.id == tab_id)
+        .and_then(|t| t.workspace.as_ref())
+        .map(|w| w.title.clone())
+}
+
 /// A pane asking the GUI to split it (written by `mux split`, drained by
 /// the App's poll loop). Splits must go through the GUI - a session created
 /// behind its back would never appear in the layout and the startup GC

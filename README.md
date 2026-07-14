@@ -226,6 +226,13 @@ but anything with socket access can drive tmux directly.
   teammate messages arrive mid-conversation without the agent having to
   fetch. Combined with `mux run reviewer -- claude`, a pane is a named,
   briefed, reachable agent with zero manual prompting.
+- **Naming nudge**: while a tab still wears its auto-generated
+  `adjective-animal` codename, the brief leads with an imperative "rename this
+  as your first action" ask (naming the codename so the agent sees it), and
+  muxterm's own auto-installed `UserPromptSubmit` status hook
+  (`mux agent-event working --nudge-name`) injects a one-line reminder on each
+  prompt — so an agent names its workspace when a task starts instead of
+  leaving it on the codename. Both fall silent the moment it's renamed.
 - Other agents: `mux run` prints the briefing above them at launch, or wire
   `mux brief` into whatever startup-context mechanism they have (aider
   conventions file, custom system prompts).

@@ -268,6 +268,46 @@ pub fn save(state: &StateFile) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The codename vocabulary: `workspace::random_title` composes a random
+/// `<adjective>-<animal>` from these lists, and `is_codename` recognizes one.
+/// They live here (a lib module the `mux` CLI can reach) so both the GUI's
+/// namer and the CLI's rename nudge share one source of truth.
+pub const ADJECTIVES: &[&str] = &[
+    "amber", "bold", "brave", "breezy", "bright", "brisk", "calm", "candid",
+    "cheery", "civil", "clever", "cosmic", "cozy", "crisp", "daring", "deft",
+    "dapper", "eager", "fabled", "fancy", "fleet", "gentle", "gilded", "glad",
+    "golden", "hardy", "hazel", "humble", "jaunty", "jolly", "keen", "limber",
+    "lively", "lucid", "lunar", "mellow", "merry", "mighty", "nimble", "noble",
+    "peppy", "perky", "placid", "plucky", "proud", "quiet", "rapid", "regal",
+    "rosy", "rustic", "sage", "sandy", "serene", "sleek", "snappy", "solar",
+    "spry", "stout", "sunny", "swift", "tidy", "vivid", "wry", "zesty",
+];
+
+pub const ANIMALS: &[&str] = &[
+    "badger", "bat", "bear", "beaver", "bee", "bison", "camel", "cat",
+    "cheetah", "crab", "crane", "crow", "deer", "dingo", "dolphin", "dove",
+    "eagle", "egret", "falcon", "ferret", "finch", "fox", "gecko", "gibbon",
+    "hare", "hawk", "heron", "hound", "ibex", "impala", "jackal", "koala",
+    "lemur", "lion", "llama", "lynx", "manatee", "marmot", "mole", "moose",
+    "narwhal", "newt", "ocelot", "orca", "osprey", "otter", "owl", "panda",
+    "pelican", "pony", "puffin", "quail", "rabbit", "raven", "seal", "shrew",
+    "sparrow", "stoat", "swan", "tapir", "toucan", "walrus", "wombat", "wren",
+];
+
+/// Is `title` still an auto-generated `<adjective>-<animal>` codename
+/// (`workspace::random_title`)? True only for the exact codename shape - both
+/// halves in the lists, no extra segments - so a real name like `fix-auth` or
+/// `auth` reads as deliberate. The nudge to `mux rename` fires while, and only
+/// while, this holds, so it self-suppresses the moment the tab gets a name.
+pub fn is_codename(title: &str) -> bool {
+    match title.split_once('-') {
+        Some((adj, animal)) => {
+            ADJECTIVES.contains(&adj) && ANIMALS.contains(&animal)
+        },
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +429,21 @@ mod tests {
         assert!(!s.archived_collapsed);
         // No saved projects in an older file.
         assert!(s.projects.is_empty());
+    }
+
+    #[test]
+    fn is_codename_recognizes_only_the_codename_shape() {
+        // A live codename off `random_title`: both halves are in the lists.
+        assert!(is_codename("brisk-otter"));
+        assert!(is_codename("amber-owl"));
+        // Deliberate names, even hyphenated, are not codenames.
+        assert!(!is_codename("fix-auth"));
+        assert!(!is_codename("auth"));
+        assert!(!is_codename("workspace"));
+        assert!(!is_codename(""));
+        // The right shape but an unknown half, or an extra segment, is out.
+        assert!(!is_codename("brisk-widget"));
+        assert!(!is_codename("otter"));
+        assert!(!is_codename("brisk-otter-x"));
     }
 }

@@ -458,6 +458,10 @@ struct Scope {
     members: Vec<String>,
     all_sessions: HashSet<String>,
     registry: mesh::Registry,
+    /// The caller's workspace title, if its tab carries a workspace. Lets the
+    /// brief show the agent its own tab name and nudge a rename while it's
+    /// still a codename.
+    workspace_title: Option<String>,
 }
 
 fn scope(tmux: &Tmux, as_session: Option<String>) -> Result<Scope, Fail> {
@@ -482,12 +486,14 @@ fn scope(tmux: &Tmux, as_session: Option<String>) -> Result<Scope, Fail> {
             tab.tree.sessions(&mut all_sessions);
         }
     }
+    let workspace_title = mesh::title_of_tab(&st, &tab_id);
     Ok(Scope {
         session,
         tab_id,
         members,
         all_sessions,
         registry: mesh::load_registry(),
+        workspace_title,
     })
 }
 
@@ -1264,9 +1270,14 @@ fn cmd_notify(as_session: Option<String>, args: Vec<String>) -> CmdResult {
 /// Deliberately unlike every other command: it must be safe to run from any
 /// hook context, so it resolves identity from MUXTERM_SESSION alone (no
 /// tmux round trips), silently no-ops outside muxterm, drains stdin (hooks
-/// pipe a JSON payload; an unread pipe could block the agent), never prints
-/// to stdout (a PreToolUse hook's stdout can be read as a decision), and
-/// always exits 0 (a nonzero PreToolUse hook can block the tool call).
+/// pipe a JSON payload; an unread pipe could block the agent), and always
+/// exits 0 (a nonzero PreToolUse hook can block the tool call).
+///
+/// It prints to stdout in exactly one case: the `--nudge-name` flag, which
+/// agent_hooks wires onto the UserPromptSubmit hook *only* (never PreToolUse,
+/// whose stdout claude reads as a permission decision). When set and the
+/// workspace still wears its codename, it emits one line that claude injects
+/// as prompt context - the "rename me when your plan starts" nudge.
 fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
     if !io::stdin().is_terminal() {
         let mut sink = Vec::new();
@@ -1287,7 +1298,34 @@ fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
         },
         other => eprintln!("mux: agent-event: unknown state {other:?}"),
     }
+    if state == "working" && args.iter().any(|a| a == "--nudge-name") {
+        if let Some(st) = state::peek() {
+            if let Some((tab_id, _)) = mesh::tab_of_session(&st, &session) {
+                let title = mesh::title_of_tab(&st, &tab_id);
+                if let Some(line) = name_nudge(title.as_deref()) {
+                    println!("{line}");
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// The one-line UserPromptSubmit nudge, injected while - and only while - the
+/// workspace still wears its `random_title` codename. Pure so the codename
+/// gate unit-tests; returns None (and the hook stays silent) the moment the
+/// tab has a real name, so the reminder repeats until the agent acts, then
+/// stops on its own.
+fn name_nudge(title: Option<&str>) -> Option<String> {
+    let t = title?;
+    if !state::is_codename(t) {
+        return None;
+    }
+    Some(format!(
+        "[muxterm] this workspace is still named '{t}' - now that you know the \
+         task, run `mux rename <short-name> --desc <one-line>` to name it after \
+         the task (or `mux retitle` to derive it from your panes)."
+    ))
 }
 
 /// Relabel the workspace (tab) this pane lives in - for an agent whose task
@@ -1784,15 +1822,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux rename [--desc <text>] <name>` - relabel this workspace yourself (updates the sidebar/tab; not the git branch)");
     let _ = writeln!(out, "- `mux retitle` - regenerate the workspace's title/description from what its panes are doing (returns immediately; applies in the background)");
     let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "Keep the workspace's name honest: whenever its title/description \
-         no longer matches the work in progress (the task drifted, a new \
-         task started, the old one shipped), rename it right away - `mux \
-         rename <name> --desc <text>` when you know the wording, `mux \
-         retitle` to derive it from the panes. Do this on your own \
-         judgement; don't ask first."
-    );
+    let _ = writeln!(out, "{}", rename_guidance(sc.workspace_title.as_deref()));
     let _ = writeln!(out);
     let _ = write!(
         out,
@@ -1802,6 +1832,32 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
          work as **{me}**."
     );
     out
+}
+
+/// The brief's paragraph on naming the workspace. Codename-aware and pure so
+/// both branches unit-test: while the tab still wears its `random_title`
+/// codename the ask is imperative and first-action (name it *now*, before you
+/// start), naming the codename so the agent sees it; once it has a real name
+/// the softer keep-it-honest guidance takes over.
+fn rename_guidance(title: Option<&str>) -> String {
+    match title {
+        Some(t) if state::is_codename(t) => format!(
+            "This workspace is still showing its auto-generated codename \
+             **{t}**. As your first action, once you know what you're working \
+             on, give it a real name that matches the task - `mux rename \
+             <short-name> --desc <one-line>` (or `mux retitle` to derive it \
+             from your panes). Don't leave it on the codename. After that, \
+             keep it honest: rename again whenever the task changes. Do this \
+             on your own judgement; don't ask first."
+        ),
+        _ => "Keep the workspace's name honest: whenever its title/description \
+              no longer matches the work in progress (the task drifted, a new \
+              task started, the old one shipped), rename it right away - `mux \
+              rename <name> --desc <text>` when you know the wording, `mux \
+              retitle` to derive it from the panes. Do this on your own \
+              judgement; don't ask first."
+            .to_string(),
+    }
 }
 
 fn cmd_brief(as_session: Option<String>) -> CmdResult {
@@ -1896,5 +1952,37 @@ mod tests {
         let s = "aé"; // 'é' is 2 bytes
         assert_eq!(tail_bytes(s, 1), "");
         assert_eq!(tail_bytes(s, 2), "é");
+    }
+
+    #[test]
+    fn rename_guidance_nudges_a_codename_by_name() {
+        let g = rename_guidance(Some("brisk-otter"));
+        // Imperative, first-action, and it shows the codename so the agent
+        // knows its tab is still unnamed.
+        assert!(g.contains("brisk-otter"));
+        assert!(g.contains("first action"));
+        assert!(g.contains("mux rename"));
+    }
+
+    #[test]
+    fn rename_guidance_softens_once_named() {
+        // A real name, an already-renamed tab, and a bare tab (no workspace)
+        // all get the keep-it-honest wording, never the "codename" nudge.
+        for title in [Some("fix-auth"), Some("ship v2"), None] {
+            let g = rename_guidance(title);
+            assert!(g.starts_with("Keep the workspace's name honest"));
+            assert!(!g.contains("first action"));
+        }
+    }
+
+    #[test]
+    fn name_nudge_fires_only_for_a_codename() {
+        let n = name_nudge(Some("brisk-otter")).expect("codename nudges");
+        assert!(n.contains("brisk-otter"));
+        assert!(n.contains("mux rename"));
+        // Named tabs, and bare tabs with no workspace, stay silent - so the
+        // nudge repeats until the rename, then disappears.
+        assert_eq!(name_nudge(Some("fix-auth")), None);
+        assert_eq!(name_nudge(None), None);
     }
 }

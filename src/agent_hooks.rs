@@ -28,26 +28,28 @@ use serde_json::{json, Value};
 /// reported idle, and nothing would ever downgrade the false alarm).
 const CLAUDE_NOTIFY_MATCHER: &str = "permission_prompt|elicitation_dialog";
 
-/// claude's hook events -> (the state each reports, optional matcher).
-/// PreToolUse (unmatched = every tool) is deliberate: it flips attention
-/// back to working the moment a permission request is approved, not at
-/// end of turn.
-const CLAUDE_EVENTS: &[(&str, &str, Option<&str>)] = &[
-    ("UserPromptSubmit", "working", None),
-    ("PreToolUse", "working", None),
-    ("Stop", "idle", None),
-    ("Notification", "attention", Some(CLAUDE_NOTIFY_MATCHER)),
-    ("SessionEnd", "gone", None),
+/// claude's hook events -> (the state each reports, optional matcher, whether
+/// it also nudges an unnamed workspace to rename). PreToolUse (unmatched =
+/// every tool) is deliberate: it flips attention back to working the moment a
+/// permission request is approved, not at end of turn. The `--nudge-name`
+/// flag rides *only* UserPromptSubmit ("when a plan starts") - never
+/// PreToolUse, whose stdout claude reads as a permission decision.
+const CLAUDE_EVENTS: &[(&str, &str, Option<&str>, bool)] = &[
+    ("UserPromptSubmit", "working", None, true),
+    ("PreToolUse", "working", None, false),
+    ("Stop", "idle", None, false),
+    ("Notification", "attention", Some(CLAUDE_NOTIFY_MATCHER), false),
+    ("SessionEnd", "gone", None, false),
 ];
 
 /// codex shares claude's event vocabulary but has no SessionEnd (the GUI's
 /// foreground-process prune covers agent exit) and names the approval event
 /// PermissionRequest.
-const CODEX_EVENTS: &[(&str, &str, Option<&str>)] = &[
-    ("UserPromptSubmit", "working", None),
-    ("PreToolUse", "working", None),
-    ("Stop", "idle", None),
-    ("PermissionRequest", "attention", None),
+const CODEX_EVENTS: &[(&str, &str, Option<&str>, bool)] = &[
+    ("UserPromptSubmit", "working", None, true),
+    ("PreToolUse", "working", None, false),
+    ("Stop", "idle", None, false),
+    ("PermissionRequest", "attention", None, false),
 ];
 
 /// Install/refresh the hooks for every agent whose config dir exists.
@@ -107,7 +109,7 @@ fn resolve_mux() -> Option<String> {
 /// left strictly alone - never clobber a user's config to install a dot.
 fn merge_hooks_file(
     path: &PathBuf,
-    events: &[(&str, &str, Option<&str>)],
+    events: &[(&str, &str, Option<&str>, bool)],
     mux: &str,
 ) {
     let root_text = match fs::read_to_string(path) {
@@ -140,11 +142,21 @@ fn merge_hooks_file(
 /// a wedged hook can never stall the agent, and a matcher only where one
 /// event multiplexes triggers we must tell apart (claude's Notification) -
 /// absent means match every tool/notification.
-fn hook_group(mux: &str, state: &str, matcher: Option<&str>) -> Value {
+fn hook_group(
+    mux: &str,
+    state: &str,
+    matcher: Option<&str>,
+    nudge: bool,
+) -> Value {
+    let command = if nudge {
+        format!("{mux} agent-event {state} --nudge-name")
+    } else {
+        format!("{mux} agent-event {state}")
+    };
     let mut group = json!({
         "hooks": [{
             "type": "command",
-            "command": format!("{mux} agent-event {state}"),
+            "command": command,
             "timeout": 5,
         }],
     });
@@ -161,7 +173,7 @@ fn hook_group(mux: &str, state: &str, matcher: Option<&str>) -> Value {
 /// document changed.
 fn merge_hooks(
     root: &mut Value,
-    events: &[(&str, &str, Option<&str>)],
+    events: &[(&str, &str, Option<&str>, bool)],
     mux: &str,
 ) -> bool {
     let Some(obj) = root.as_object_mut() else {
@@ -172,8 +184,8 @@ fn merge_hooks(
         return false;
     };
     let mut changed = false;
-    for (event, state, matcher) in events {
-        let desired = hook_group(mux, state, *matcher);
+    for (event, state, matcher, nudge) in events {
+        let desired = hook_group(mux, state, *matcher, *nudge);
         let entry = hooks.entry(*event).or_insert_with(|| json!([]));
         let Some(list) = entry.as_array_mut() else {
             continue;
@@ -261,17 +273,61 @@ mod tests {
     fn merge_into_empty_adds_all_events() {
         let mut root = json!({});
         assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
-        for (event, state, matcher) in CLAUDE_EVENTS {
+        for (event, state, matcher, nudge) in CLAUDE_EVENTS {
             let group = &root["hooks"][*event][0];
             let cmd = group["hooks"][0]["command"].as_str().unwrap();
-            assert_eq!(
-                cmd,
+            let want = if *nudge {
+                format!("/usr/local/bin/mux agent-event {state} --nudge-name")
+            } else {
                 format!("/usr/local/bin/mux agent-event {state}")
-            );
+            };
+            assert_eq!(cmd, want);
             assert_eq!(group["matcher"].as_str(), *matcher);
         }
         // Idempotent: a second merge with the same path changes nothing.
         assert!(!merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+    }
+
+    #[test]
+    fn only_user_prompt_submit_carries_the_rename_nudge() {
+        // The nudge writes to stdout, which claude honors as context on
+        // UserPromptSubmit but reads as a permission decision on PreToolUse -
+        // so the flag must ride the former alone, even though both report
+        // "working".
+        let mut root = json!({});
+        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+        let cmd = |event: &str| {
+            root["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(cmd("UserPromptSubmit").ends_with(" --nudge-name"));
+        assert!(!cmd("PreToolUse").contains("--nudge-name"));
+    }
+
+    #[test]
+    fn merge_upgrades_a_pre_nudge_user_prompt_submit_in_place() {
+        // A pre-nudge install had the plain `working` command on
+        // UserPromptSubmit; it's recognized as ours and replaced, not doubled.
+        let mut root = json!({
+            "hooks": {
+                "UserPromptSubmit": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/mux agent-event working",
+                        "timeout": 5,
+                    }],
+                }],
+            },
+        });
+        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+        let groups = root["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0]["hooks"][0]["command"],
+            "/usr/local/bin/mux agent-event working --nudge-name"
+        );
     }
 
     #[test]

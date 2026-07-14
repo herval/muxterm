@@ -264,37 +264,16 @@ pub fn expand_dir(input: &str) -> Option<PathBuf> {
     Some(PathBuf::from(s))
 }
 
-const ADJECTIVES: &[&str] = &[
-    "amber", "bold", "brave", "breezy", "bright", "brisk", "calm", "candid",
-    "cheery", "civil", "clever", "cosmic", "cozy", "crisp", "daring", "deft",
-    "dapper", "eager", "fabled", "fancy", "fleet", "gentle", "gilded", "glad",
-    "golden", "hardy", "hazel", "humble", "jaunty", "jolly", "keen", "limber",
-    "lively", "lucid", "lunar", "mellow", "merry", "mighty", "nimble", "noble",
-    "peppy", "perky", "placid", "plucky", "proud", "quiet", "rapid", "regal",
-    "rosy", "rustic", "sage", "sandy", "serene", "sleek", "snappy", "solar",
-    "spry", "stout", "sunny", "swift", "tidy", "vivid", "wry", "zesty",
-];
-
-const ANIMALS: &[&str] = &[
-    "badger", "bat", "bear", "beaver", "bee", "bison", "camel", "cat",
-    "cheetah", "crab", "crane", "crow", "deer", "dingo", "dolphin", "dove",
-    "eagle", "egret", "falcon", "ferret", "finch", "fox", "gecko", "gibbon",
-    "hare", "hawk", "heron", "hound", "ibex", "impala", "jackal", "koala",
-    "lemur", "lion", "llama", "lynx", "manatee", "marmot", "mole", "moose",
-    "narwhal", "newt", "ocelot", "orca", "osprey", "otter", "owl", "panda",
-    "pelican", "pony", "puffin", "quail", "rabbit", "raven", "seal", "shrew",
-    "sparrow", "stoat", "swan", "tapir", "toucan", "walrus", "wombat", "wren",
-];
-
 /// A random adjective-animal codename ("brisk-otter"): the name of a
 /// workspace's git worktree/branch, and a bare cmd+t tab's title. Random
 /// rather than derived from the prompt: instant, needs no agent CLI, git-safe,
 /// and keeps the task's words out of the branch. Randomness comes from uuid v4
-/// bytes (the crate's one existing entropy source; no rand dependency).
+/// bytes (the crate's one existing entropy source; no rand dependency). The
+/// vocabulary lives in `state` so `state::is_codename` recognizes the result.
 pub fn random_title() -> String {
     let b = uuid::Uuid::new_v4().into_bytes();
-    let adj = ADJECTIVES[usize::from(b[0]) % ADJECTIVES.len()];
-    let animal = ANIMALS[usize::from(b[1]) % ANIMALS.len()];
+    let adj = state::ADJECTIVES[usize::from(b[0]) % state::ADJECTIVES.len()];
+    let animal = state::ANIMALS[usize::from(b[1]) % state::ANIMALS.len()];
     format!("{adj}-{animal}")
 }
 
@@ -1082,13 +1061,15 @@ mod tests {
     #[test]
     fn random_title_is_adjective_animal() {
         // A byte mod 64 is unbiased only while the lists stay 64 long.
-        assert_eq!(ADJECTIVES.len(), 64);
-        assert_eq!(ANIMALS.len(), 64);
+        assert_eq!(state::ADJECTIVES.len(), 64);
+        assert_eq!(state::ANIMALS.len(), 64);
         for _ in 0..20 {
             let t = random_title();
             let (adj, animal) = t.split_once('-').expect("adj-animal shape");
-            assert!(ADJECTIVES.contains(&adj), "unknown adjective in {t}");
-            assert!(ANIMALS.contains(&animal), "unknown animal in {t}");
+            assert!(state::ADJECTIVES.contains(&adj), "unknown adjective in {t}");
+            assert!(state::ANIMALS.contains(&animal), "unknown animal in {t}");
+            // Every codename `random_title` makes must read back as a codename.
+            assert!(state::is_codename(&t), "{t} not recognized as a codename");
         }
     }
 
