@@ -240,7 +240,7 @@ impl TmuxCtl {
                 "list-panes",
                 "-a",
                 "-F",
-                "#{session_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}",
+                "#{session_name}\t#{pane_pid}\t#{pane_current_command}\t#{window_activity}\t#{pane_current_path}",
             ])
             .output();
         match out {
@@ -491,6 +491,11 @@ pub struct PaneSnap {
     /// walk root for the background-job scan (bg_jobs). None if the field
     /// failed to parse - a torn line must not drop the row's cmd/cwd.
     pub pid: Option<u32>,
+    /// #{window_activity}: unix seconds of the pane's last terminal activity
+    /// (each muxterm pane is its own tmux session/window, so it's per-pane).
+    /// Lets the poll tick clear a stuck "attention" whose pane kept producing
+    /// output after the permission fired. None if the field failed to parse.
+    pub activity: Option<u64>,
 }
 
 /// Parse `list-panes -a` output shaped
@@ -500,10 +505,11 @@ pub struct PaneSnap {
 fn parse_pane_snapshot(text: &str) -> HashMap<String, PaneSnap> {
     text.lines()
         .filter_map(|line| {
-            let mut fields = line.splitn(4, '\t');
+            let mut fields = line.splitn(5, '\t');
             let session = fields.next()?;
             let pid = fields.next()?.trim().parse::<u32>().ok();
             let cmd = fields.next()?.trim();
+            let activity = fields.next()?.trim().parse::<u64>().ok();
             let cwd = fields.next().map(str::trim).filter(|p| !p.is_empty());
             (!session.is_empty() && !cmd.is_empty()).then(|| {
                 (
@@ -512,6 +518,7 @@ fn parse_pane_snapshot(text: &str) -> HashMap<String, PaneSnap> {
                         cmd: cmd.to_string(),
                         cwd: cwd.map(PathBuf::from),
                         pid,
+                        activity,
                     },
                 )
             })
@@ -598,22 +605,26 @@ mod tests {
         // Claude Code's process title is its version string; commands and
         // paths may carry spaces; blank/malformed lines are dropped and a
         // missing path becomes None rather than an empty cwd. A garbage pid
-        // field costs only the pid, never the row.
+        // or window_activity field costs only that field, never the row; cwd
+        // stays the greedy last field so a tab in it (never seen in practice)
+        // could not shift the columns.
         let map = parse_pane_snapshot(
-            "mux-aaaa1111\t81234\tzsh\t/Users/u/dev\n\
-             mux-bbbb2222\t81235\t2.1.202\t/Users/u/my repo\n\
-             mux-cccc3333\t81236\tgit log\t\n\
-             mux-dddd4444\tnope\tvim\t/Users/u/dev\n\
+            "mux-aaaa1111\t81234\tzsh\t1784119626\t/Users/u/dev\n\
+             mux-bbbb2222\t81235\t2.1.202\t1784119177\t/Users/u/my repo\n\
+             mux-cccc3333\t81236\tgit log\t1784119000\t\n\
+             mux-dddd4444\tnope\tvim\tnope\t/Users/u/dev\n\
              \nbroken\n",
         );
         assert_eq!(map.len(), 4);
         assert_eq!(map["mux-aaaa1111"].cmd, "zsh");
         assert_eq!(map["mux-aaaa1111"].pid, Some(81234));
+        assert_eq!(map["mux-aaaa1111"].activity, Some(1784119626));
         assert_eq!(
             map["mux-aaaa1111"].cwd.as_deref(),
             Some(Path::new("/Users/u/dev"))
         );
         assert_eq!(map["mux-bbbb2222"].cmd, "2.1.202");
+        assert_eq!(map["mux-bbbb2222"].activity, Some(1784119177));
         assert_eq!(
             map["mux-bbbb2222"].cwd.as_deref(),
             Some(Path::new("/Users/u/my repo"))
@@ -622,6 +633,12 @@ mod tests {
         assert!(map["mux-cccc3333"].cwd.is_none());
         assert_eq!(map["mux-dddd4444"].cmd, "vim");
         assert!(map["mux-dddd4444"].pid.is_none());
+        // A garbage activity field degrades to None, keeping cmd/cwd.
+        assert!(map["mux-dddd4444"].activity.is_none());
+        assert_eq!(
+            map["mux-dddd4444"].cwd.as_deref(),
+            Some(Path::new("/Users/u/dev"))
+        );
         assert!(is_shell(&map["mux-aaaa1111"].cmd));
         assert!(!is_shell(&map["mux-bbbb2222"].cmd));
     }

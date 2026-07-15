@@ -44,6 +44,13 @@ const PANE_GAP: f32 = 4.0;
 /// ungated); a confused agent must not be able to shred the layout.
 const AGENT_SPLIT_MAX_PANES: usize = 8;
 
+/// Seconds of tmux `window_activity` past a stuck "attention" ts before the
+/// poll tick treats it as stale (the agent moved on but its clearing hook
+/// never fired). Wide enough that the permission prompt's own render - near
+/// the attention ts - never trips it, so a genuinely blocked, silent prompt
+/// keeps its "!". See the agent_states prune below.
+const STALE_ATTENTION_GRACE: u64 = 30;
+
 pub struct Tab {
     /// Stable id (`mux-tab-<8hex>`) scoping the agent mesh to this tab.
     pub tab_id: String,
@@ -2067,13 +2074,30 @@ impl eframe::App for App {
             // race on a freshly launched agent.
             self.agent_states = mesh::read_agent_states();
             self.agent_states.retain(|session, state| {
-                let live = self
-                    .pane_snap
-                    .get(session)
-                    .is_some_and(|snap| !tmux::is_shell(&snap.cmd));
+                let snap = self.pane_snap.get(session);
+                let live =
+                    snap.is_some_and(|snap| !tmux::is_shell(&snap.cmd));
                 if !live && mesh::now().saturating_sub(state.ts) > 5 {
                     mesh::remove_agent_state(session);
                     return false;
+                }
+                // A stuck "attention" whose pane kept producing terminal
+                // output after the permission fired: the agent moved on, but
+                // its clearing hook (Stop/PreToolUse -> idle/working) never
+                // ran - a session that predates the hooks, or had them edited
+                // out. tmux's per-pane window_activity postdating the ts
+                // proves activity since; a genuinely blocked prompt stays
+                // silent, so its activity never advances and the "!" persists.
+                if state.state == "attention" {
+                    let moved_on = snap
+                        .and_then(|snap| snap.activity)
+                        .is_some_and(|act| {
+                            act > state.ts.saturating_add(STALE_ATTENTION_GRACE)
+                        });
+                    if moved_on {
+                        mesh::remove_agent_state(session);
+                        return false;
+                    }
                 }
                 true
             });
