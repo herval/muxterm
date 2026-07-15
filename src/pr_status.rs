@@ -72,8 +72,13 @@ pub enum Kind {
     Err,
     /// Checks pending.
     Warn,
-    /// Ready to merge: open, checks green (or none), not draft.
+    /// Open and healthy but not yet approved: checks green (or none), not
+    /// draft, no approving review. The "awaiting review" state.
     Ok,
+    /// Approved: open, checks green (or none), not draft, review APPROVED.
+    /// Split out from `Ok` so a signed-off PR reads distinctly from one
+    /// still waiting on a reviewer.
+    Approved,
     Merged,
     /// Draft.
     Draft,
@@ -87,6 +92,7 @@ impl Kind {
             Kind::Err => hud.err,
             Kind::Warn => hud.warn,
             Kind::Ok => hud.ok,
+            Kind::Approved => hud.ok,
             Kind::Merged => hud.merged,
             Kind::Draft => hud.fg_dim,
             Kind::Neutral => hud.fg_dim,
@@ -96,8 +102,9 @@ impl Kind {
     /// The chip's state icon, painter-drawn like `sidebar::status_icon`
     /// (terminal fonts gamble on ✗/✓ glyphs) and a distinct shape per
     /// state - color alone must never be the only signal: red ✗ failing,
-    /// yellow dot pending, green ✓ ready to merge, hollow ring draft,
-    /// magenta merge-glyph merged, dim minus closed.
+    /// yellow dot pending, green ✓ open/awaiting review, green sealed-✓
+    /// approved, hollow ring draft, magenta merge-glyph merged, dim minus
+    /// closed.
     pub fn draw_icon(
         self,
         painter: &egui::Painter,
@@ -137,6 +144,23 @@ impl Kind {
                 );
                 painter.line_segment(
                     [mid, Pos2::new(center.x + r, center.y - r * 0.7)],
+                    stroke,
+                );
+            },
+            Kind::Approved => {
+                // The ready check, sealed in a ring: a stronger "signed off"
+                // than the bare open-PR check, and shape-distinct from it and
+                // from the empty (dim) draft ring.
+                painter.circle_stroke(center, r, stroke);
+                let cr = r * 0.5;
+                let mid =
+                    Pos2::new(center.x - cr * 0.25, center.y + cr * 0.85);
+                painter.line_segment(
+                    [Pos2::new(center.x - cr, center.y + cr * 0.1), mid],
+                    stroke,
+                );
+                painter.line_segment(
+                    [mid, Pos2::new(center.x + cr, center.y - cr * 0.75)],
                     stroke,
                 );
             },
@@ -635,6 +659,8 @@ pub fn rollup(json: &str, root: &str, branch: &str) -> Option<Badge> {
             Kind::Warn
         } else if draft {
             Kind::Draft
+        } else if review == Some("APPROVED") {
+            Kind::Approved
         } else {
             Kind::Ok
         }
@@ -737,9 +763,16 @@ mod tests {
 
     #[test]
     fn green_paths_and_draft() {
+        // Approved (checks green) reads distinctly from a plain open PR.
         let b = roll(r#""state":"OPEN","reviewDecision":"APPROVED","statusCheckRollup":[{"state":"SUCCESS"}]"#).unwrap();
-        assert_eq!(b.kind, Kind::Ok);
+        assert_eq!(b.kind, Kind::Approved);
         assert!(b.detail.contains("approved"));
+        // Open with passing checks but no approving review yet stays Ok, not
+        // Approved - the whole point of the split.
+        let b = roll(r#""state":"OPEN","statusCheckRollup":[{"state":"SUCCESS"}]"#).unwrap();
+        assert_eq!(b.kind, Kind::Ok);
+        assert!(b.detail.contains("checks passing"));
+        assert!(!b.detail.contains("approved"));
         // no checks at all: an open healthy PR is still green
         let b = roll(r#""state":"OPEN""#).unwrap();
         assert_eq!(b.kind, Kind::Ok);
@@ -920,6 +953,7 @@ mod tests {
                     Kind::Err,
                     Kind::Warn,
                     Kind::Ok,
+                    Kind::Approved,
                     Kind::Merged,
                     Kind::Draft,
                     Kind::Neutral,
