@@ -1323,8 +1323,11 @@ fn name_nudge(title: Option<&str>) -> Option<String> {
     }
     Some(format!(
         "[muxterm] this workspace is still named '{t}' - now that you know the \
-         task, run `mux rename <short-name> --desc <one-line>` to name it after \
-         the task (or `mux retitle` to derive it from your panes)."
+         task, give it a short descriptive title: a 2-5 word plain-English \
+         phrase capturing the intent (like a tab label, NOT a branch slug - \
+         spaces, not hyphens). Run e.g. `mux rename \"Fix auth redirect\" \
+         --desc \"<one line of detail>\"`, or `mux retitle` to derive it from \
+         your panes."
     ))
 }
 
@@ -1819,7 +1822,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux tell <name> <text>` - type directly into their terminal (immediate but can interleave)");
     let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
     let _ = writeln!(out, "- `mux split [right|down] [--run <cmd>]` - add a pane beside yours for a new teammate; prints its session name");
-    let _ = writeln!(out, "- `mux rename [--desc <text>] <name>` - relabel this workspace yourself (updates the sidebar/tab; not the git branch)");
+    let _ = writeln!(out, "- `mux rename [--desc <text>] <title...>` - relabel this workspace with a short descriptive title (2-5 words, spaces ok; updates the sidebar/tab, never the git branch)");
     let _ = writeln!(out, "- `mux retitle` - regenerate the workspace's title/description from what its panes are doing (returns immediately; applies in the background)");
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", rename_guidance(sc.workspace_title.as_deref()));
@@ -1844,11 +1847,14 @@ fn rename_guidance(title: Option<&str>) -> String {
         Some(t) if state::is_codename(t) => format!(
             "This workspace is still showing its auto-generated codename \
              **{t}**. As your first action, once you know what you're working \
-             on, give it a real name that matches the task - `mux rename \
-             <short-name> --desc <one-line>` (or `mux retitle` to derive it \
-             from your panes). Don't leave it on the codename. After that, \
-             keep it honest: rename again whenever the task changes. Do this \
-             on your own judgement; don't ask first."
+             on, give it a short descriptive title: a 2-5 word plain-English \
+             phrase that captures the intent, like a tab label - NOT a branch \
+             slug (use spaces, not hyphens; this is a display name, never \
+             touches the git branch). For example `mux rename \"Fix auth \
+             redirect\" --desc \"<one line of detail>\"`, or `mux retitle` to \
+             derive it from your panes. Don't leave it on the codename. After \
+             that, keep it honest: rename again whenever the task changes. Do \
+             this on your own judgement; don't ask first."
         ),
         _ => "Keep the workspace's name honest: whenever its title/description \
               no longer matches the work in progress (the task drifted, a new \
@@ -1962,6 +1968,9 @@ mod tests {
         assert!(g.contains("brisk-otter"));
         assert!(g.contains("first action"));
         assert!(g.contains("mux rename"));
+        // Steers toward a readable title, not a branch-style slug.
+        assert!(g.contains("descriptive"));
+        assert!(g.contains("spaces"));
     }
 
     #[test]
@@ -1980,6 +1989,9 @@ mod tests {
         let n = name_nudge(Some("brisk-otter")).expect("codename nudges");
         assert!(n.contains("brisk-otter"));
         assert!(n.contains("mux rename"));
+        // Steers toward a readable title, not a branch-style slug.
+        assert!(n.contains("descriptive"));
+        assert!(n.contains("spaces"));
         // Named tabs, and bare tabs with no workspace, stay silent - so the
         // nudge repeats until the rename, then disappears.
         assert_eq!(name_nudge(Some("fix-auth")), None);
