@@ -17,14 +17,16 @@ use egui::{
 };
 
 use muxterm::agent::Agent;
+use muxterm::layout::SplitAxis;
 
 use crate::config;
 use crate::theme::{self, UiTheme};
-use crate::workspace::{self, Project};
+use crate::workspace::{self, Project, Template, TemplatePane};
 
-/// Row width in character cells, borders included. Sized so the longest
-/// fixed line (the "?" hint row) fits with a little air.
-const COLS: usize = 48;
+/// Row width in character cells, borders included. Wide enough for the four
+/// tab labels in the selector row (`appearance preferences projects
+/// templates`), which is now the longest fixed line.
+const COLS: usize = 56;
 
 /// Which settings tab is showing. Owned by the App (like `settings_open`)
 /// so cmd+shift+n can land straight on Projects.
@@ -34,6 +36,7 @@ pub enum Tab {
     Appearance,
     Preferences,
     Projects,
+    Templates,
 }
 
 /// The Projects tab's add form text, owned by the App so typing survives
@@ -47,6 +50,36 @@ pub struct ProjectDraft {
     /// the whole repo, then cd's here before the setup script.
     pub subfolder: String,
     pub setup: String,
+}
+
+/// The Templates tab's edit form, owned by the App so typing survives the
+/// stateless per-frame `show`. `panes[0]` is the immutable main slot (the
+/// agent/shell the workspace opens anyway); the rest are the extra panes the
+/// user lays out. Clicking a saved template row loads it here; `[ add ]`
+/// upserts by name (the edit path, like Projects).
+pub struct TemplateDraft {
+    pub name: String,
+    pub panes: Vec<PaneDraft>,
+}
+
+pub struct PaneDraft {
+    pub command: String,
+    pub split: SplitAxis,
+    pub size: u8,
+}
+
+impl PaneDraft {
+    /// A fresh pane: split the previous one to the right, an even 50/50.
+    fn new() -> Self {
+        Self { command: String::new(), split: SplitAxis::SideBySide, size: 50 }
+    }
+}
+
+impl Default for TemplateDraft {
+    fn default() -> Self {
+        // Always at least the main pane; the user adds extras from there.
+        Self { name: String::new(), panes: vec![PaneDraft::new()] }
+    }
 }
 
 /// What the user changed this frame; the caller persists and reloads.
@@ -66,6 +99,11 @@ pub struct Outcome {
     pub add_project: Option<Project>,
     /// Index into the caller's project list to remove.
     pub remove_project: Option<usize>,
+    /// A template to add - or to replace, when a saved one already has its
+    /// name. The caller owns the list (state.json), same as projects.
+    pub add_template: Option<Template>,
+    /// Index into the caller's template list to remove.
+    pub remove_template: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -85,6 +123,8 @@ pub fn show(
     tab: &mut Tab,
     projects: &[Project],
     draft: &mut ProjectDraft,
+    templates: &[Template],
+    tdraft: &mut TemplateDraft,
 ) -> Outcome {
     let mut out = Outcome::default();
     let grid = Grid {
@@ -134,6 +174,9 @@ pub fn show(
                 Tab::Projects => {
                     show_projects(ui, &grid, th, projects, draft, &mut out)
                 },
+                Tab::Templates => show_templates(
+                    ui, &grid, th, templates, tdraft, &mut out,
+                ),
             }
 
             grid.divider(ui, "esc closes", th.text_dim);
@@ -388,6 +431,156 @@ fn show_projects(
     });
 }
 
+fn show_templates(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    th: &UiTheme,
+    templates: &[Template],
+    draft: &mut TemplateDraft,
+    out: &mut Outcome,
+) {
+    grid.divider(ui, "Templates", th.accent);
+    if templates.is_empty() {
+        grid.hint(ui, "none yet - lay out panes below, then add");
+    }
+    for (i, t) in templates.iter().enumerate() {
+        // `name  N panes  [x]`: click the name to load it into the draft
+        // (edit path), the trailing [x] removes it.
+        let loaded = draft.name.trim() == t.name;
+        let row = ui.horizontal(|ui| {
+            let marker = if loaded { "> " } else { "  " };
+            let name = grid.seg(
+                ui,
+                &format!("  {marker}{:<22}", clip(&t.name, 21)),
+                if loaded { th.accent } else { th.text },
+                true,
+            );
+            let name = name.union(grid.seg(
+                ui,
+                &format!(" {:>2} panes ", t.panes.len()),
+                th.text_dim,
+                true,
+            ));
+            let x = grid.seg(ui, "[x]", th.accent, true);
+            (name, x)
+        });
+        let (name, x) = row.inner;
+        if x.clicked() {
+            out.remove_template = Some(i);
+        } else if name.clicked() {
+            draft.name = t.name.clone();
+            draft.panes = load_panes(t);
+        }
+    }
+
+    grid.divider(ui, "Edit template", th.accent);
+    grid.input_row(ui, &mut draft.name, "name", 1);
+
+    // Pane 1 is the main pane: it runs whatever the workspace opens anyway
+    // (the agent, or a bare shell), so it carries no command or split.
+    grid.hint(ui, "1  main (agent / shell)");
+
+    // Extra panes: a control line (split direction, size, remove) plus a
+    // command field, each split off the previous pane.
+    let mut remove: Option<usize> = None;
+    for i in 1..draft.panes.len() {
+        let pane = &mut draft.panes[i];
+        ui.horizontal(|ui| {
+            grid.seg(ui, &format!("  {}  ", i + 1), th.text_dim, false);
+            let dir = match pane.split {
+                SplitAxis::SideBySide => "[right]",
+                SplitAxis::Stacked => "[down] ",
+            };
+            if grid.seg(ui, dir, th.accent, true).clicked() {
+                pane.split = match pane.split {
+                    SplitAxis::SideBySide => SplitAxis::Stacked,
+                    SplitAxis::Stacked => SplitAxis::SideBySide,
+                };
+            }
+            grid.seg(ui, "  ", th.text, false);
+            let minus = grid.seg(ui, "[-]", th.accent, true);
+            grid.seg(ui, &format!(" {:>2}% ", pane.size), th.text, false);
+            let plus = grid.seg(ui, "[+]", th.accent, true);
+            if minus.clicked() {
+                pane.size = pane.size.saturating_sub(5).max(10);
+            }
+            if plus.clicked() {
+                pane.size = pane.size.saturating_add(5).min(90);
+            }
+            grid.seg(ui, "  ", th.text, false);
+            if grid.seg(ui, "[x]", th.accent, true).clicked() {
+                remove = Some(i);
+            }
+        });
+        grid.input_row(ui, &mut draft.panes[i].command, "command (optional)", 1);
+    }
+    if let Some(i) = remove {
+        draft.panes.remove(i);
+    }
+
+    ui.horizontal(|ui| {
+        grid.seg(ui, "  ", th.text_dim, false);
+        if grid.seg(ui, "[ + pane ]", th.accent, true).clicked() {
+            draft.panes.push(PaneDraft::new());
+        }
+    });
+    grid.hint(ui, "each pane splits the previous one");
+
+    let ready = !draft.name.trim().is_empty();
+    ui.horizontal(|ui| {
+        grid.seg(ui, "  ", th.text_dim, false);
+        let color = if ready { th.accent } else { th.text_dim };
+        let btn = grid.seg(ui, "[ add ]", color, ready);
+        let exists = templates.iter().any(|t| t.name == draft.name.trim());
+        let note = if exists { " replaces the saved one" } else { "" };
+        grid.seg(ui, note, th.text_dim, false);
+        if ready && btn.clicked() {
+            if let Some(t) = draft_template(draft) {
+                out.add_template = Some(t);
+                *draft = TemplateDraft::default();
+            }
+        }
+    });
+}
+
+/// Build the Template the draft describes, or None while it's unnamed. The
+/// main pane's command/split are dropped (it runs the workspace's own
+/// launch); sizes are clamped to the split-friendly 10..=90 range.
+fn draft_template(draft: &TemplateDraft) -> Option<Template> {
+    let name = draft.name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(Template {
+        name: name.to_string(),
+        panes: draft
+            .panes
+            .iter()
+            .map(|p| TemplatePane {
+                command: p.command.trim().to_string(),
+                split: p.split,
+                size: p.size.clamp(10, 90),
+            })
+            .collect(),
+    })
+}
+
+/// Load a saved template into editable pane drafts, always keeping at least
+/// the main pane so the form has something to render.
+fn load_panes(t: &Template) -> Vec<PaneDraft> {
+    if t.panes.is_empty() {
+        return vec![PaneDraft::new()];
+    }
+    t.panes
+        .iter()
+        .map(|p| PaneDraft {
+            command: p.command.clone(),
+            split: p.split,
+            size: p.size.clamp(10, 90),
+        })
+        .collect()
+}
+
 /// The location text, classified: a git URL / "owner/repo" shorthand, a
 /// folder path, or nothing. Pure; drives both the add button's gating and
 /// the Project the draft builds.
@@ -551,6 +744,7 @@ impl Grid<'_> {
                 (Tab::Appearance, "appearance"),
                 (Tab::Preferences, "preferences"),
                 (Tab::Projects, "projects"),
+                (Tab::Templates, "templates"),
             ] {
                 let selected = *tab == t;
                 let marker = if selected { "> " } else { "  " };
@@ -845,6 +1039,29 @@ mod tests {
         ]
     }
 
+    fn fixture_templates() -> Vec<Template> {
+        vec![Template {
+            name: "a-rather-long-template-name".into(),
+            panes: vec![
+                TemplatePane {
+                    command: String::new(),
+                    split: SplitAxis::SideBySide,
+                    size: 50,
+                },
+                TemplatePane {
+                    command: "gitwatch".into(),
+                    split: SplitAxis::SideBySide,
+                    size: 35,
+                },
+                TemplatePane {
+                    command: String::new(),
+                    split: SplitAxis::Stacked,
+                    size: 50,
+                },
+            ],
+        }]
+    }
+
     /// Render one tab headless; the panel's second frame paints for real
     /// (a window's first frame is an invisible sizing pass).
     fn render_tab(tab: Tab) -> (egui::Context, FontId, egui::FullOutput) {
@@ -862,9 +1079,19 @@ mod tests {
         };
         let agents: Vec<_> = agent::AGENTS.iter().collect();
         let projects = fixture_projects();
+        let templates = fixture_templates();
         let frame = |ctx: &egui::Context| {
             let mut tab = tab;
             let mut draft = ProjectDraft::default();
+            // A draft with an extra pane so the Templates tab actually paints
+            // its control line + command field for the frame-width check.
+            let mut tdraft = TemplateDraft::default();
+            tdraft.name = "dev".into();
+            tdraft.panes.push(PaneDraft {
+                command: "gitwatch".into(),
+                split: SplitAxis::Stacked,
+                size: 35,
+            });
             show(
                 ctx,
                 &ui_theme,
@@ -881,6 +1108,8 @@ mod tests {
                 &mut tab,
                 &projects,
                 &mut draft,
+                &templates,
+                &mut tdraft,
             );
         };
         let _ = ctx.run(input.clone(), frame);
@@ -894,7 +1123,9 @@ mod tests {
     /// border's cell, or content collides with the hairline frame.
     #[test]
     fn text_stays_inside_the_frame() {
-        for tab in [Tab::Appearance, Tab::Preferences, Tab::Projects] {
+        for tab in
+            [Tab::Appearance, Tab::Preferences, Tab::Projects, Tab::Templates]
+        {
             let (ctx, font, output) = render_tab(tab);
 
             let mut texts: Vec<(f32, f32, f32, String)> = Vec::new();
@@ -1091,7 +1322,9 @@ mod tests {
     #[test]
     #[ignore]
     fn print_panel() {
-        for tab in [Tab::Appearance, Tab::Preferences, Tab::Projects] {
+        for tab in
+            [Tab::Appearance, Tab::Preferences, Tab::Projects, Tab::Templates]
+        {
             let (_, _, output) = render_tab(tab);
             let mut texts: Vec<(f32, f32, f32, String)> = Vec::new();
             for clipped in &output.shapes {

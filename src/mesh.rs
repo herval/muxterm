@@ -591,6 +591,7 @@ mod tests {
             sidebar_open: true,
             archived_collapsed: false,
             projects: Vec::new(),
+            templates: Vec::new(),
             windows: vec![WindowState {
                 active_tab: 0,
                 tabs: vec![

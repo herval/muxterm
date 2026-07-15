@@ -41,19 +41,33 @@ pub enum Removal {
 }
 
 impl Node {
-    /// Replace `Leaf(target)` with a split holding the old pane first and
-    /// `new_pane` second. Returns false if `target` is not in the tree.
+    /// Replace `Leaf(target)` with an evenly-split node holding the old pane
+    /// first and `new_pane` second. Returns false if `target` is not in the
+    /// tree.
     pub fn split(
         &mut self,
         target: PaneId,
         axis: SplitAxis,
         new_pane: PaneId,
     ) -> bool {
+        self.split_with(target, axis, new_pane, 0.5)
+    }
+
+    /// Like `split`, but the new split gets `ratio` (the fraction kept by the
+    /// old pane, `first`) instead of an even 0.5 - workspace templates use
+    /// this to size the panes they lay out.
+    pub fn split_with(
+        &mut self,
+        target: PaneId,
+        axis: SplitAxis,
+        new_pane: PaneId,
+        ratio: f32,
+    ) -> bool {
         match self {
             Node::Leaf(id) if *id == target => {
                 *self = Node::Split {
                     axis,
-                    ratio: 0.5,
+                    ratio,
                     first: Box::new(Node::Leaf(target)),
                     second: Box::new(Node::Leaf(new_pane)),
                 };
@@ -61,8 +75,8 @@ impl Node {
             },
             Node::Leaf(_) => false,
             Node::Split { first, second, .. } => {
-                first.split(target, axis, new_pane)
-                    || second.split(target, axis, new_pane)
+                first.split_with(target, axis, new_pane, ratio)
+                    || second.split_with(target, axis, new_pane, ratio)
             },
         }
     }
@@ -235,6 +249,17 @@ mod tests {
         assert!(tree.split(PaneId(2), SplitAxis::Stacked, PaneId(3)));
         assert!(!tree.split(PaneId(99), SplitAxis::Stacked, PaneId(4)));
         assert_eq!(tree.leaves(), vec![PaneId(1), PaneId(2), PaneId(3)]);
+    }
+
+    #[test]
+    fn split_with_sets_ratio() {
+        let mut tree = Node::Leaf(PaneId(1));
+        assert!(tree.split_with(PaneId(1), SplitAxis::SideBySide, PaneId(2), 0.7));
+        match &tree {
+            Node::Split { ratio, .. } => assert_eq!(*ratio, 0.7),
+            _ => panic!("expected a split"),
+        }
+        assert!(!tree.split_with(PaneId(99), SplitAxis::Stacked, PaneId(3), 0.3));
     }
 
     #[test]

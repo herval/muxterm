@@ -91,6 +91,8 @@ pub struct App {
     settings_tab: settings::Tab,
     /// The Projects tab's add form, typed across frames.
     project_draft: settings::ProjectDraft,
+    /// The Templates tab's edit form, typed across frames.
+    template_draft: settings::TemplateDraft,
     dirty: bool,
     config_mtime: Option<SystemTime>,
     last_config_check: Instant,
@@ -150,6 +152,10 @@ pub struct App {
     /// The saved project registry (Settings > Projects): what cmd+shift+n
     /// starts sessions from. Persisted in state.json.
     projects: Vec<workspace::Project>,
+    /// The saved workspace-layout templates (Settings > Templates): the
+    /// multi-pane presets the new-workspace popup can apply. Persisted in
+    /// state.json.
+    templates: Vec<workspace::Template>,
     /// tab_id -> AI-generated title, streamed in by `workspace::spawn_title`.
     title_tx: Sender<(String, String)>,
     title_rx: Receiver<(String, String)>,
@@ -196,6 +202,13 @@ pub struct App {
     /// while the tab is pending. Seeded at Create, updated on Progress,
     /// removed on Done - render-only, never persisted.
     worktree_progress: HashMap<String, String>,
+    /// tab_id -> the template's extra panes awaiting their boot: (pane, the
+    /// command to run after the shared cd + setup). Filled when a template
+    /// workspace is created and drained by `launch_template_panes` on the same
+    /// tick the main pane boots (immediately, or after the worktree lands).
+    /// Transient, never persisted - the panes themselves are real sessions the
+    /// layout tree already captures.
+    pending_panes: HashMap<String, Vec<(PaneId, String)>>,
     /// (active tab, window focused) as last published to the panes' repaint
     /// policies - see `sync_repaint_policies`.
     policy_state: Option<(usize, bool)>,
@@ -278,6 +291,7 @@ impl App {
             settings_open: false,
             settings_tab: settings::Tab::default(),
             project_draft: settings::ProjectDraft::default(),
+            template_draft: settings::TemplateDraft::default(),
             dirty: false,
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
@@ -307,6 +321,7 @@ impl App {
             new_workspace: None,
             last_workspace_dir: None,
             projects: Vec::new(),
+            templates: Vec::new(),
             title_tx,
             title_rx,
             naming: HashSet::new(),
@@ -320,6 +335,7 @@ impl App {
             worktree_rx,
             pending_worktrees: HashSet::new(),
             worktree_progress: HashMap::new(),
+            pending_panes: HashMap::new(),
             policy_state: None,
             pane_snap_shared,
             focused_flag,
@@ -339,6 +355,12 @@ impl App {
                     .iter()
                     .cloned()
                     .map(workspace::Project::from_state)
+                    .collect();
+                app.templates = saved
+                    .templates
+                    .iter()
+                    .cloned()
+                    .map(workspace::Template::from_state)
                     .collect();
                 let mut referenced = HashSet::new();
                 for window in &saved.windows {
@@ -612,7 +634,7 @@ impl App {
             .or_else(|| root.clone())
             .map(|p| p.display().to_string());
 
-        let pane = match self.create_pane(ctx, None, start_dir) {
+        let pane = match self.create_pane(ctx, None, start_dir.clone()) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("failed to open workspace pane: {e:#}");
@@ -621,11 +643,42 @@ impl App {
         };
         // A workspace opens as a single agent pane (split later with cmd+d);
         // the agent launch types into the tree's *first* leaf, which a lone
-        // leaf trivially is.
+        // leaf trivially is. A picked layout template pre-splits it into
+        // several: one extra pane per spec, arranged by build_template_tree
+        // (split-previous, sized), each running its command after the same
+        // cd + setup boot the main pane gets (deferred via pending_panes so
+        // the side panes wait for the worktree checkout too).
         let id = pane.id;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
-        let tree = Node::Leaf(id);
+        let template = form.selected_template().cloned();
+        let mut ids = vec![id];
+        let mut specs: Vec<workspace::TemplatePane> = Vec::new();
+        let mut extra_cmds: Vec<(PaneId, String)> = Vec::new();
+        if let Some(main) = template.as_ref().and_then(|t| t.panes.first()) {
+            // specs stays aligned with ids: index 0 is the main pane (its
+            // split/size are ignored), then one entry per extra pane that
+            // actually opened - a failed create_pane drops both together.
+            specs.push(main.clone());
+            for spec in template.as_ref().map(|t| t.extra_panes()).unwrap_or(&[])
+            {
+                match self.create_pane(ctx, None, start_dir.clone()) {
+                    Ok(p) => {
+                        let pid = p.id;
+                        panes.insert(pid, p);
+                        ids.push(pid);
+                        specs.push(spec.clone());
+                        extra_cmds.push((pid, spec.command.clone()));
+                    },
+                    Err(e) => log::warn!("template pane failed to open: {e:#}"),
+                }
+            }
+        }
+        let tree = if ids.len() > 1 {
+            workspace::build_template_tree(&specs, &ids)
+        } else {
+            Node::Leaf(id)
+        };
         let tab_id = mesh::new_tab_id();
 
         // A prompt-derived placeholder shows instantly; the AI title upgrades
@@ -686,6 +739,13 @@ impl App {
         });
         self.active = self.tabs.len() - 1;
 
+        // Remember the template's extra panes for their boot (immediately
+        // below when there's no worktree, else after the checkout lands in
+        // drain_worktrees).
+        if !extra_cmds.is_empty() {
+            self.pending_panes.insert(tab_id.clone(), extra_cmds);
+        }
+
         // The AI title only needs the prompt, so it can start now regardless
         // of the worktree checkout. Best-effort: no agent or a failed call
         // leaves the placeholder title in place.
@@ -734,8 +794,10 @@ impl App {
             );
         } else {
             // No worktree: run the agent straight away in the root (its cd
-            // into a subfolder project's subdir rides launch_agent).
+            // into a subfolder project's subdir rides launch_agent), then
+            // boot the template's side panes in the same place.
             self.launch_agent(&tab_id, None, None);
+            self.launch_template_panes(&tab_id, None, false);
         }
 
         // Project roots (often a ~/.muxterm/clones dest) would make a
@@ -824,10 +886,19 @@ impl App {
     }
 
     /// Type a `cd` into every pane of a tab *except* the first leaf (whose
-    /// boot sequence `launch_agent` owns): panes the user split while the
+    /// boot sequence `launch_agent` owns) and the template's own panes (whose
+    /// full boot `launch_template_panes` owns): panes the user split while the
     /// checkout was pending follow the workspace to its subfolder on
     /// success and back out on the failed-checkout walk-back.
     fn cd_side_panes(&mut self, tab_id: &str, dir: &std::path::Path) {
+        // Snapshot the template panes before borrowing tabs - they get their
+        // cd (plus setup + command) from launch_template_panes, so cd'ing them
+        // here too would double-fire.
+        let template_ids: HashSet<PaneId> = self
+            .pending_panes
+            .get(tab_id)
+            .map(|v| v.iter().map(|(id, _)| *id).collect())
+            .unwrap_or_default();
         let Some(tab) = self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
         else {
             return;
@@ -838,10 +909,61 @@ impl App {
             muxterm::agent::shell_quote(&dir.display().to_string())
         );
         for (pane_id, pane) in tab.panes.iter_mut() {
-            if *pane_id != agent_pane {
+            if *pane_id != agent_pane && !template_ids.contains(pane_id) {
                 pane.backend.process_command(BackendCommand::Write(
                     cd.clone().into_bytes(),
                 ));
+            }
+        }
+    }
+
+    /// Boot the template's extra panes: type `cd <boot_cd/fallback>`, the
+    /// workspace's setup script, then each pane's own command - mirroring
+    /// `launch_agent` for the main pane, and drained from `pending_panes` so
+    /// the side panes wait for the same worktree checkout the agent does. As
+    /// with the main pane, a failed checkout (`notice_failed`) cds to the
+    /// `fallback` and skips setup, but still runs the command (a terminal or
+    /// gitwatch in the root is still useful). No-ops without a stashed entry.
+    fn launch_template_panes(
+        &mut self,
+        tab_id: &str,
+        fallback: Option<&std::path::Path>,
+        notice_failed: bool,
+    ) {
+        let Some(commands) = self.pending_panes.remove(tab_id) else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|t| t.tab_id == tab_id) else {
+            return;
+        };
+        let setup = tab.workspace.setup.clone();
+        let cd = match fallback {
+            Some(p) => Some(p.to_path_buf()),
+            None => workspace::boot_cd(
+                tab.workspace.worktree.as_ref().map(|w| w.path.as_path()),
+                tab.workspace.root.as_deref(),
+                tab.workspace.subdir.as_deref(),
+            ),
+        };
+        for (pane_id, command) in commands {
+            let lines = workspace::pane_boot_lines(
+                cd.as_deref(),
+                setup.as_deref(),
+                &command,
+                notice_failed,
+            );
+            if lines.is_empty() {
+                continue;
+            }
+            let mut bytes = lines.join("\r").into_bytes();
+            bytes.push(b'\r');
+            if let Some(pane) = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.tab_id == tab_id)
+                .and_then(|t| t.panes.get_mut(&pane_id))
+            {
+                pane.backend.process_command(BackendCommand::Write(bytes));
             }
         }
     }
@@ -887,6 +1009,9 @@ impl App {
                     if let Some(dir) = side_cd {
                         self.cd_side_panes(&tab_id, &dir);
                     }
+                    // After cd_side_panes (which reads pending_panes to skip
+                    // template panes), boot the template's own panes.
+                    self.launch_template_panes(&tab_id, None, false);
                 },
                 Err(e) => {
                     log::warn!("worktree creation failed: {e}");
@@ -929,6 +1054,12 @@ impl App {
                     if let Some(fallback) = fallback.as_deref() {
                         self.cd_side_panes(&tab_id, fallback);
                     }
+                    // Template panes walk back too, skip setup, keep command.
+                    self.launch_template_panes(
+                        &tab_id,
+                        fallback.as_deref(),
+                        true,
+                    );
                 },
             }
             self.dirty = true;
@@ -1283,6 +1414,11 @@ impl App {
 
         match tab.tree.remove(pane_id) {
             Removal::BecameEmpty => {
+                // Drop any template panes still awaiting boot for this tab.
+                if let Some(t) = self.tabs.get(tab_idx) {
+                    let tab_id = t.tab_id.clone();
+                    self.pending_panes.remove(&tab_id);
+                }
                 self.tabs.remove(tab_idx);
                 self.active =
                     active_after_removal(self.active, tab_idx, self.tabs.len());
@@ -1480,11 +1616,13 @@ impl App {
                         .find(|a| a.id == self.agent.id)
                         .copied()
                         .unwrap_or(installed[0]);
-                    self.new_workspace = Some(NewWorkspaceForm::new(
+                    let mut form = NewWorkspaceForm::new(
                         prefill,
                         seed.id,
                         workspace_popup::default_model(seed.id),
-                    ));
+                    );
+                    form.templates = self.templates.clone();
+                    self.new_workspace = Some(form);
                 }
             },
             Action::NewProjectWorkspace => {
@@ -1501,11 +1639,13 @@ impl App {
                         .find(|a| a.id == self.agent.id)
                         .copied()
                         .unwrap_or(installed[0]);
-                    self.new_workspace = Some(NewWorkspaceForm::for_project(
+                    let mut form = NewWorkspaceForm::for_project(
                         self.projects.clone(),
                         seed.id,
                         workspace_popup::default_model(seed.id),
-                    ));
+                    );
+                    form.templates = self.templates.clone();
+                    self.new_workspace = Some(form);
                 }
             },
             Action::ToggleSidebar => {
@@ -1629,6 +1769,7 @@ impl App {
             sidebar_open: self.sidebar_open,
             archived_collapsed: self.archived_collapsed,
             projects: self.projects.iter().map(|p| p.to_state()).collect(),
+            templates: self.templates.iter().map(|t| t.to_state()).collect(),
             windows: vec![WindowState {
                 active_tab: self.active,
                 tabs: self
@@ -1986,6 +2127,8 @@ impl App {
             &mut self.settings_tab,
             &self.projects,
             &mut self.project_draft,
+            &self.templates,
+            &mut self.template_draft,
         );
         if let Some(p) = out.add_project {
             // Upsert by name: `[ add ]` with a saved project's name is the
@@ -1999,6 +2142,20 @@ impl App {
         if let Some(i) = out.remove_project {
             if i < self.projects.len() {
                 self.projects.remove(i);
+                self.dirty = true;
+            }
+        }
+        if let Some(t) = out.add_template {
+            // Same upsert-by-name edit path as projects.
+            match self.templates.iter_mut().find(|q| q.name == t.name) {
+                Some(q) => *q = t,
+                None => self.templates.push(t),
+            }
+            self.dirty = true;
+        }
+        if let Some(i) = out.remove_template {
+            if i < self.templates.len() {
+                self.templates.remove(i);
                 self.dirty = true;
             }
         }

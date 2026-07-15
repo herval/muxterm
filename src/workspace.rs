@@ -15,8 +15,12 @@ use std::sync::mpsc::Sender;
 use std::thread;
 
 use muxterm::agent::{self, Agent};
+use muxterm::layout::{Node, PaneId, SplitAxis};
 use muxterm::mesh;
-use muxterm::state::{self, ProjectState, WorkspaceState, WorktreeState};
+use muxterm::state::{
+    self, ProjectState, TemplatePaneState, TemplateState, WorkspaceState,
+    WorktreeState,
+};
 
 #[derive(Clone, Debug)]
 pub struct Workspace {
@@ -192,6 +196,110 @@ impl Project {
             _ => None,
         }
     }
+}
+
+/// A saved workspace-layout template (Settings > Templates): a named preset
+/// the new-workspace popup can apply. `panes[0]` is the main pane - it hosts
+/// whatever the workspace would open anyway (the agent, or a bare shell) -
+/// and each later pane splits the *previous* one (`split`, sized by `size`)
+/// and runs `command` after the workspace's shared cd + setup boot. The
+/// layout's source of truth is `state::TemplateState`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Template {
+    pub name: String,
+    pub panes: Vec<TemplatePane>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemplatePane {
+    /// Shell command typed after the cd + setup boot; empty = a bare shell.
+    /// Ignored for `panes[0]`.
+    pub command: String,
+    /// How this pane splits off the previous one; ignored for `panes[0]`.
+    pub split: SplitAxis,
+    /// This pane's percent of the split region (10..=90); the previous pane
+    /// keeps the rest. Ignored for `panes[0]`.
+    pub size: u8,
+}
+
+impl Template {
+    pub fn to_state(&self) -> TemplateState {
+        TemplateState {
+            name: self.name.clone(),
+            panes: self
+                .panes
+                .iter()
+                .map(|p| TemplatePaneState {
+                    command: p.command.clone(),
+                    split: p.split,
+                    size: p.size,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn from_state(s: TemplateState) -> Self {
+        Self {
+            name: s.name,
+            panes: s
+                .panes
+                .into_iter()
+                .map(|p| TemplatePane {
+                    command: p.command,
+                    split: p.split,
+                    size: p.size,
+                })
+                .collect(),
+        }
+    }
+
+    /// The extra (non-main) panes - the splits a template lays out beyond the
+    /// single pane a plain workspace opens.
+    pub fn extra_panes(&self) -> &[TemplatePane] {
+        self.panes.get(1..).unwrap_or(&[])
+    }
+}
+
+/// The shell lines a template's side pane boots with, in order: `cd` into
+/// `dir`, the workspace's `setup` script (skipped when `skip_setup` - a
+/// failed checkout, matching the main pane), then the pane's own `command`.
+/// Empty pieces drop out. Pure (mirrors `launch_agent`'s line assembly) so
+/// the "cd + setup, then command" contract is unit-tested without a live pane.
+pub fn pane_boot_lines(
+    dir: Option<&Path>,
+    setup: Option<&str>,
+    command: &str,
+    skip_setup: bool,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(p) = dir {
+        lines.push(format!(
+            "cd {}",
+            agent::shell_quote(&p.display().to_string())
+        ));
+    }
+    if let (Some(setup), false) = (setup, skip_setup) {
+        lines.extend(
+            setup.lines().map(str::to_string).filter(|l| !l.is_empty()),
+        );
+    }
+    if !command.trim().is_empty() {
+        lines.push(command.to_string());
+    }
+    lines
+}
+
+/// Build a tab's split tree for a template. `ids[0]` is the main pane's leaf;
+/// each later pane splits the *previous* one along its axis, the previous
+/// pane keeping `100 - size` percent. Pure (no egui/tmux) so it unit-tests
+/// directly. `ids` must be the same length as `panes` and non-empty.
+pub fn build_template_tree(panes: &[TemplatePane], ids: &[PaneId]) -> Node {
+    let mut tree = Node::Leaf(ids[0]);
+    for i in 1..ids.len() {
+        let kept = 100u32 - panes[i].size.clamp(10, 90) as u32;
+        tree.split_with(ids[i - 1], panes[i].split, ids[i], kept as f32 / 100.0);
+    }
+    tree
 }
 
 /// The one `git clone` URL a project's `repo` field means: bare
@@ -1037,6 +1145,83 @@ fn clean_title(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tpane(command: &str, split: SplitAxis, size: u8) -> TemplatePane {
+        TemplatePane { command: command.to_string(), split, size }
+    }
+
+    #[test]
+    fn template_tree_linear_split_previous() {
+        // main | (gitwatch / terminal): main wider, right column split evenly.
+        let panes = vec![
+            tpane("", SplitAxis::SideBySide, 50),
+            tpane("gitwatch", SplitAxis::SideBySide, 35),
+            tpane("", SplitAxis::Stacked, 50),
+        ];
+        let ids = [PaneId(1), PaneId(2), PaneId(3)];
+        let tree = build_template_tree(&panes, &ids);
+        assert_eq!(tree.leaves(), vec![PaneId(1), PaneId(2), PaneId(3)]);
+        match &tree {
+            Node::Split { axis, ratio, first, second } => {
+                assert_eq!(*axis, SplitAxis::SideBySide);
+                assert!((ratio - 0.65).abs() < 1e-6, "main should keep 65%");
+                assert!(matches!(**first, Node::Leaf(PaneId(1))));
+                match &**second {
+                    Node::Split { axis, ratio, first, second } => {
+                        assert_eq!(*axis, SplitAxis::Stacked);
+                        assert!((ratio - 0.5).abs() < 1e-6);
+                        assert!(matches!(**first, Node::Leaf(PaneId(2))));
+                        assert!(matches!(**second, Node::Leaf(PaneId(3))));
+                    },
+                    _ => panic!("right column should be a stacked split"),
+                }
+            },
+            _ => panic!("expected an outer side-by-side split"),
+        }
+    }
+
+    #[test]
+    fn pane_boot_lines_compose_cd_setup_then_command() {
+        let dir = Path::new("/tmp/wt");
+        // The whole contract: cd, then setup (one line per non-empty line),
+        // then the pane's command.
+        assert_eq!(
+            pane_boot_lines(Some(dir), Some("direnv allow\n\nnvm use"), "gitwatch", false),
+            vec!["cd '/tmp/wt'", "direnv allow", "nvm use", "gitwatch"],
+        );
+        // A failed checkout skips setup but still cds back and runs the command.
+        assert_eq!(
+            pane_boot_lines(Some(dir), Some("direnv allow"), "gitwatch", true),
+            vec!["cd '/tmp/wt'", "gitwatch"],
+        );
+        // An empty command leaves just the cd + setup (a bare shell there).
+        assert_eq!(
+            pane_boot_lines(Some(dir), Some("setup"), "  ", false),
+            vec!["cd '/tmp/wt'", "setup"],
+        );
+        // Nothing to do at all.
+        assert!(pane_boot_lines(None, None, "", false).is_empty());
+    }
+
+    #[test]
+    fn template_tree_single_pane_is_a_leaf() {
+        let panes = vec![tpane("", SplitAxis::SideBySide, 50)];
+        let tree = build_template_tree(&panes, &[PaneId(7)]);
+        assert!(matches!(tree, Node::Leaf(PaneId(7))));
+    }
+
+    #[test]
+    fn template_state_round_trips() {
+        let t = Template {
+            name: "dev".into(),
+            panes: vec![
+                tpane("", SplitAxis::SideBySide, 50),
+                tpane("gitwatch", SplitAxis::Stacked, 40),
+            ],
+        };
+        assert_eq!(Template::from_state(t.to_state()), t);
+        assert_eq!(t.extra_panes().len(), 1);
+    }
 
     #[test]
     fn placeholder_title_from_prompt() {

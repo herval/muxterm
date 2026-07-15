@@ -25,7 +25,7 @@ use egui::{
 use muxterm::agent::{self, Agent};
 
 use crate::theme::{self, UiTheme};
-use crate::workspace::{Branch, BranchChoice, Project};
+use crate::workspace::{Branch, BranchChoice, Project, Template};
 
 /// Live state of the open popup, owned by the App as `Option<NewWorkspaceForm>`.
 pub struct NewWorkspaceForm {
@@ -43,6 +43,11 @@ pub struct NewWorkspaceForm {
     pub projects: Vec<Project>,
     /// Index into `projects` of the picked one.
     pub project: usize,
+    /// The saved layout templates to pick from, snapshotted at open. Empty
+    /// hides the picker (single pane, the default).
+    pub templates: Vec<Template>,
+    /// The picked template, or None for the default single-pane layout.
+    pub template: Option<usize>,
     /// Cached `is_git_repo` for `folder`, refreshed only when the folder text
     /// settles on an existing directory (so we don't spawn `git` per keystroke).
     is_repo: bool,
@@ -73,6 +78,8 @@ impl NewWorkspaceForm {
             model,
             projects: Vec::new(),
             project: 0,
+            templates: Vec::new(),
+            template: None,
             is_repo: false,
             branches: Vec::new(),
             checked: String::from("\0"), // force a first check
@@ -106,6 +113,11 @@ impl NewWorkspaceForm {
     /// The picked project, in project mode.
     pub fn selected_project(&self) -> Option<&Project> {
         self.projects.get(self.project)
+    }
+
+    /// The picked layout template, or None for the default single-pane layout.
+    pub fn selected_template(&self) -> Option<&Template> {
+        self.template.and_then(|i| self.templates.get(i))
     }
 
     /// Some(clone URL) when the picked project is a repo without its local
@@ -352,6 +364,42 @@ pub fn show(
                 }
             });
             ui.add_space(8.0);
+
+            // Layout template: single pane (default) or a saved multi-pane
+            // preset. Hidden when none are saved (Settings > Templates).
+            if !form.templates.is_empty() {
+                panel.divider(ui, "Layout", th.accent);
+                ui.add_space(2.0);
+                // Collect the click and apply after the row - the seg loop
+                // borrows form.templates, so it can't also write form.template.
+                let mut pick: Option<Option<usize>> = None;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    panel.seg(ui, " ", th.text_dim, false, false); // indent
+                    let selected = form.template.is_none();
+                    let color = if selected { th.accent } else { th.text };
+                    let marker = if selected { "> " } else { "  " };
+                    if panel
+                        .seg(ui, &format!("{marker}single   "), color, true, selected)
+                        .clicked()
+                    {
+                        pick = Some(None);
+                    }
+                    for (i, t) in form.templates.iter().enumerate() {
+                        let selected = form.template == Some(i);
+                        let color = if selected { th.accent } else { th.text };
+                        let marker = if selected { "> " } else { "  " };
+                        let label = format!("{marker}{}   ", t.name);
+                        if panel.seg(ui, &label, color, true, selected).clicked() {
+                            pick = Some(Some(i));
+                        }
+                    }
+                });
+                if let Some(sel) = pick {
+                    form.template = sel;
+                }
+                ui.add_space(8.0);
+            }
 
             panel.divider(ui, "", th.text_dim);
             ui.add_space(6.0);
@@ -1085,6 +1133,70 @@ mod tests {
                 name: "review/x".into(),
                 remote: "origin".into(),
             }
+        );
+    }
+
+    /// The Layout picker lists "single" plus each saved template when the
+    /// form carries any, and vanishes when it doesn't - all ASCII, like
+    /// every row.
+    #[test]
+    fn popup_renders_layout_picker() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, ui_theme) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let mut form =
+            NewWorkspaceForm::new(String::new(), "claude", "opus".into());
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let agents: Vec<_> = agent::AGENTS.iter().collect();
+        let render = |form: &mut NewWorkspaceForm| {
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(ctx, form, &agents, &ui_theme, &font);
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let output = ctx.run(input.clone(), &mut frame);
+            let mut texts: Vec<String> = Vec::new();
+            for clipped in &output.shapes {
+                collect_texts(&clipped.shape, &mut texts);
+            }
+            for run in &texts {
+                assert!(run.is_ascii(), "non-ASCII painted run: {run:?}");
+            }
+            texts
+        };
+
+        // No templates: the Layout section is absent (single pane, silently).
+        let joined = render(&mut form).join("\u{1}");
+        assert!(!joined.contains("Layout"), "picker shown with no templates");
+
+        // With templates: the "single" default plus each name are painted.
+        form.templates = vec![Template {
+            name: "dev-split".into(),
+            panes: vec![crate::workspace::TemplatePane {
+                command: String::new(),
+                split: muxterm::layout::SplitAxis::SideBySide,
+                size: 50,
+            }],
+        }];
+        let texts = render(&mut form);
+        let joined = texts.join("\u{1}");
+        for needle in ["Layout", "single", "dev-split"] {
+            assert!(joined.contains(needle), "missing {needle:?} in {texts:?}");
+        }
+
+        // Selection is reflected by selected_template() (default = none).
+        assert!(form.selected_template().is_none());
+        form.template = Some(0);
+        assert_eq!(
+            form.selected_template().map(|t| t.name.as_str()),
+            Some("dev-split"),
         );
     }
 

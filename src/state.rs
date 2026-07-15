@@ -28,6 +28,11 @@ pub struct StateFile {
     /// cmd+shift+n popup offers. Additive with `#[serde(default)]` (empty).
     #[serde(default)]
     pub projects: Vec<ProjectState>,
+    /// The saved workspace-layout templates (Settings > Templates), offered by
+    /// the new-workspace popup's template picker. Additive with
+    /// `#[serde(default)]` (empty), so older state files load unchanged.
+    #[serde(default)]
+    pub templates: Vec<TemplateState>,
 }
 
 fn default_true() -> bool {
@@ -112,6 +117,40 @@ pub struct ProjectState {
     pub setup: Option<String>,
     #[serde(default)]
     pub subdir: Option<String>,
+}
+
+/// Serde mirror of the GUI's `workspace::Template`: a named workspace-layout
+/// preset. `panes[0]` is the main pane (the agent/shell the workspace would
+/// normally open); each later pane splits the previous one and runs `command`
+/// after the shared cd + setup boot.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TemplateState {
+    pub name: String,
+    #[serde(default)]
+    pub panes: Vec<TemplatePaneState>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TemplatePaneState {
+    /// Shell command typed after the cd + setup boot; empty leaves a bare
+    /// shell. Ignored for `panes[0]` (the main pane runs the agent/shell).
+    #[serde(default)]
+    pub command: String,
+    /// How this pane splits off the previous one; ignored for `panes[0]`.
+    #[serde(default = "default_split_axis")]
+    pub split: SplitAxis,
+    /// This pane's percent of the split region (10..=90); the previous pane
+    /// keeps the rest. Ignored for `panes[0]`.
+    #[serde(default = "default_split_size")]
+    pub size: u8,
+}
+
+fn default_split_axis() -> SplitAxis {
+    SplitAxis::SideBySide
+}
+
+fn default_split_size() -> u8 {
+    50
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -335,6 +374,21 @@ mod tests {
                     subdir: Some("nvim".into()),
                 },
             ],
+            templates: vec![TemplateState {
+                name: "dev".into(),
+                panes: vec![
+                    TemplatePaneState {
+                        command: String::new(),
+                        split: SplitAxis::SideBySide,
+                        size: 50,
+                    },
+                    TemplatePaneState {
+                        command: "gitwatch".into(),
+                        split: SplitAxis::Stacked,
+                        size: 35,
+                    },
+                ],
+            }],
             windows: vec![WindowState {
                 active_tab: 1,
                 tabs: vec![
@@ -395,6 +449,12 @@ mod tests {
         assert_eq!(back.projects[0].path.as_deref(), Some(Path::new("/tmp/proj")));
         assert_eq!(back.projects[1].repo.as_deref(), Some("herval/dotfiles"));
         assert_eq!(back.projects[1].subdir.as_deref(), Some("nvim"));
+        assert_eq!(back.templates.len(), 1);
+        assert_eq!(back.templates[0].name, "dev");
+        assert_eq!(back.templates[0].panes.len(), 2);
+        assert_eq!(back.templates[0].panes[1].command, "gitwatch");
+        assert_eq!(back.templates[0].panes[1].split, SplitAxis::Stacked);
+        assert_eq!(back.templates[0].panes[1].size, 35);
 
         let mut sessions = HashSet::new();
         for tab in &back.windows[0].tabs {
@@ -427,8 +487,9 @@ mod tests {
         // Sidebar defaults on for discoverability, archived pile expanded.
         assert!(s.sidebar_open);
         assert!(!s.archived_collapsed);
-        // No saved projects in an older file.
+        // No saved projects or templates in an older file.
         assert!(s.projects.is_empty());
+        assert!(s.templates.is_empty());
     }
 
     #[test]
