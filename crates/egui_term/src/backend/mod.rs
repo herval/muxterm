@@ -465,6 +465,17 @@ impl TerminalBackend {
         self.link_opener = Some(Box::new(opener));
     }
 
+    /// muxterm patch P26: drop the local selection. The app calls this after
+    /// its scroll-intercept has recreated the selection in tmux copy-mode (so
+    /// it survives the wheel repaint) - clearing the local one drops the stale
+    /// highlight and makes the hand-off one-shot. `&self` is enough: the
+    /// selection lives behind the term lock (interior mutability, like the
+    /// selection setters).
+    pub fn clear_selection(&self) {
+        self.term.lock().selection = None;
+        self.dirty.store(true, Ordering::Release);
+    }
+
     /// muxterm patch P24: which PR numbers a `#<number>` token may link
     /// to; `None` turns PR tokens off entirely. Arc'd so the app shares
     /// one set across every pane of a repo.

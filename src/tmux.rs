@@ -317,6 +317,28 @@ impl TmuxCtl {
             .output();
     }
 
+    /// Recreate a local grid selection as a tmux copy-mode selection, then
+    /// scroll - so the selection survives a wheel scroll (which forwards to
+    /// tmux and repaints the pane, wiping the local selection). Rows/cols are
+    /// 0-based within the *visible* pane; `lines` is signed (>0 = wheel up =
+    /// scroll toward older lines). Sequenced like `search_op`: one fork, argv
+    /// chained with lone `;` elements. Once tmux owns the selection it keeps
+    /// it across further scrolling (extending along, copy-mode style) and
+    /// cmd+c copies it via the existing `copy_intercept` path.
+    pub fn select_and_scroll(
+        &self,
+        session: &str,
+        sr: usize,
+        sc: usize,
+        er: usize,
+        ec: usize,
+        lines: i32,
+    ) {
+        let _ = Command::new(&self.bin)
+            .args(select_scroll_argv(session, sr, sc, er, ec, lines))
+            .output();
+    }
+
     /// iTerm-style cmd+k: clear the pane's visible screen and its scrollback.
     /// Ctrl-L makes the shell clear and redraw its prompt at the top; tmux
     /// scrolls the cleared screen into its history, so a beat later
@@ -575,6 +597,56 @@ fn escape_semi(query: &str) -> String {
     }
 }
 
+/// The argv (after `tmux`) that recreates a visible-pane selection in
+/// copy-mode and scrolls it: `copy-mode ; top-line ; start-of-line ; [down
+/// sr] ; [right sc] ; begin-selection ; [down er-sr] ; start-of-line ;
+/// [right ec] ; [scroll]`. `top-line`+`start-of-line` give a stable anchor
+/// (top-left of the visible screen); zero-count motions are skipped. Pure so
+/// it unit-tests without a tmux server (the risky copy-mode motion sequence).
+fn select_scroll_argv(
+    session: &str,
+    sr: usize,
+    sc: usize,
+    er: usize,
+    ec: usize,
+    lines: i32,
+) -> Vec<String> {
+    // A `; send-keys -t <target> -X <args...>` step (a nested fn, not a
+    // closure, so it doesn't borrow `argv` for the whole build).
+    fn step(argv: &mut Vec<String>, t: &str, args: &[&str]) {
+        argv.push(";".into());
+        argv.extend(["send-keys", "-t", t, "-X"].map(String::from));
+        argv.extend(args.iter().map(|s| s.to_string()));
+    }
+    let t = format!("={session}:");
+    let mut argv: Vec<String> = ["-L", SOCKET, "copy-mode", "-t", t.as_str()]
+        .map(String::from)
+        .to_vec();
+    step(&mut argv, &t, &["top-line"]);
+    step(&mut argv, &t, &["start-of-line"]);
+    if sr > 0 {
+        step(&mut argv, &t, &["-N", &sr.to_string(), "cursor-down"]);
+    }
+    if sc > 0 {
+        step(&mut argv, &t, &["-N", &sc.to_string(), "cursor-right"]);
+    }
+    step(&mut argv, &t, &["begin-selection"]);
+    if er > sr {
+        step(&mut argv, &t, &["-N", &(er - sr).to_string(), "cursor-down"]);
+    }
+    // Reset the column before extending to the end column, so uneven line
+    // lengths never leave the cursor short.
+    step(&mut argv, &t, &["start-of-line"]);
+    if ec > 0 {
+        step(&mut argv, &t, &["-N", &ec.to_string(), "cursor-right"]);
+    }
+    if lines != 0 {
+        let cmd = if lines > 0 { "scroll-up" } else { "scroll-down" };
+        step(&mut argv, &t, &["-N", &lines.unsigned_abs().to_string(), cmd]);
+    }
+    argv
+}
+
 /// capture-pane pads the visible region with blank lines; strip them (and
 /// per-line trailing whitespace) so the context file ends at real content.
 fn trim_capture(text: &str) -> String {
@@ -589,6 +661,62 @@ fn trim_capture(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ordered copy-mode command names (the arg after each `-X`, past an
+    /// optional `-N <count>`).
+    fn x_cmds(argv: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < argv.len() {
+            if argv[i] == "-X" {
+                if argv.get(i + 1).map(String::as_str) == Some("-N") {
+                    out.push(argv[i + 3].clone());
+                    i += 4;
+                } else {
+                    out.push(argv[i + 1].clone());
+                    i += 2;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn select_scroll_argv_sequence_and_skips() {
+        // Multi-line selection, scroll up: full motion sequence, `=name:`
+        // target, count-carrying steps present.
+        let a = select_scroll_argv("mux-aaaa", 2, 3, 4, 10, 3);
+        assert_eq!(a[..5], ["-L", SOCKET, "copy-mode", "-t", "=mux-aaaa:"]);
+        assert_eq!(x_cmds(&a), [
+            "top-line",
+            "start-of-line",
+            "cursor-down",   // to start row (sr=2)
+            "cursor-right",  // to start col (sc=3)
+            "begin-selection",
+            "cursor-down",   // to end row (er-sr=2)
+            "start-of-line",
+            "cursor-right",  // to end col (ec=10)
+            "scroll-up",     // lines>0
+        ]);
+        // The scroll step carries the line count.
+        let joined = a.join(" ");
+        assert!(joined.contains("-X -N 3 scroll-up"), "{joined}");
+        assert!(joined.contains("-X -N 2 cursor-down"), "{joined}");
+
+        // Zero offsets are skipped (sr=sc=0, er==sr), and lines<0 scrolls down.
+        let b = select_scroll_argv("mux-bbbb", 0, 0, 0, 5, -2);
+        assert_eq!(x_cmds(&b), [
+            "top-line",
+            "start-of-line",
+            "begin-selection",
+            "start-of-line",
+            "cursor-right", // ec=5
+            "scroll-down",  // lines<0
+        ]);
+        assert!(b.join(" ").contains("-X -N 2 scroll-down"));
+    }
 
     #[test]
     fn shells_are_recognized() {

@@ -274,3 +274,14 @@ tmux-backed design. Local patches:
   `#{mouse_any_flag}` (`send -M` into mouse-tracking apps, consumed
   otherwise), so an option+click on a plain shell does nothing. Plain
   clicks, drags, and double/triple selection are untouched.
+- **P26** (`src/backend/mod.rs`, `clear_selection`): a public one-liner
+  to drop the local selection (`term.selection = None` + mark dirty).
+  Under tmux the wheel is forwarded (P2) and tmux repaints the pane,
+  whose in-place erases wipe any local selection - so selecting text then
+  scrolling loses it. muxterm's app fixes this by recreating the
+  selection in tmux copy-mode (which owns scrollback) when the wheel fires
+  over a live selection; it then calls `clear_selection` so the stale
+  local highlight goes away and the hand-off runs only once (the next
+  wheel sees no local selection and forwards normally, tmux keeping its
+  own copy-mode selection). `&self` suffices - the selection lives behind
+  the term lock, like the existing selection setters.

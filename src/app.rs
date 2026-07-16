@@ -13,7 +13,7 @@ use egui::{
 };
 use egui_term::{
     BackendCommand, FontSettings, PtyEvent, RepaintPolicy, TerminalBackend,
-    TerminalFont, TerminalTheme, TerminalView,
+    TerminalFont, TerminalMode, TerminalTheme, TerminalView,
 };
 
 use muxterm::agent::{self, Agent};
@@ -2098,6 +2098,102 @@ impl App {
         }
     }
 
+    /// Keep a mouse selection alive when the wheel scrolls it away. muxterm
+    /// forwards the wheel to tmux (patch P2), which repaints the pane and
+    /// wipes the local selection (the widget anchors it to on-screen rows).
+    /// When the focused pane has a live selection and the wheel fires over it,
+    /// recreate that selection in tmux copy-mode at the same visible
+    /// coordinates and scroll there: tmux owns scrollback, so the selection
+    /// persists, scrolls with the content (copy-mode style: it extends as it
+    /// scrolls), and stays copyable via `copy_intercept`. One-shot -
+    /// `clear_selection` drops the local copy so the next wheel forwards
+    /// normally and tmux keeps its own copy-mode selection. Must run before
+    /// any TerminalView clones the frame's input, like the other intercepts.
+    fn scroll_intercept(&mut self, ctx: &egui::Context) {
+        if self.settings_open || self.new_workspace.is_some() {
+            return;
+        }
+        // This frame's wheel: summed vertical delta plus the unit (mice report
+        // lines, trackpads points). No wheel event -> nothing to do.
+        let (dy, unit) = ctx.input(|i| {
+            let mut dy = 0.0;
+            let mut unit = None;
+            for e in &i.events {
+                if let egui::Event::MouseWheel { unit: u, delta, .. } = e {
+                    dy += delta.y;
+                    unit = Some(*u);
+                }
+            }
+            (dy, unit)
+        });
+        if unit.is_none() || dy == 0.0 {
+            return;
+        }
+        let hover = ctx.input(|i| i.pointer.hover_pos());
+
+        // Gather everything from the focused pane under one immutable borrow,
+        // then drop it before touching tmux / the mutable re-borrow.
+        let handoff = {
+            let Some(tab) = self.tabs.get(self.active) else {
+                return;
+            };
+            let Some(pane) = tab.panes.get(&tab.focused) else {
+                return;
+            };
+            // Only hijack a scroll aimed at the focused pane itself.
+            let Some(&rect) = tab.last_rects.get(&tab.focused) else {
+                return;
+            };
+            if !hover.is_some_and(|p| rect.contains(p)) {
+                return;
+            }
+            let content = pane.backend.last_content();
+            let Some(range) = content.selectable_range else {
+                return;
+            };
+            // Only when the wheel is being forwarded to tmux (its `mouse on`);
+            // a local scroll already preserves the selection.
+            if !content.terminal_mode.intersects(TerminalMode::MOUSE_MODE) {
+                return;
+            }
+            // Selection points are absolute grid coords; under tmux
+            // display_offset stays ~0, so line.0 is the visible row (the
+            // selection was made on-screen, so it is non-negative here).
+            let off = content.grid.display_offset() as i64;
+            let row = |line: i32| (line as i64 + off).max(0) as usize;
+            let sr = row(range.start.line.0);
+            let sc = range.start.column.0;
+            let er = row(range.end.line.0);
+            let ec = range.end.column.0;
+            let cell_h = content.terminal_size.cell_height.max(1.0);
+            let mut lines = match unit {
+                Some(egui::MouseWheelUnit::Line) => dy.round() as i32,
+                Some(egui::MouseWheelUnit::Point) => (dy / cell_h).round() as i32,
+                _ => 0,
+            };
+            if lines == 0 {
+                lines = dy.signum() as i32; // at least one line in the direction
+            }
+            (pane.session.clone(), sr, sc, er, ec, lines)
+        };
+
+        let (session, sr, sc, er, ec, lines) = handoff;
+        self.tmux.select_and_scroll(&session, sr, sc, er, ec, lines);
+        if let Some(pane) = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(&t.focused))
+        {
+            pane.backend.clear_selection();
+        }
+        // Swallow the wheel so the widget doesn't also forward it (which would
+        // scroll twice and, worse, wipe the selection we just handed off).
+        ctx.input_mut(|i| {
+            i.events
+                .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }))
+        });
+    }
+
     /// Re-probe agents whose CLI was last seen missing, so installing one
     /// while muxterm runs makes it appear the next time a picker opens.
     /// Known-good bins are not re-probed (each probe costs a login shell).
@@ -2325,6 +2421,7 @@ impl eframe::App for App {
         self.search_intercept(ctx);
         self.ai_intercept(ctx);
         self.copy_intercept(ctx);
+        self.scroll_intercept(ctx);
 
         self.drain_pty_events(ctx);
         // Looking at a tab acknowledges its badges: seeing the active tab
