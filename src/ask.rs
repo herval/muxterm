@@ -26,10 +26,19 @@ use crate::state;
 /// request to *do* something should be carried out with its tools, not merely
 /// described. Only added when stdin is redirected - the normal "?" flow -
 /// since without piped context there is nothing to anchor "this pane" to.
+/// The "dig before you ask" half exists because the details are usually
+/// sitting on this machine (read-only tools run ungated, so looking costs
+/// the user nothing) - but the escalation order stops there: look, then ask.
+/// Deliberately no "make an assumption" fallback - an agent that guesses a
+/// missing detail and acts on it hits the wrong target.
 const CONTEXT_HINT: &str =
     "The stdin holds this terminal pane's recent scrollback as context. When \
      the request asks you to do something, carry it out with your tools (run \
-     commands, edit files) instead of only describing the steps.";
+     commands, edit files) instead of only describing the steps. Don't ask \
+     for details you can find out yourself - use your tools to look them up \
+     in the scrollback, the working directory, or wherever else on this \
+     machine they'd be. Never guess or assume a detail you could not \
+     verify: if looking genuinely comes up empty, ask.";
 
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
