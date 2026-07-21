@@ -145,6 +145,11 @@ pub struct App {
     /// Whether the sidebar's archived pile is folded to its header (its
     /// header click); persisted in state.json like the sidebar itself.
     archived_collapsed: bool,
+    /// The archived workspace armed for deletion (its ✕ clicked once), by
+    /// stable tab id - ephemeral, never persisted. Cleared by any other
+    /// sidebar action, by the pointer leaving the row, and by the sidebar
+    /// closing.
+    delete_armed: Option<String>,
     /// The open workspace-creation popup (cmd+n), or None.
     new_workspace: Option<NewWorkspaceForm>,
     /// Folder the creation popup pre-fills - the last one a workspace used.
@@ -318,6 +323,7 @@ impl App {
             notifications: style.notifications,
             sidebar_open: true,
             archived_collapsed: false,
+            delete_armed: None,
             new_workspace: None,
             last_workspace_dir: None,
             projects: Vec::new(),
@@ -579,6 +585,102 @@ impl App {
                 tab.workspace.archived_at = None;
             },
             _ => return,
+        }
+        self.active = i;
+        self.dirty = true;
+    }
+
+    /// The archived row's armed ✕: kill the workspace's tmux sessions, drop
+    /// its tab from the app and state.json, and remove its git worktree if
+    /// it has one. Refuses - loudly, workspace fully intact - rather than
+    /// guessing: a dirty worktree, an unreadable one, or a checkout still in
+    /// flight each keep everything as it was, with the reason echoed into
+    /// the pane.
+    fn delete_workspace(&mut self, ctx: &egui::Context, i: usize) {
+        let Some(tab) = self.tabs.get(i) else {
+            return;
+        };
+        // Only archived rows carry the affordance; a stale index must never
+        // delete a live tab.
+        if !tab.workspace.is_archived() {
+            return;
+        }
+        if self.pending_worktrees.contains(&tab.tab_id) {
+            self.refuse_delete(i, "worktree checkout still in flight");
+            return;
+        }
+        // The dirty gate: only an existing worktree can hold unsaved work
+        // (a vanished dir has nothing to lose and nothing to remove).
+        let wt_live = tab
+            .workspace
+            .worktree
+            .as_ref()
+            .is_some_and(|w| w.path.exists());
+        if wt_live {
+            let path = tab.workspace.worktree.as_ref().unwrap().path.clone();
+            if let Some(reason) = workspace::worktree_delete_refusal(&path) {
+                self.refuse_delete(i, &reason);
+                return;
+            }
+        }
+
+        // Landing spot before the removal shifts indices: the archived tab
+        // is never in the visible list, so `nearest_visible` works on the
+        // pre-removal indices and the result maps through the shift.
+        let landing = nearest_visible(&self.visible_tab_indices(), i);
+        let tab = self.tabs.remove(i);
+        // Sessions die before the worktree dir goes - a live shell cwd'd
+        // inside the vanishing dir showers getcwd errors (the
+        // failed-checkout doctrine in workspace.rs).
+        for pane in tab.panes.values() {
+            self.tmux.kill_session(&pane.session);
+            mesh::remove_session(&pane.session);
+        }
+        // Per-tab-id leftovers close_pane's last-pane path would cover (or
+        // never has to): pending boots, an in-flight title, worktree
+        // bookkeeping. Session-keyed maps (pane_snap, agent_states, pr, git,
+        // bg_jobs) self-heal on the next poll tick, as with close_pane.
+        self.pending_panes.remove(&tab.tab_id);
+        self.naming.remove(&tab.tab_id);
+        self.pending_worktrees.remove(&tab.tab_id);
+        self.worktree_progress.remove(&tab.tab_id);
+        if self.active == i {
+            match landing {
+                Some(j) => {
+                    self.active =
+                        active_after_removal(j, i, self.tabs.len());
+                },
+                // Every remaining tab is archived (or none remain): open a
+                // bare tab like archive_tab does - the app never quits here.
+                None => self.new_tab(ctx, None),
+            }
+        } else {
+            self.active =
+                active_after_removal(self.active, i, self.tabs.len());
+        }
+        self.dirty = true;
+        if wt_live {
+            let w = tab.workspace.worktree.expect("wt_live checked");
+            workspace::spawn_worktree_removal(w.path, tab.workspace.root);
+        }
+    }
+
+    /// A refused delete: echo why into the workspace's focused pane and
+    /// bring the tab to the foreground (a peek, deliberately not
+    /// unarchiving) so the reason is visible and actionable.
+    fn refuse_delete(&mut self, i: usize, reason: &str) {
+        let Some(tab) = self.tabs.get_mut(i) else {
+            return;
+        };
+        let line = format!(
+            "echo {}\r",
+            muxterm::agent::shell_quote(&format!(
+                "[muxterm] delete refused: {reason}"
+            ))
+        );
+        if let Some(pane) = tab.panes.get_mut(&tab.focused) {
+            pane.backend
+                .process_command(BackendCommand::Write(line.into_bytes()));
         }
         self.active = i;
         self.dirty = true;
@@ -2668,6 +2770,9 @@ impl eframe::App for App {
                         active: i == self.active,
                         status,
                         archived: ws.is_archived(),
+                        delete_armed: ws.is_archived()
+                            && self.delete_armed.as_deref()
+                                == Some(tab.tab_id.as_str()),
                     }
                 })
                 .collect();
@@ -2694,6 +2799,11 @@ impl eframe::App for App {
                 &self.font,
                 &self.ui_theme,
             ) {
+                // Any action but the arming click stands a pending delete
+                // down (Delete included - its tab is going away).
+                if !matches!(action, SidebarAction::ArmDelete(_)) {
+                    self.delete_armed = None;
+                }
                 match action {
                     // A row body-click selects; for an archived row that is the
                     // peek (GotoTab just sets `active`, archived or not).
@@ -2707,7 +2817,14 @@ impl eframe::App for App {
                         actions.push(Action::Unarchive(i))
                     },
                     // Pure sidebar state, no keybinding: applied here rather
-                    // than through an Action.
+                    // than through an Action, like ToggleArchived below.
+                    SidebarAction::ArmDelete(i) => {
+                        self.delete_armed =
+                            self.tabs.get(i).map(|t| t.tab_id.clone());
+                    },
+                    SidebarAction::Delete(i) => self.delete_workspace(ctx, i),
+                    // The pre-match clear already did the work.
+                    SidebarAction::DisarmDelete => {},
                     SidebarAction::ToggleArchived => {
                         self.archived_collapsed = !self.archived_collapsed;
                         self.dirty = true;
@@ -2720,6 +2837,10 @@ impl eframe::App for App {
                     },
                 }
             }
+        } else {
+            // A hidden sidebar can't emit the disarm; don't let an armed ✕
+            // survive a close/reopen round trip.
+            self.delete_armed = None;
         }
 
         let mut ui_actions = Vec::new();

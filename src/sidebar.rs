@@ -22,6 +22,14 @@ pub enum SidebarAction {
     Archive(usize),
     /// Pull the tab at this index back out of the archived pile (restore icon).
     Unarchive(usize),
+    /// First click on an archived row's ✕: arm it (the icon turns warn-red
+    /// and a second click becomes destructive).
+    ArmDelete(usize),
+    /// Second click while armed: really delete the workspace.
+    Delete(usize),
+    /// The pointer left the armed row (or the row left the screen): stand
+    /// the pending delete down.
+    DisarmDelete,
     /// Collapse/expand the archived pile (its header click).
     ToggleArchived,
     /// Open the creation popup (the header "+").
@@ -56,6 +64,10 @@ pub struct Row {
     /// Whether this workspace is archived: it renders in the bottom pile and
     /// its hover icon restores rather than archives.
     pub archived: bool,
+    /// Whether this row's ✕ is armed (one click in): the App keys the armed
+    /// state by stable tab id and sets this per frame, so a tab-index shuffle
+    /// can never arm the wrong row.
+    pub delete_armed: bool,
 }
 
 pub fn show(
@@ -109,11 +121,13 @@ pub fn show(
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
+                // Whether the pointer still sits on an armed row this frame;
+                // an armed row that lost the pointer stands its delete down.
+                let mut armed_hovered = false;
                 // Active pile: the workspaces in the tab flow.
                 for row in rows.iter().filter(|r| !r.archived) {
-                    let (resp, icon_clicked) = workspace_row(ui, row, font, t);
-                    if let Some(a) = row_action(resp.clicked(), icon_clicked, row)
-                    {
+                    let r = workspace_row(ui, row, font, t);
+                    if let Some(a) = row_action(&r, row) {
                         actions.push(a);
                     }
                 }
@@ -135,36 +149,43 @@ pub fn show(
                     if !archived_collapsed {
                         ui.add_space(4.0);
                         for row in rows.iter().filter(|r| r.archived) {
-                            let (resp, icon_clicked) =
-                                workspace_row(ui, row, font, t);
-                            if let Some(a) =
-                                row_action(resp.clicked(), icon_clicked, row)
-                            {
+                            let r = workspace_row(ui, row, font, t);
+                            armed_hovered |= row.delete_armed && r.hovered;
+                            if let Some(a) = row_action(&r, row) {
                                 actions.push(a);
                             }
                         }
                     }
+                }
+                // One condition covers every way an armed ✕ goes stale: the
+                // pointer left the row, the pile collapsed over it, or the
+                // row vanished altogether.
+                if rows.iter().any(|r| r.delete_armed) && !armed_hovered {
+                    actions.push(SidebarAction::DisarmDelete);
                 }
             });
         });
     actions
 }
 
-/// Map a row's body-click / icon-click into the action it means. The icon
-/// wins over a body click (they overlap): on an active row it archives, on an
-/// archived row it restores; a plain body click selects (a peek for archived).
-fn row_action(
-    clicked: bool,
-    icon_clicked: bool,
-    row: &Row,
-) -> Option<SidebarAction> {
-    if icon_clicked {
+/// Map a row's clicks into the action they mean. The icons win over a body
+/// click (they overlap): the ✕ on an archived row arms, then deletes; the
+/// ↓/↑ archives or restores; a plain body click selects (a peek for
+/// archived).
+fn row_action(r: &RowResponse, row: &Row) -> Option<SidebarAction> {
+    if r.delete && row.archived {
+        Some(if row.delete_armed {
+            SidebarAction::Delete(row.tab_index)
+        } else {
+            SidebarAction::ArmDelete(row.tab_index)
+        })
+    } else if r.icon {
         Some(if row.archived {
             SidebarAction::Unarchive(row.tab_index)
         } else {
             SidebarAction::Archive(row.tab_index)
         })
-    } else if clicked {
+    } else if r.body {
         Some(SidebarAction::Select(row.tab_index))
     } else {
         None
@@ -313,19 +334,34 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, t: &UiTheme) -> egui::Response {
     )
 }
 
-/// Width reserved on the right of every row for the hover archive/restore
-/// icon, so a long title wraps before it instead of running underneath.
+/// Width reserved on the right of every row for each hover icon (one on
+/// active rows, archive/restore + delete on archived ones), so a long title
+/// wraps before them instead of running underneath.
 const ICON_W: f32 = 16.0;
 
-/// Renders one row and returns `(body response, icon_clicked)`. The icon is a
-/// separate interact rect overlaid on the right, so `show` can archive/restore
-/// on the icon and select on the body without the two colliding.
+/// What one rendered row reported back: the clicks `row_action` maps and the
+/// hover `show` needs to stand an armed delete down. Plain bools so the
+/// click-to-action mapping unit-tests without an egui pass.
+struct RowResponse {
+    /// The row body was clicked.
+    body: bool,
+    /// The archive/restore icon (↓/↑) was clicked.
+    icon: bool,
+    /// The ✕ was clicked (archived rows only; always false otherwise).
+    delete: bool,
+    /// Pointer anywhere on the row - body or either icon (the disarm gate).
+    hovered: bool,
+}
+
+/// Renders one row. The icons are separate interact rects overlaid on the
+/// right, registered after the body so they win the click there and `show`
+/// can act on them without colliding with select-on-body.
 fn workspace_row(
     ui: &mut egui::Ui,
     row: &Row,
     font: &FontId,
     t: &UiTheme,
-) -> (egui::Response, bool) {
+) -> RowResponse {
     let title_color = if row.active { t.text } else { t.text_dim };
     let pad = Vec2::new(8.0, 5.0);
 
@@ -349,10 +385,12 @@ fn workspace_row(
         ui.ctx().request_repaint_after(PULSE_FRAME);
     }
     let status_w = font.size * 1.1;
+    // Archived rows carry two hover icons (restore + delete), active rows
+    // one; reserve the whole band so wrapping never collides with them.
+    let band = if row.archived { ICON_W * 2.0 } else { ICON_W };
     let mut job = LayoutJob::default();
-    // Reserve both icons' widths so wrapping never collides with them.
     job.wrap.max_width =
-        (ui.available_width() - pad.x * 2.0 - ICON_W - status_w).max(1.0);
+        (ui.available_width() - pad.x * 2.0 - band - status_w).max(1.0);
     job.append(&row.title, 0.0, TextFormat::simple(font.clone(), title_color));
     if let Some(sub) = &row.subtitle {
         job.append(
@@ -369,9 +407,9 @@ fn workspace_row(
     let size = Vec2::new(ui.available_width(), galley.size().y + pad.y * 2.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
 
-    // The hover-revealed archive/restore affordance: its own interact rect on
-    // the right, registered after the row so it wins the click there. Created
-    // before painting so its hover can also light the row background.
+    // The hover-revealed affordances: their own interact rects on the right,
+    // registered after the row so they win the click there. Created before
+    // painting so their hover can also light the row background.
     let (glyph, hint) = if row.archived {
         ("↑", "Restore workspace")
     } else {
@@ -389,7 +427,30 @@ fn workspace_row(
         )
         .on_hover_text(hint)
         .on_hover_cursor(egui::CursorIcon::PointingHand);
-    let hovered = resp.hovered() || icon_resp.hovered();
+    // Archived rows also carry a delete ✕, one band inward - deliberately
+    // not at the edge, so the destructive icon is the harder one to graze.
+    // Two clicks to fire: the first arms it (the App remembers by tab id),
+    // and only the armed ✕ deletes.
+    let del_rect = Rect::from_center_size(
+        Pos2::new(rect.max.x - pad.x - ICON_W - ICON_W / 2.0, rect.center().y),
+        Vec2::splat(ICON_W),
+    );
+    let del_resp = row.archived.then(|| {
+        ui.interact(
+            del_rect,
+            ui.id().with(("ws_row_del", row.tab_index)),
+            egui::Sense::click(),
+        )
+        .on_hover_text(if row.delete_armed {
+            "Click again to delete"
+        } else {
+            "Delete workspace"
+        })
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
+    let hovered = resp.hovered()
+        || icon_resp.hovered()
+        || del_resp.as_ref().is_some_and(|r| r.hovered());
 
     // Background first, then text on top - a tinted selection (bg blended
     // toward accent) reads as terminal chrome, not a flat gray box.
@@ -421,15 +482,38 @@ fn workspace_row(
         animate.then(|| ui.input(|i| i.time)),
     );
     if hovered {
+        let icon_font = FontId::new(font.size * 0.95, font.family.clone());
         ui.painter().text(
             icon_rect.center(),
             Align2::CENTER_CENTER,
             glyph,
-            FontId::new(font.size * 0.95, font.family.clone()),
+            icon_font.clone(),
             if icon_resp.hovered() { t.text } else { t.text_dim },
         );
+        if let Some(del) = &del_resp {
+            // Armed reads red even while the pointer sits on the row body -
+            // the warning must not depend on hovering the ✕ itself.
+            ui.painter().text(
+                del_rect.center(),
+                Align2::CENTER_CENTER,
+                "✕",
+                icon_font,
+                if row.delete_armed {
+                    t.status_err
+                } else if del.hovered() {
+                    t.text
+                } else {
+                    t.text_dim
+                },
+            );
+        }
     }
-    (resp.on_hover_cursor(egui::CursorIcon::PointingHand), icon_resp.clicked())
+    RowResponse {
+        body: resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked(),
+        icon: icon_resp.clicked(),
+        delete: del_resp.is_some_and(|r| r.clicked()),
+        hovered,
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +551,7 @@ mod tests {
                 active: false,
                 status: Status::Idle,
                 archived: false,
+                delete_armed: false,
             },
             Row {
                 tab_index: 1,
@@ -475,6 +560,7 @@ mod tests {
                 active: false,
                 status: Status::Working,
                 archived: false,
+                delete_armed: false,
             },
             Row {
                 tab_index: 2,
@@ -483,6 +569,7 @@ mod tests {
                 active: false,
                 status: Status::Blocked,
                 archived: false,
+                delete_armed: false,
             },
             Row {
                 tab_index: 3,
@@ -491,6 +578,7 @@ mod tests {
                 active: false,
                 status: Status::Background,
                 archived: false,
+                delete_armed: false,
             },
         ];
 
@@ -560,6 +648,7 @@ mod tests {
                 active: true,
                 status: Status::Idle,
                 archived: false,
+                delete_armed: false,
             },
             Row {
                 tab_index: 1,
@@ -568,6 +657,7 @@ mod tests {
                 active: false,
                 status: Status::Idle,
                 archived: true,
+                delete_armed: false,
             },
         ];
 
@@ -634,6 +724,7 @@ mod tests {
                 active: false,
                 status,
                 archived: false,
+                delete_armed: false,
             }];
             let mut frame = |ctx: &egui::Context| {
                 let _ = show(ctx, &rows, false, &font, &th);
@@ -668,5 +759,165 @@ mod tests {
                 "unfocused pulse still schedules repaints (delay {delay:?})"
             );
         }
+    }
+
+    fn archived_row(delete_armed: bool) -> Row {
+        Row {
+            tab_index: 0,
+            title: "parked-ws".into(),
+            subtitle: None,
+            active: false,
+            status: Status::Idle,
+            archived: true,
+            delete_armed,
+        }
+    }
+
+    /// The click-to-action mapping: an unarmed ✕ arms, an armed one deletes,
+    /// and the delete flag is inert on a non-archived row (which has no ✕ -
+    /// the body/icon mapping decides instead).
+    #[test]
+    fn row_action_delete_arms_then_fires() {
+        let click = |body, icon, delete| RowResponse {
+            body,
+            icon,
+            delete,
+            hovered: true,
+        };
+        assert!(matches!(
+            row_action(&click(false, false, true), &archived_row(false)),
+            Some(SidebarAction::ArmDelete(0))
+        ));
+        assert!(matches!(
+            row_action(&click(false, false, true), &archived_row(true)),
+            Some(SidebarAction::Delete(0))
+        ));
+        // The ✕ wins over a simultaneous body click.
+        assert!(matches!(
+            row_action(&click(true, false, true), &archived_row(true)),
+            Some(SidebarAction::Delete(0))
+        ));
+        let live = Row { archived: false, ..archived_row(false) };
+        assert!(matches!(
+            row_action(&click(false, false, true), &live),
+            None
+        ));
+        assert!(matches!(
+            row_action(&click(true, false, false), &archived_row(false)),
+            Some(SidebarAction::Select(0))
+        ));
+    }
+
+    /// An armed row whose pointer is elsewhere (here: nowhere) stands down
+    /// via DisarmDelete; an unarmed pile never emits it.
+    #[test]
+    fn armed_delete_disarms_when_pointer_leaves() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let disarms = |armed: bool| {
+            let rows = vec![archived_row(armed)];
+            let mut fired = false;
+            let mut frame = |ctx: &egui::Context| {
+                for a in show(ctx, &rows, false, &font, &th) {
+                    if matches!(a, SidebarAction::DisarmDelete) {
+                        fired = true;
+                    }
+                }
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let _ = ctx.run(input.clone(), &mut frame);
+            fired
+        };
+        assert!(disarms(true), "armed row without the pointer kept its arm");
+        assert!(!disarms(false), "unarmed pile emitted DisarmDelete");
+    }
+
+    /// Hovering an archived row reveals both the restore ↑ and the delete ✕,
+    /// and an armed ✕ paints in status_err even when the pointer sits on the
+    /// row body rather than the icon.
+    #[test]
+    fn archived_row_hover_reveals_both_icons() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let base_input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+
+        let icon_shapes = |armed: bool| {
+            let rows = vec![archived_row(armed)];
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(ctx, &rows, false, &font, &th);
+            };
+            // Settle the layout, then find the row title's on-screen spot
+            // so the hover lands on the body regardless of exact geometry.
+            let out = ctx.run(base_input(), &mut frame);
+            let mut shapes = Vec::new();
+            for clipped in &out.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            let title_pos = shapes
+                .iter()
+                .find_map(|s| match s {
+                    egui::Shape::Text(t)
+                        if t.galley.text().contains("parked-ws") =>
+                    {
+                        Some(t.pos)
+                    },
+                    _ => None,
+                })
+                .expect("archived row title not painted");
+            let mut input = base_input();
+            input.events.push(egui::Event::PointerMoved(
+                title_pos + Vec2::new(10.0, 5.0),
+            ));
+            let _ = ctx.run(input, &mut frame);
+            let out = ctx.run(base_input(), &mut frame);
+            let mut shapes = Vec::new();
+            for clipped in &out.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            shapes
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => {
+                        Some((t.galley.text().to_string(), t.fallback_color))
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let texts = icon_shapes(false);
+        assert!(
+            texts.iter().any(|(t, _)| t == "↑"),
+            "hover lost the restore icon: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|(t, _)| t == "✕"),
+            "hover lost the delete icon: {texts:?}"
+        );
+
+        let armed = icon_shapes(true);
+        let x = armed.iter().find(|(t, _)| t == "✕");
+        assert_eq!(
+            x.map(|(_, c)| *c),
+            Some(th.status_err),
+            "armed ✕ not painted in status_err: {armed:?}"
+        );
     }
 }

@@ -1066,6 +1066,139 @@ pub fn sweep_stale_claims(referenced: &[&Path], pane_cwds: &[&Path]) {
     }
 }
 
+/// How long the delete guard's `git status --porcelain` may run. Unlike
+/// FETCH_TIMEOUT this is local-only work, and it runs *synchronously* on the
+/// UI thread - the refusal has to be decided before any teardown - so the
+/// ceiling is a UI-freeze budget: 3s is the worst acceptable beachball for a
+/// click, far above a warm local status. Timing out refuses the delete; a
+/// worktree that can't be read is never deleted on a guess.
+const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Cap on the fire-and-forget `git worktree remove` thread, so a hung
+/// filesystem can't leak it forever. Generous: unlinking a big ignored tree
+/// (target/, node_modules/) takes real time.
+const REMOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The delete guard's verdict from a bounded `git status --porcelain` run:
+/// Some(reason) refuses the whole delete, None lets it proceed. `status` is
+/// None when the command timed out or failed to spawn, else (exited ok,
+/// stdout). Untracked files count as dirty - porcelain lists them - while
+/// ignored residue doesn't, which is the wanted line: build artifacts never
+/// hold a delete hostage, unsaved work always does.
+pub fn delete_refusal(status: Option<(bool, &str)>) -> Option<String> {
+    let Some((ok, out)) = status else {
+        return Some("git status timed out".into());
+    };
+    if !ok {
+        return Some("git status failed".into());
+    }
+    let entries = out.lines().filter(|l| !l.trim().is_empty()).count();
+    match entries {
+        0 => None,
+        n => Some(format!("uncommitted changes ({n} entries)")),
+    }
+}
+
+/// The delete guard, live: run the bounded `git status --porcelain` against
+/// a worktree dir and map it through [`delete_refusal`]. Synchronous - the
+/// caller needs the verdict before any teardown - but capped at
+/// STATUS_TIMEOUT so it can't hang the UI.
+pub fn worktree_delete_refusal(wt: &Path) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(wt).args(["status", "--porcelain"]);
+    match agent::output_with_timeout(&mut cmd, STATUS_TIMEOUT) {
+        Ok(Some(o)) => delete_refusal(Some((
+            o.status.success(),
+            &String::from_utf8_lossy(&o.stdout),
+        ))),
+        Ok(None) => delete_refusal(None),
+        // Couldn't even spawn git: same refusal as a failing status.
+        Err(_) => delete_refusal(Some((false, ""))),
+    }
+}
+
+/// The main repo owning a worktree, from `rev-parse --git-common-dir`
+/// output. A linked worktree always answers with an absolute `<repo>/.git`;
+/// the main repo itself answers a relative `.git` - refuse that shape (it
+/// means we asked the wrong place), and anything else unparseable, with
+/// None.
+pub fn main_repo_of(common_dir: &str) -> Option<PathBuf> {
+    let p = Path::new(common_dir.trim());
+    if p.is_absolute() && p.file_name().is_some_and(|n| n == ".git") {
+        p.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
+/// The argv (after `git`) that removes a worktree. Runs -C the *main repo*:
+/// from inside the worktree git refuses with "cannot remove the current
+/// working tree". --force because the porcelain gate is the arbiter of
+/// "clean" - git's own re-check would refuse over ignored residue the gate
+/// already ruled on. Pure so the shape unit-tests.
+pub fn worktree_remove_argv(
+    repo: &Path,
+    wt: &Path,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "-C".into(),
+        repo.into(),
+        "worktree".into(),
+        "remove".into(),
+        "--force".into(),
+        wt.into(),
+    ]
+}
+
+/// Remove a deleted workspace's worktree off the UI thread. Resolves the
+/// owning repo from the worktree itself (`rev-parse --git-common-dir` - the
+/// workspace root follows the panes and may point elsewhere by now), falling
+/// back to `root_hint`. Never deletes anything itself: `git worktree remove`
+/// is the only deletion, so a failed resolve can cost a leftover dir but
+/// never a repo, a clone, or a branch. The caller must have killed every
+/// pane session first - a live shell cwd'd inside the vanishing dir showers
+/// getcwd errors (the failed-checkout doctrine above). Outcome goes to the
+/// log; the tab is gone, there is nowhere else to report.
+pub fn spawn_worktree_removal(wt: PathBuf, root_hint: Option<PathBuf>) {
+    thread::spawn(move || {
+        let mut resolve = Command::new("git");
+        resolve.arg("-C").arg(&wt).args(["rev-parse", "--git-common-dir"]);
+        let repo = agent::output_with_timeout(&mut resolve, STATUS_TIMEOUT)
+            .ok()
+            .flatten()
+            .filter(|o| o.status.success())
+            .and_then(|o| main_repo_of(&String::from_utf8_lossy(&o.stdout)))
+            .or_else(|| root_hint.filter(|r| r.exists()));
+        let Some(repo) = repo else {
+            log::warn!(
+                "worktree removal: no owning repo resolved for {}; leaving it",
+                wt.display()
+            );
+            return;
+        };
+        let mut cmd = Command::new("git");
+        cmd.args(worktree_remove_argv(&repo, &wt));
+        match agent::output_with_timeout(&mut cmd, REMOVE_TIMEOUT) {
+            Ok(Some(o)) if o.status.success() => {
+                log::info!("removed worktree {}", wt.display());
+            },
+            Ok(Some(o)) => log::warn!(
+                "worktree remove failed for {}: {}",
+                wt.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Ok(None) => log::warn!(
+                "worktree remove timed out for {}",
+                wt.display()
+            ),
+            Err(e) => log::warn!(
+                "worktree remove failed to run for {}: {e}",
+                wt.display()
+            ),
+        }
+    });
+}
+
 fn branch_exists(root: &Path, branch: &str) -> bool {
     Command::new("git")
         .arg("-C")
@@ -2063,5 +2196,81 @@ ffeedd refs/heads/
         }
 
         fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// Real-git round trip of the delete path's removal: the worktree dir
+    /// and git's bookkeeping go, the repo and the branch stay. Also guards
+    /// the repo resolution (rev-parse --git-common-dir, no root hint).
+    #[test]
+    fn spawn_worktree_removal_removes_dir_but_keeps_branch() {
+        let (scratch, git) = scratch_git("wtremove");
+        let repo = scratch.join("repo");
+        seed_repo(&git, &repo);
+        let wt = scratch.join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-b", "gone", wt.to_str().unwrap()],
+        );
+        // Leftover files must not block the removal: cleanliness was ruled
+        // on upstream (the porcelain gate), --force is deliberate here.
+        fs::write(wt.join("junk"), "x").unwrap();
+
+        spawn_worktree_removal(wt.clone(), None);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while wt.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!wt.exists(), "worktree dir survived removal");
+        assert!(
+            !git(&repo, &["worktree", "list"]).contains(wt.to_str().unwrap()),
+            "git still lists the removed worktree"
+        );
+        let branches = git(&repo, &["branch", "--list", "gone"]);
+        assert!(branches.contains("gone"), "removal deleted the branch");
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn delete_refusal_verdicts() {
+        // Clean worktree: proceed.
+        assert_eq!(delete_refusal(Some((true, ""))), None);
+        assert_eq!(delete_refusal(Some((true, "\n  \n"))), None);
+        // Modified + untracked both count, and the reason carries the count.
+        let dirty = delete_refusal(Some((true, " M a.rs\n?? b.txt\n")));
+        assert_eq!(dirty.as_deref(), Some("uncommitted changes (2 entries)"));
+        // Untracked alone still refuses.
+        assert!(delete_refusal(Some((true, "?? x\n"))).is_some());
+        // A failed or timed-out status never lets the delete through.
+        assert_eq!(
+            delete_refusal(Some((false, ""))).as_deref(),
+            Some("git status failed")
+        );
+        assert_eq!(delete_refusal(None).as_deref(), Some("git status timed out"));
+    }
+
+    #[test]
+    fn main_repo_of_requires_absolute_dot_git() {
+        assert_eq!(
+            main_repo_of("/a/b/.git\n"),
+            Some(PathBuf::from("/a/b"))
+        );
+        // The main repo answers a bare relative ".git": wrong place, refuse.
+        assert_eq!(main_repo_of(".git"), None);
+        assert_eq!(main_repo_of("/a/b"), None);
+        assert_eq!(main_repo_of(""), None);
+    }
+
+    #[test]
+    fn worktree_remove_argv_shape() {
+        let argv =
+            worktree_remove_argv(Path::new("/repo"), Path::new("/wt/dir"));
+        let strs: Vec<_> =
+            argv.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            strs,
+            ["-C", "/repo", "worktree", "remove", "--force", "/wt/dir"]
+        );
     }
 }
