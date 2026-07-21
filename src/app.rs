@@ -77,6 +77,21 @@ enum UiAction {
     LayoutChanged,
 }
 
+/// A closed tab whose muxterm-managed worktree had uncommitted work: the
+/// close is done, but the worktree is held pending a user confirmation
+/// (`reclaim_worktree` -> the modal in the update loop) rather than removed or
+/// silently left. Carries everything the removal needs, since the tab is gone.
+struct WorktreeConfirm {
+    /// The worktree dir to remove if the user confirms.
+    path: PathBuf,
+    /// Root hint for `spawn_worktree_removal` (the owning repo fallback).
+    root: Option<PathBuf>,
+    /// The closed workspace's title, for the prompt.
+    title: String,
+    /// Why it's dirty, straight from `worktree_delete_refusal`.
+    reason: String,
+}
+
 pub struct App {
     tabs: Vec<Tab>,
     active: usize,
@@ -158,6 +173,9 @@ pub struct App {
     /// sidebar action, by the pointer leaving the row, and by the sidebar
     /// closing.
     delete_armed: Option<String>,
+    /// Closed tabs whose dirty worktree awaits a keep/delete decision, shown
+    /// one modal at a time (front first). Ephemeral, never persisted.
+    confirm_worktree: Vec<WorktreeConfirm>,
     /// The open workspace-creation popup (cmd+n), or None.
     new_workspace: Option<NewWorkspaceForm>,
     /// Folder the creation popup pre-fills - the last one a workspace used.
@@ -352,6 +370,7 @@ impl App {
             sidebar_open: true,
             archived_collapsed: false,
             delete_armed: None,
+            confirm_worktree: Vec::new(),
             new_workspace: None,
             last_workspace_dir: None,
             projects: Vec::new(),
@@ -1805,7 +1824,11 @@ impl App {
                     let tab_id = t.tab_id.clone();
                     self.pending_panes.remove(&tab_id);
                 }
-                self.tabs.remove(tab_idx);
+                let removed = self.tabs.remove(tab_idx);
+                // Closing a worktree-backed tab reclaims its worktree, the
+                // same `git worktree remove` the archived-row delete runs -
+                // silently and only when safe (see `reclaim_worktree`).
+                self.reclaim_worktree(&removed);
                 self.active =
                     active_after_removal(self.active, tab_idx, self.tabs.len());
                 if self.tabs.is_empty() {
@@ -1821,6 +1844,45 @@ impl App {
             Removal::NotFound => {},
         }
         self.dirty = true;
+    }
+
+    /// Reclaim a just-closed tab's worktree - the same `git worktree remove`
+    /// the archived-row delete uses (`spawn_worktree_removal`), adapted to a
+    /// close. Only a *muxterm-managed* worktree that still exists and isn't
+    /// mid-checkout is a candidate; branches survive either way (`git worktree
+    /// remove` drops only the working dir and its bookkeeping). A clean one is
+    /// removed straight off. A *dirty* one (uncommitted or untracked work,
+    /// `worktree_delete_refusal`) is neither removed nor silently left: it's
+    /// queued for a keep/delete confirmation modal, so the close never
+    /// destroys unsaved work without asking. The panes' sessions are dead by
+    /// here (close_pane killed them before the tab emptied), per the
+    /// getcwd-storm doctrine in workspace.rs.
+    fn reclaim_worktree(&mut self, tab: &Tab) {
+        let Some(w) = tab.workspace.worktree.as_ref() else {
+            return;
+        };
+        if !w.path.exists() {
+            return;
+        }
+        if self.pending_worktrees.contains(&tab.tab_id) {
+            log::debug!(
+                "close: worktree checkout in flight for {}; leaving it",
+                w.path.display()
+            );
+            return;
+        }
+        match workspace::worktree_delete_refusal(&w.path) {
+            None => workspace::spawn_worktree_removal(
+                w.path.clone(),
+                tab.workspace.root.clone(),
+            ),
+            Some(reason) => self.confirm_worktree.push(WorktreeConfirm {
+                path: w.path.clone(),
+                root: tab.workspace.root.clone(),
+                title: tab.workspace.title.clone(),
+                reason,
+            }),
+        }
     }
 
     fn close_pane_by_backend(&mut self, ctx: &egui::Context, backend_id: u64) {
@@ -2371,6 +2433,7 @@ impl App {
     fn ai_intercept(&mut self, ctx: &egui::Context) {
         if self.settings_open
             || self.new_workspace.is_some()
+            || !self.confirm_worktree.is_empty()
             || self.search.active()
         {
             return;
@@ -2479,7 +2542,10 @@ impl App {
     /// (PtyEvent::ClipboardStore). The event is left in place - the widget's
     /// own Copy handling stays a no-op for an empty local selection.
     fn copy_intercept(&mut self, ctx: &egui::Context) {
-        if self.settings_open || self.new_workspace.is_some() {
+        if self.settings_open
+            || self.new_workspace.is_some()
+            || !self.confirm_worktree.is_empty()
+        {
             return;
         }
         let copied = ctx.input(|i| {
@@ -2515,7 +2581,10 @@ impl App {
     /// normally and tmux keeps its own copy-mode selection. Must run before
     /// any TerminalView clones the frame's input, like the other intercepts.
     fn scroll_intercept(&mut self, ctx: &egui::Context) {
-        if self.settings_open || self.new_workspace.is_some() {
+        if self.settings_open
+            || self.new_workspace.is_some()
+            || !self.confirm_worktree.is_empty()
+        {
             return;
         }
         // This frame's wheel: summed vertical delta plus the unit (mice report
@@ -2828,6 +2897,14 @@ impl eframe::App for App {
         {
             self.new_workspace = None;
         }
+        // Esc on the dirty-worktree modal keeps it on disk (the safe choice).
+        if !self.confirm_worktree.is_empty()
+            && ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            self.confirm_worktree.remove(0);
+        }
         // Open/close the bar *before* search_intercept: cmd+f is already
         // consumed above, but the bar only starts intercepting once it is
         // active. If a first query character is batched into the same egui
@@ -3128,6 +3205,7 @@ impl eframe::App for App {
                     let focused = if archived
                         || self.settings_open
                         || self.new_workspace.is_some()
+                        || !self.confirm_worktree.is_empty()
                         || self.ai.composing()
                         || self.search.active()
                     {
@@ -3324,6 +3402,28 @@ impl eframe::App for App {
                 workspace_popup::Outcome::None => {
                     self.new_workspace = Some(form);
                 },
+            }
+        }
+
+        // The dirty-worktree confirmation from a tab close (one at a time).
+        if let Some(c) = self.confirm_worktree.first() {
+            match workspace_popup::confirm_worktree_delete(
+                ctx,
+                &c.title,
+                &c.path.display().to_string(),
+                &c.reason,
+                &self.ui_theme,
+                &self.font,
+            ) {
+                workspace_popup::ConfirmOutcome::Delete => {
+                    let c = self.confirm_worktree.remove(0);
+                    workspace::spawn_worktree_removal(c.path, c.root);
+                },
+                // Keep leaves it on disk (the pre-confirmation behavior).
+                workspace_popup::ConfirmOutcome::Keep => {
+                    self.confirm_worktree.remove(0);
+                },
+                workspace_popup::ConfirmOutcome::None => {},
             }
         }
 

@@ -222,6 +222,12 @@ pub enum Outcome {
     Create,
 }
 
+pub enum ConfirmOutcome {
+    None,
+    Delete,
+    Keep,
+}
+
 pub fn show(
     ctx: &egui::Context,
     form: &mut NewWorkspaceForm,
@@ -435,6 +441,97 @@ pub fn show(
     {
         outcome = Outcome::Create;
     }
+    outcome
+}
+
+/// A small modal asking whether to delete a just-closed tab's worktree that
+/// still holds uncommitted work, or keep it on disk. Painted in the same
+/// panel idiom as the creation popup. Deleting is the deliberate click and is
+/// never the keyboard default; Esc keeps (wired by the App), so the safe
+/// choice needs no press. `git worktree remove` keeps the branch - only the
+/// working dir and its uncommitted changes go.
+pub fn confirm_worktree_delete(
+    ctx: &egui::Context,
+    title: &str,
+    path: &str,
+    reason: &str,
+    th: &UiTheme,
+    font: &FontId,
+) -> ConfirmOutcome {
+    let mut outcome = ConfirmOutcome::None;
+    let panel = Panel {
+        font: font.clone(),
+        char_w: ctx.fonts(|f| f.glyph_width(font, ' ')),
+        row_h: ctx.fonts(|f| f.row_height(font)),
+        th,
+    };
+
+    egui::Window::new("Delete worktree?")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .default_width(460.0)
+        .frame(
+            egui::Frame::new()
+                .fill(th.bg)
+                .inner_margin(16.0)
+                .stroke(panel.hairline())
+                .shadow(Shadow {
+                    offset: [0, 6],
+                    blur: 24,
+                    spread: 0,
+                    color: Color32::from_black_alpha(100),
+                }),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(432.0);
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, 6.0);
+            panel.divider(ui, "[ Keep or delete worktree? ]", th.accent);
+            ui.add_space(2.0);
+            panel.row(
+                ui,
+                vec![
+                    ("workspace ".into(), th.text_dim),
+                    (title.to_string(), th.text),
+                ],
+                false,
+            );
+            panel.row(ui, vec![(home_abbrev(path), th.text_dim)], false);
+            panel.row(ui, vec![(reason.to_string(), th.status_err)], false);
+            ui.add_space(2.0);
+            panel.row(
+                ui,
+                vec![(
+                    "Deleting discards those uncommitted changes.".into(),
+                    th.text_dim,
+                )],
+                false,
+            );
+            ui.add_space(6.0);
+            panel.divider(ui, "", th.text_dim);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                if panel
+                    .button(ui, "[ Delete worktree ]", false, true)
+                    .clicked()
+                {
+                    outcome = ConfirmOutcome::Delete;
+                }
+                // The safe choice is the primary, right-aligned like Create.
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if panel.button(ui, "[ Keep ]", true, true).clicked() {
+                            outcome = ConfirmOutcome::Keep;
+                        }
+                    },
+                );
+            });
+            ui.add_space(4.0);
+            panel.divider(ui, "esc keeps it on disk", th.text_dim);
+        });
     outcome
 }
 
@@ -989,6 +1086,66 @@ mod tests {
             "Claude Code",
             "[ Cancel ]",
             "[ Create ]",
+        ] {
+            assert!(
+                joined.contains(needle),
+                "missing {needle:?} in painted runs: {texts:?}"
+            );
+        }
+    }
+
+    /// The dirty-worktree confirmation renders its labels, stays ASCII (its
+    /// button/divider runs feed the same char-cell math as the creation
+    /// popup), lays out without panicking, and returns None with no input.
+    #[test]
+    fn confirm_worktree_renders_ascii_and_labelled() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, ui_theme) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        // Seeded non-None so the assert proves it was overwritten.
+        let mut outcome = ConfirmOutcome::Delete;
+        let mut frame = |ctx: &egui::Context| {
+            outcome = confirm_worktree_delete(
+                ctx,
+                "brisk-otter",
+                "~/.muxterm/worktrees/brisk-otter",
+                "uncommitted changes (3 entries)",
+                &ui_theme,
+                &font,
+            );
+        };
+        let _ = ctx.run(input.clone(), &mut frame);
+        let output = ctx.run(input, &mut frame);
+
+        assert!(
+            matches!(outcome, ConfirmOutcome::None),
+            "an untouched modal must return None"
+        );
+
+        let mut texts: Vec<String> = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        for run in &texts {
+            assert!(run.is_ascii(), "non-ASCII painted run: {run:?}");
+        }
+        let joined = texts.join("\u{1}");
+        for needle in [
+            "[ Keep or delete worktree? ]",
+            "brisk-otter",
+            "uncommitted changes (3 entries)",
+            "[ Delete worktree ]",
+            "[ Keep ]",
+            "esc keeps it on disk",
         ] {
             assert!(
                 joined.contains(needle),
