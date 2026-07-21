@@ -695,9 +695,11 @@ mod tests {
                             ratio: 0.5,
                             first: Box::new(NodeState::Leaf {
                                 session: "mux-a".into(),
+                                cwd: None,
                             }),
                             second: Box::new(NodeState::Leaf {
                                 session: "mux-b".into(),
+                                cwd: None,
                             }),
                         },
                     },
@@ -707,6 +709,7 @@ mod tests {
                         workspace: None,
                         tree: NodeState::Leaf {
                             session: "mux-c".into(),
+                            cwd: None,
                         },
                     },
                 ],

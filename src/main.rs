@@ -11,6 +11,7 @@ mod keys;
 mod links;
 mod pane;
 mod pr_status;
+mod scrollback;
 mod search;
 mod settings;
 mod sidebar;

@@ -157,6 +157,13 @@ fn default_split_size() -> u8 {
 pub enum NodeState {
     Leaf {
         session: String,
+        /// The pane's last-known working directory, snapshotted from tmux
+        /// while the app ran. Fed back as the fresh session's start dir on a
+        /// post-reboot restore (the tmux server, and every cwd it held, dies
+        /// on reboot). Additive with `#[serde(default)]` (None), so older
+        /// state files load unchanged - no VERSION bump.
+        #[serde(default)]
+        cwd: Option<PathBuf>,
     },
     Split {
         axis: SplitAxis,
@@ -169,7 +176,7 @@ pub enum NodeState {
 impl NodeState {
     pub fn sessions(&self, out: &mut HashSet<String>) {
         match self {
-            NodeState::Leaf { session } => {
+            NodeState::Leaf { session, .. } => {
                 out.insert(session.clone());
             },
             NodeState::Split { first, second, .. } => {
@@ -182,7 +189,7 @@ impl NodeState {
     /// In-order session names (pane order within the tab).
     pub fn session_list(&self, out: &mut Vec<String>) {
         match self {
-            NodeState::Leaf { session } => out.push(session.clone()),
+            NodeState::Leaf { session, .. } => out.push(session.clone()),
             NodeState::Split { first, second, .. } => {
                 first.session_list(out);
                 second.session_list(out);
@@ -396,6 +403,7 @@ mod tests {
                         id: "mux-tab-1111".into(),
                         tree: NodeState::Leaf {
                             session: "mux-aaaa".into(),
+                            cwd: None,
                         },
                         focused_session: "mux-aaaa".into(),
                         workspace: None,
@@ -407,9 +415,11 @@ mod tests {
                             ratio: 0.3,
                             first: Box::new(NodeState::Leaf {
                                 session: "mux-bbbb".into(),
+                                cwd: None,
                             }),
                             second: Box::new(NodeState::Leaf {
                                 session: "mux-cccc".into(),
+                                cwd: None,
                             }),
                         },
                         focused_session: "mux-cccc".into(),
@@ -490,6 +500,35 @@ mod tests {
         // No saved projects or templates in an older file.
         assert!(s.projects.is_empty());
         assert!(s.templates.is_empty());
+    }
+
+    // The per-pane cwd added for reboot recovery is `#[serde(default)]`: a
+    // leaf saved before the field (no `cwd` key) loads as None, and a leaf
+    // that carries one round-trips it. No VERSION bump, so both parse at v1.
+    #[test]
+    fn leaf_cwd_is_optional_and_round_trips() {
+        // Old leaf, no cwd key -> None (the compat path).
+        let old: NodeState =
+            serde_json::from_str(r#"{"Leaf":{"session":"mux-a"}}"#).unwrap();
+        match old {
+            NodeState::Leaf { cwd, .. } => assert!(cwd.is_none()),
+            _ => panic!("expected a leaf"),
+        }
+        // A leaf with a cwd survives a save/load round trip.
+        let leaf = NodeState::Leaf {
+            session: "mux-b".into(),
+            cwd: Some(PathBuf::from("/work/proj/src")),
+        };
+        let back: NodeState =
+            serde_json::from_str(&serde_json::to_string(&leaf).unwrap())
+                .unwrap();
+        match back {
+            NodeState::Leaf { session, cwd } => {
+                assert_eq!(session, "mux-b");
+                assert_eq!(cwd, Some(PathBuf::from("/work/proj/src")));
+            },
+            _ => panic!("expected a leaf"),
+        }
     }
 
     #[test]

@@ -28,6 +28,7 @@ use muxterm::mesh;
 use crate::git_status;
 use crate::pane::Pane;
 use crate::pr_status;
+use crate::scrollback;
 use crate::search::{self, SearchBar, SearchOp};
 use crate::settings;
 use crate::sidebar::{self, SidebarAction};
@@ -50,6 +51,13 @@ const AGENT_SPLIT_MAX_PANES: usize = 8;
 /// the attention ts - never trips it, so a genuinely blocked, silent prompt
 /// keeps its "!". See the agent_states prune below.
 const STALE_ATTENTION_GRACE: u64 = 30;
+
+/// Grace after launch before the workspace-root sync may retarget a tab. A
+/// reboot restore respawns panes in their saved cwd (`-c`), but the first
+/// `list-panes` snapshot that proves they're back inside the worktree only
+/// lands on the first poll tick; without this grace, that settling window
+/// could be misread as "every pane left the worktree" and drop the link.
+const WORKSPACE_SYNC_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Tab {
     /// Stable id (`mux-tab-<8hex>`) scoping the agent mesh to this tab.
@@ -223,6 +231,21 @@ pub struct App {
     /// Window focus, shared with the pr/git pollers: they stretch their
     /// scan cadence while nobody can read the chips.
     focused_flag: Arc<AtomicBool>,
+    /// Reboot-recovery config (Layer 1/2/3), read at restore time: reopen
+    /// panes in their saved cwd, replay saved scrollback, relaunch agent CLIs.
+    session_recovery: bool,
+    restore_scrollback: bool,
+    restore_agents: bool,
+    /// Toggles the scrollback capture poller live (config `restore_scrollback`).
+    scrollback_enabled: Arc<AtomicBool>,
+    /// Sessions the tmux socket already held at launch. A restored leaf absent
+    /// here came back from a dead server (reboot/crash/`kill-server`) - the
+    /// per-pane trigger for cwd restore, scrollback replay, and agent
+    /// relaunch. Populated once in `App::new`, before the restore loop.
+    startup_live: HashSet<String>,
+    /// Instant the workspace-root sync may start retargeting (launch +
+    /// `WORKSPACE_SYNC_GRACE`), so the post-reboot cwd settling isn't misread.
+    workspace_sync_after: Instant,
 }
 
 impl App {
@@ -268,6 +291,11 @@ impl App {
             pane_snap_shared.clone(),
             focused_flag.clone(),
         );
+        // The scrollback capture poller (config `restore_scrollback`): spawned
+        // after `app` is built, since it needs `app.tmux`; the enable flag is
+        // made here so it can live in the struct and toggle on live reload.
+        let scrollback_enabled =
+            Arc::new(AtomicBool::new(style.restore_scrollback));
         let (title_tx, title_rx) = mpsc::channel();
         let (worktree_tx, worktree_rx) = mpsc::channel();
         let (bg_tx, bg_rx) = mpsc::channel();
@@ -345,6 +373,12 @@ impl App {
             policy_state: None,
             pane_snap_shared,
             focused_flag,
+            session_recovery: style.session_recovery,
+            restore_scrollback: style.restore_scrollback,
+            restore_agents: style.restore_agents,
+            scrollback_enabled,
+            startup_live: HashSet::new(),
+            workspace_sync_after: Instant::now() + WORKSPACE_SYNC_GRACE,
         };
 
         // Wire the agents' lifecycle hooks to `mux agent-event` (the sidebar
@@ -374,7 +408,24 @@ impl App {
                         tab.tree.sessions(&mut referenced);
                     }
                 }
+                // Sessions the socket still holds. A referenced session missing
+                // here means the server that owned it died (reboot/crash), so
+                // its leaf will be created fresh - the trigger for per-pane
+                // recovery, checked in `restore_tab`.
+                app.startup_live =
+                    app.tmux.list_sessions().into_iter().collect();
                 app.tmux.gc(&referenced);
+                // A cold restore (any referenced session gone) may replay
+                // scrollback: rotate the last run's captures aside first so the
+                // restarting poller can't clobber them before restore reads.
+                let cold_restore = app.session_recovery
+                    && app.restore_scrollback
+                    && referenced
+                        .iter()
+                        .any(|s| !app.startup_live.contains(s));
+                if cold_restore {
+                    scrollback::rotate();
+                }
                 if let Some(window) = saved.windows.into_iter().next() {
                     for tab_state in window.tabs {
                         if let Err(e) =
@@ -427,6 +478,15 @@ impl App {
             .filter_map(|p| p.cwd.as_deref())
             .collect();
         workspace::sweep_stale_claims(&referenced, &cwds);
+
+        // Start capturing scrollback for the *next* reboot (config
+        // `restore_scrollback`). After the rotate above, so this run's fresh
+        // captures land in `scrollback/` and never touch `scrollback-prev`.
+        scrollback::spawn(
+            app.tmux.clone(),
+            app.scrollback_enabled.clone(),
+            app.pane_snap_shared.clone(),
+        );
 
         app
     }
@@ -1208,6 +1268,14 @@ impl App {
     /// for; a pane with no known cwd (mid-teardown) skips its tab for the
     /// tick rather than guess.
     fn sync_workspace_roots(&mut self) {
+        // A reboot restore respawns panes in their saved cwd, but the
+        // `list-panes` snapshot proving they're back inside the worktree only
+        // lands on the first poll tick. Hold retargeting off until the
+        // settling grace passes, so that startup window can't be misread as
+        // "every pane left the worktree" and drop a still-valid worktree link.
+        if Instant::now() < self.workspace_sync_after {
+            return;
+        }
         // Memoize `git rev-parse --show-toplevel` per path: only consulted
         // on ticks where a tab's panes all wandered off, but then cwds
         // repeat across panes and tabs.
@@ -1290,10 +1358,28 @@ impl App {
             ctx: &egui::Context,
             node: NodeState,
             panes: &mut HashMap<PaneId, Pane>,
+            recovery_dir: &Option<String>,
         ) -> anyhow::Result<Node> {
             match node {
-                NodeState::Leaf { session } => {
-                    let pane = app.create_pane(ctx, Some(session), None)?;
+                NodeState::Leaf { session, cwd } => {
+                    // Reboot recovery (Layer 1): a leaf whose session the
+                    // socket no longer holds is being created fresh (the
+                    // server died), so seed it in its saved cwd. `-c` is
+                    // honored on create and ignored on a warm reattach, so a
+                    // live session is unaffected. Fall back to the worktree/
+                    // root when the exact cwd is gone, keeping the pane inside
+                    // the workspace so the root sync won't drop the link.
+                    let start_dir = if app.session_recovery
+                        && !app.startup_live.contains(&session)
+                    {
+                        cwd.filter(|d| d.is_dir())
+                            .map(|d| d.display().to_string())
+                            .or_else(|| recovery_dir.clone())
+                    } else {
+                        None
+                    };
+                    let pane =
+                        app.create_pane(ctx, Some(session), start_dir)?;
                     let id = pane.id;
                     panes.insert(id, pane);
                     Ok(Node::Leaf(id))
@@ -1306,14 +1392,28 @@ impl App {
                 } => Ok(Node::Split {
                     axis,
                     ratio: ratio.clamp(0.1, 0.9),
-                    first: Box::new(build(app, ctx, *first, panes)?),
-                    second: Box::new(build(app, ctx, *second, panes)?),
+                    first: Box::new(build(app, ctx, *first, panes, recovery_dir)?),
+                    second: Box::new(build(app, ctx, *second, panes, recovery_dir)?),
                 }),
             }
         }
 
+        // The worktree/root to drop a recovered pane into when its exact saved
+        // cwd is gone (borrowed before `saved.tree`/`saved.workspace` move).
+        let recovery_dir: Option<String> = saved
+            .workspace
+            .as_ref()
+            .and_then(|w| {
+                w.worktree
+                    .as_ref()
+                    .map(|wt| wt.path.clone())
+                    .or_else(|| w.root.clone())
+            })
+            .filter(|p| p.is_dir())
+            .map(|p| p.display().to_string());
+
         let mut panes = HashMap::new();
-        let tree = build(self, ctx, saved.tree, &mut panes)?;
+        let tree = build(self, ctx, saved.tree, &mut panes, &recovery_dir)?;
         let focused = panes
             .values()
             .find(|p| p.session == saved.focused_session)
@@ -1332,15 +1432,132 @@ impl App {
             .workspace
             .map(Workspace::from_state)
             .unwrap_or_else(|| Workspace::bare(None));
+        // Panes created fresh from a dead server (Layer 2/3 recovery targets):
+        // captured before the push so the borrow is clean, replayed after.
+        let first_leaf = tree.first_leaf();
+        let cold: Vec<(PaneId, String)> = if self.session_recovery {
+            panes
+                .iter()
+                .filter(|(_, p)| !self.startup_live.contains(&p.session))
+                .map(|(id, p)| (*id, p.session.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.tabs.push(Tab {
-            tab_id,
+            tab_id: tab_id.clone(),
             tree,
             panes,
             focused,
             last_rects: HashMap::new(),
             workspace,
         });
+        // Recovery runs after the tab exists: the typed input rides the same
+        // BackendCommand::Write path as `launch_agent`. Scrollback first (it
+        // reprints above the prompt), then the agent relaunch, so an agent
+        // pane runs `cat` and then its CLI in order.
+        if !cold.is_empty() {
+            if self.restore_scrollback {
+                for (pane_id, session) in &cold {
+                    self.replay_scrollback(&tab_id, *pane_id, session);
+                }
+            }
+            // Relaunch the agent only when its own (first) pane came back cold
+            // and the workspace had an agent (`relaunch_agent_for_recovery`
+            // no-ops otherwise).
+            if self.restore_agents
+                && cold.iter().any(|(id, _)| *id == first_leaf)
+            {
+                self.relaunch_agent_for_recovery(&tab_id);
+            }
+        }
         Ok(())
+    }
+
+    /// Reboot recovery (Layer 2): if a cold pane's pre-reboot scrollback was
+    /// captured (`scrollback::recovered_file`), reprint it into the fresh pane
+    /// via `cat`, framed by a dim banner - so its history, and cmd+f search
+    /// over it, come back. `cat`ting a file only reprints text; nothing in the
+    /// scrollback is ever run as a command. A leading space keeps the two
+    /// commands out of shells honoring `ignorespace`.
+    fn replay_scrollback(
+        &mut self,
+        tab_id: &str,
+        pane_id: PaneId,
+        session: &str,
+    ) {
+        let Some(file) = scrollback::recovered_file(session) else {
+            return;
+        };
+        let banner =
+            "──── muxterm: restored scrollback (before reboot) ────";
+        let lines = vec![
+            format!(
+                " printf '\\033[2m%s\\033[0m\\n' {}",
+                agent::shell_quote(banner)
+            ),
+            format!(
+                " cat {}",
+                agent::shell_quote(&file.display().to_string())
+            ),
+        ];
+        let mut bytes = lines.join("\r").into_bytes();
+        bytes.push(b'\r');
+        if let Some(pane) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.tab_id == tab_id)
+            .and_then(|t| t.panes.get_mut(&pane_id))
+        {
+            pane.backend.process_command(BackendCommand::Write(bytes));
+        }
+    }
+
+    /// Reboot recovery (Layer 3): bring a cold workspace tab's agent CLI back
+    /// up interactively. The pane already respawned in its cwd (`-c`); cd into
+    /// the project subdir if any, then run the bare agent command with NO task
+    /// prompt - the reboot killed the agent mid-task, and re-sending the
+    /// original prompt could redo or corrupt work, so the user resumes. The
+    /// setup script is skipped (it may restart services / have side effects).
+    /// No-ops for a tab without an agent.
+    fn relaunch_agent_for_recovery(&mut self, tab_id: &str) {
+        let Some(tab) = self.tabs.iter().find(|t| t.tab_id == tab_id) else {
+            return;
+        };
+        let Some(agent) = tab.workspace.agent.and_then(agent::by_id) else {
+            return;
+        };
+        // Only a task (prompt-bearing) workspace auto-launches an agent, the
+        // same gate `launch_agent` uses - a bare shell workspace with a
+        // lingering agent id must not sprout one on restore.
+        if tab.workspace.prompt.is_empty() {
+            return;
+        }
+        let pane_id = tab.tree.first_leaf();
+        let model = tab.workspace.model.clone();
+        let cd = workspace::boot_cd(
+            tab.workspace.worktree.as_ref().map(|w| w.path.as_path()),
+            tab.workspace.root.as_deref(),
+            tab.workspace.subdir.as_deref(),
+        );
+        let mut lines: Vec<String> = Vec::new();
+        if let Some(p) = &cd {
+            lines.push(format!(
+                "cd {}",
+                agent::shell_quote(&p.display().to_string())
+            ));
+        }
+        lines.push(agent::resume_command(agent, model.as_deref()));
+        let mut bytes = lines.join("\r").into_bytes();
+        bytes.push(b'\r');
+        if let Some(pane) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.tab_id == tab_id)
+            .and_then(|t| t.panes.get_mut(&pane_id))
+        {
+            pane.backend.process_command(BackendCommand::Write(bytes));
+        }
     }
 
     fn split_focused(&mut self, ctx: &egui::Context, axis: SplitAxis) {
@@ -1910,13 +2127,24 @@ impl App {
         fn node_state(
             node: &Node,
             panes: &HashMap<PaneId, Pane>,
+            snap: &HashMap<String, tmux::PaneSnap>,
         ) -> NodeState {
             match node {
-                Node::Leaf(id) => NodeState::Leaf {
-                    session: panes
+                Node::Leaf(id) => {
+                    let session = panes
                         .get(id)
                         .map(|p| p.session.clone())
-                        .unwrap_or_default(),
+                        .unwrap_or_default();
+                    NodeState::Leaf {
+                        // Persist the pane's last-known cwd (the poll tick
+                        // keeps `pane_snap` fresh) so a post-reboot restore can
+                        // reopen it there - the tmux server holding the live
+                        // cwd dies on reboot.
+                        cwd: snap
+                            .get(&session)
+                            .and_then(|s| s.cwd.clone()),
+                        session,
+                    }
                 },
                 Node::Split {
                     axis,
@@ -1926,8 +2154,8 @@ impl App {
                 } => NodeState::Split {
                     axis: *axis,
                     ratio: *ratio,
-                    first: Box::new(node_state(first, panes)),
-                    second: Box::new(node_state(second, panes)),
+                    first: Box::new(node_state(first, panes, snap)),
+                    second: Box::new(node_state(second, panes, snap)),
                 },
             }
         }
@@ -1946,7 +2174,7 @@ impl App {
                     .iter()
                     .map(|tab| TabState {
                         id: tab.tab_id.clone(),
-                        tree: node_state(&tab.tree, &tab.panes),
+                        tree: node_state(&tab.tree, &tab.panes, &self.pane_snap),
                         focused_session: tab
                             .panes
                             .get(&tab.focused)
@@ -1988,6 +2216,14 @@ impl App {
         self.git_status = style.git_status;
         self.git_enabled.store(style.git_status, Ordering::Relaxed);
         self.notifications = style.notifications;
+        // Reboot-recovery flags. session_recovery/restore_agents only act at
+        // the next launch's restore, but track them so a live edit sticks;
+        // restore_scrollback also gates the capture poller, toggled live.
+        self.session_recovery = style.session_recovery;
+        self.restore_scrollback = style.restore_scrollback;
+        self.restore_agents = style.restore_agents;
+        self.scrollback_enabled
+            .store(style.restore_scrollback, Ordering::Relaxed);
         if !style.pr_status && !style.pr_detector {
             // The poller also sends a clearing snapshot, but drop the
             // badges now so the toggle feels instant.
@@ -2488,7 +2724,21 @@ impl eframe::App for App {
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
             self.drain_newtab_requests(ctx);
-            self.pane_snap = self.tmux.pane_snapshot();
+            let new_snap = self.tmux.pane_snapshot();
+            // A pane changed directory since the last tick: mark state dirty
+            // so the saved layout's per-leaf cwd (reboot recovery) tracks it.
+            // cwd changes don't otherwise flip `dirty`; bounded to real moves.
+            if self.session_recovery {
+                let prev = &self.pane_snap;
+                let moved = new_snap.keys().chain(prev.keys()).any(|s| {
+                    new_snap.get(s).and_then(|p| p.cwd.as_ref())
+                        != prev.get(s).and_then(|p| p.cwd.as_ref())
+                });
+                if moved {
+                    self.dirty = true;
+                }
+            }
+            self.pane_snap = new_snap;
             *self.pane_snap_shared.lock().unwrap() = self.pane_snap.clone();
             // Hook-reported agent states, pruned against liveness: a session
             // whose foreground returned to a shell (or vanished) has no live

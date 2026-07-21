@@ -70,6 +70,13 @@ copy_on_select = false
 # `mux notify`. Tab badges are always on; this gates only the OS alerts.
 # notifications = true
 
+# Recover context when relaunching after a machine reboot. A reboot kills
+# the tmux server (and every pane's live process, cwd, and scrollback);
+# these bring back what can be brought back - live processes can't.
+# session_recovery = true    # reopen each pane in its last directory
+# restore_scrollback = true  # replay saved scrollback into restored panes
+# restore_agents = true      # relaunch agent CLIs (interactive, no re-prompt)
+
 # The per-pane title/status bar (pane title + git/PR chips). Each theme
 # picks a style and edge; override with "chips" (floating corner badges)
 # or "solid" (a full-width strip that reserves a row above/below the
@@ -128,6 +135,19 @@ pub struct ConfigFile {
     pub pr_detector: bool,
     /// Dock bounce + banner on bell/`mux notify` while unfocused.
     pub notifications: bool,
+    /// Restore each pane's working directory when relaunching after a machine
+    /// reboot (which kills the tmux server, and every cwd it held). Master
+    /// switch for reboot recovery; also stops the workspace-root sync from
+    /// dropping a worktree link when panes come back empty.
+    pub session_recovery: bool,
+    /// Capture pane scrollback to disk and replay it into panes restored
+    /// after a reboot (needs `session_recovery`). Purely cosmetic - the text
+    /// is reprinted, no process comes back.
+    pub restore_scrollback: bool,
+    /// After a reboot, relaunch a workspace tab's agent CLI interactively -
+    /// with no task prompt, so the user resumes rather than re-running mid-
+    /// flight work (needs `session_recovery`).
+    pub restore_agents: bool,
     /// Pane HUD bar edge: "top" | "bottom"; unset keeps the theme's choice.
     pub bar_position: Option<String>,
     /// Pane HUD style: "chips" | "solid"; unset keeps the theme's choice.
@@ -154,6 +174,9 @@ impl Default for ConfigFile {
             pr_status: true,
             pr_detector: true,
             notifications: true,
+            session_recovery: true,
+            restore_scrollback: true,
+            restore_agents: true,
             bar_position: None,
             bar_style: None,
             bar_font: None,
@@ -185,6 +208,9 @@ pub struct Style {
     pub pr_status: bool,
     pub pr_detector: bool,
     pub notifications: bool,
+    pub session_recovery: bool,
+    pub restore_scrollback: bool,
+    pub restore_agents: bool,
 }
 
 pub fn path() -> PathBuf {
@@ -318,6 +344,9 @@ pub fn resolve(
             pr_status: cfg.pr_status,
             pr_detector: cfg.pr_detector,
             notifications: cfg.notifications,
+            session_recovery: cfg.session_recovery,
+            restore_scrollback: cfg.restore_scrollback,
+            restore_agents: cfg.restore_agents,
         },
         font_data,
         bar_font_data,
@@ -909,6 +938,27 @@ mod tests {
         assert!(!cfg.notifications);
         let (style, _, _) = resolve(&cfg);
         assert!(!style.notifications);
+    }
+
+    #[test]
+    fn recovery_flags_default_on_and_parse() {
+        // All three default on (the chosen "full recovery" scope), and an
+        // older config with none of the keys still loads them on.
+        let d = ConfigFile::default();
+        assert!(d.session_recovery && d.restore_scrollback && d.restore_agents);
+        let seed: ConfigFile = toml::from_str(&default_config()).unwrap();
+        assert!(seed.session_recovery);
+        assert!(seed.restore_scrollback);
+        assert!(seed.restore_agents);
+        // Each disables independently and reaches the resolved Style.
+        let cfg: ConfigFile = toml::from_str(
+            "session_recovery = false\nrestore_scrollback = false\nrestore_agents = false",
+        )
+        .unwrap();
+        let (style, _, _) = resolve(&cfg);
+        assert!(!style.session_recovery);
+        assert!(!style.restore_scrollback);
+        assert!(!style.restore_agents);
     }
 
     #[test]

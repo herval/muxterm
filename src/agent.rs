@@ -151,6 +151,21 @@ pub fn launch_command(
     cmd
 }
 
+/// Relaunch the agent's interactive session with no task attached, for
+/// reboot recovery (`app::relaunch_agent_for_recovery`): the same CLI and
+/// user-picked model as `launch_command`, but *without* a first message.
+/// The reboot killed the agent mid-task; re-sending the original prompt
+/// could redo or corrupt work, so we bring the CLI back up ready and let the
+/// user resume.
+pub fn resume_command(agent: &Agent, model: Option<&str>) -> String {
+    let mut cmd = agent.bin.to_string();
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        cmd.push_str(" --model ");
+        cmd.push_str(m);
+    }
+    cmd
+}
+
 /// The captured one-shot behind AI workspace-title generation (workspace.rs,
 /// `mux retitle`): non-interactive, fast model, plain-text stdout. Unlike
 /// `launch_command` (interactive, user-picked model), this always uses the
@@ -377,5 +392,14 @@ mod tests {
             launch_command(pi, Some("sonnet"), "fix it"),
             "pi --model sonnet 'fix it'"
         );
+    }
+
+    #[test]
+    fn resume_command_omits_the_prompt() {
+        let claude = by_id("claude").unwrap();
+        // Same CLI + model as launch_command, but no task message appended.
+        assert_eq!(resume_command(claude, Some("sonnet")), "claude --model sonnet");
+        assert_eq!(resume_command(claude, None), "claude");
+        assert_eq!(resume_command(claude, Some("")), "claude");
     }
 }
