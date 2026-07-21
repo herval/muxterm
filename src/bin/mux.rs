@@ -54,6 +54,10 @@ usage: mux [--as <session>] [--json] <command> [args]
   split [right|down] [--cwd <dir>] [--run <command>]
                                grow the team: ask the GUI to split your
                                pane; prints the new pane's session name
+  new-tab [--cwd <dir>] [--run <command>] [--title <t>]
+                               open a NEW background tab running a command
+                               in a folder; prints its session name (use
+                               only when the user explicitly asks for a tab)
   leave [--name <n>|--session <s>]
                                deregister (default: yourself)
   peers [--all]                list teammates (--all: unregistered panes too)
@@ -134,6 +138,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "join" => cmd_join(as_session, rest),
         "run" => cmd_run(as_session, rest),
         "split" => cmd_split(as_session, rest),
+        "new-tab" => cmd_new_tab(as_session, rest),
         "leave" => cmd_leave(as_session, rest),
         "peers" => cmd_peers(as_session, rest, json),
         "tree" => cmd_tree(as_session, json),
@@ -791,6 +796,72 @@ fn cmd_split(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
             return Err((
                 EXIT_REFUSED,
                 "timed out waiting for muxterm to create the split (is the app running?)"
+                    .to_string(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    if let Some(cmd) = run {
+        // Same delivery as `mux tell`: the text queues in the pane's pty
+        // and the shell reads it as soon as it is up.
+        tmux.paste_text(&session, &cmd, true)?;
+    }
+    println!("{session}");
+    Ok(())
+}
+
+/// `mux new-tab`: open a brand-new tab (not a split). Same handshake as
+/// `cmd_split` - pre-agree the session name, spool a request, poll the tmux
+/// socket for the session (or a `.err` refusal), then paste `--run`. The new
+/// tab opens in the background; the GUI never steals focus for it.
+fn cmd_new_tab(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
+    let usage = || {
+        (
+            EXIT_USAGE,
+            "usage: mux new-tab [--cwd <dir>] [--run <command>] [--title <t>]"
+                .to_string(),
+        )
+    };
+    let cwd_flag = take_opt(&mut args, "--cwd")?;
+    let run = take_opt(&mut args, "--run")?;
+    let title = take_opt(&mut args, "--title")?;
+    if !args.is_empty() {
+        return Err(usage());
+    }
+
+    let tmux = Tmux::new()?;
+    // Resolves (and authorizes) the caller as a real muxterm pane.
+    let sc = scope(&tmux, as_session)?;
+    let session = mesh::new_session_name();
+    // The new shell starts where the caller is, unless told otherwise.
+    let cwd = cwd_flag
+        .or_else(|| env::current_dir().ok().map(|p| p.display().to_string()));
+    mesh::write_newtab_request(&mesh::NewTabRequest {
+        v: 1,
+        from: sc.session.clone(),
+        session: session.clone(),
+        cwd,
+        title,
+        ts: mesh::now(),
+    })
+    .map_err(|e| (EXIT_TMUX, format!("spooling request: {e:#}")))?;
+
+    // The GUI drains the spool on a ~1s tick (a bit slower when idle).
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(reason) = mesh::take_newtab_refusal(&session) {
+            return Err((EXIT_REFUSED, format!("muxterm refused: {reason}")));
+        }
+        if tmux.has_session(&session) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            // Withdraw, so a late GUI doesn't create an orphaned tab.
+            let _ = fs::remove_file(mesh::newtab_request_path(&session));
+            return Err((
+                EXIT_REFUSED,
+                "timed out waiting for muxterm to create the tab (is the app running?)"
                     .to_string(),
             ));
         }
@@ -1822,6 +1893,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux tell <name> <text>` - type directly into their terminal (immediate but can interleave)");
     let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
     let _ = writeln!(out, "- `mux split [right|down] [--run <cmd>]` - add a pane beside yours for a new teammate; prints its session name");
+    let _ = writeln!(out, "- `mux new-tab [--cwd <dir>] [--run <cmd>] [--title <t>]` - open a NEW background tab running a command in a folder. **Only use this when the user explicitly asks you to open a tab/window** - never on your own initiative.");
     let _ = writeln!(out, "- `mux rename [--desc <text>] <title...>` - relabel this workspace with a short descriptive title (2-5 words, spaces ok; updates the sidebar/tab, never the git branch)");
     let _ = writeln!(out, "- `mux retitle` - regenerate the workspace's title/description from what its panes are doing (returns immediately; applies in the background)");
     let _ = writeln!(out);

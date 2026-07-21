@@ -185,6 +185,7 @@ mux inbox --consume                    # read messages sent to you
 mux tell writer "run the tests again"  # type into their terminal directly
 mux ctx set build.status green         # shared per-tab scratchpad
 mux split --run 'mux run w2 -- claude' # grow the team: split your own pane
+mux new-tab --cwd ~/dev/api --run 'npm run dev'  # open a new background tab
 mux brief                              # paste-ready team briefing for a prompt
 ```
 
@@ -203,6 +204,14 @@ them with `read`/`post`/`tell`. Splits stay GUI-owned (a session created
 behind the app's back would never render and would be GC'd), so the CLI
 spools a request that the app's poll loop applies: the new pane lands next
 to the requester without stealing focus, capped at 8 panes per tab.
+
+`mux new-tab [--cwd <dir>] [--run <command>] [--title <t>]` uses the same
+handshake to open a whole new tab instead of a split — a bare shell that
+starts in `--cwd` and runs `--run`, landing in the background (never stealing
+focus) and printing its session name. It's meant for spinning up an
+independent shell or long-running command (a dev server, a build), so the
+brief tells agents to use it **only when the user explicitly asks** for a new
+tab or window — never on their own initiative.
 
 Prefer `post` for anything a teammate should act on (it queues durably and
 injects a single `[mux] new message from …` nudge no matter how many

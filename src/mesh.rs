@@ -62,6 +62,13 @@ pub fn rename_dir() -> PathBuf {
     config_dir().join("rename")
 }
 
+/// Its own directory for the same reason as the spools above. Like a split
+/// (and unlike notify/rename) it carries an `.err` back-channel keyed by the
+/// pre-agreed session name, so the CLI can poll for its specific refusal.
+pub fn newtab_dir() -> PathBuf {
+    config_dir().join("newtab")
+}
+
 /// One file per session (`<session>.json`), written by `mux agent-event`
 /// (agent lifecycle hooks) and read by the GUI's poll tick to drive the
 /// sidebar status dot. Unlike the spools above these are *state*, not a
@@ -80,6 +87,7 @@ pub fn ensure_dirs() {
     let _ = fs::create_dir_all(requests_dir());
     let _ = fs::create_dir_all(notify_dir());
     let _ = fs::create_dir_all(rename_dir());
+    let _ = fs::create_dir_all(newtab_dir());
     let _ = fs::create_dir_all(agent_state_dir());
 }
 
@@ -425,6 +433,89 @@ pub fn clear_rename_requests() {
     }
 }
 
+/// `mux new-tab`: a pane asking the GUI to open a brand-new tab (not a split).
+/// Same handshake as a split - the CLI pre-agrees the session name, the GUI
+/// creates it, and the CLI learns the outcome by polling tmux for the session
+/// (or this spool for a sibling `.err` refusal). One file per request, named
+/// after the session-to-be, so the requester can poll for its specific `.err`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NewTabRequest {
+    pub v: u32,
+    /// Session of the pane asking to open a tab (authorizes the request).
+    pub from: String,
+    /// Pre-agreed name for the new tab's first (only) session.
+    pub session: String,
+    /// Where the new shell starts (tmux `new-session -c`); None uses the default.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Optional workspace title; None gives the tab a random codename.
+    #[serde(default)]
+    pub title: Option<String>,
+    pub ts: u64,
+}
+
+pub fn newtab_request_path(session: &str) -> PathBuf {
+    newtab_dir().join(format!("{session}.json"))
+}
+
+pub fn newtab_refusal_path(session: &str) -> PathBuf {
+    newtab_dir().join(format!("{session}.err"))
+}
+
+pub fn write_newtab_request(req: &NewTabRequest) -> anyhow::Result<()> {
+    fs::create_dir_all(newtab_dir())?;
+    let path = newtab_request_path(&req.session);
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(req)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Drain pending new-tab requests; each file is removed as it is read
+/// (`.json.tmp` staging files are skipped, as with splits).
+pub fn take_newtab_requests() -> Vec<NewTabRequest> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(newtab_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let _ = fs::remove_file(&path);
+        if let Ok(req) = serde_json::from_str::<NewTabRequest>(&text) {
+            out.push(req);
+        }
+    }
+    out
+}
+
+/// The GUI's "no": the requester polls for this alongside the session.
+pub fn write_newtab_refusal(session: &str, reason: &str) {
+    let _ = fs::create_dir_all(newtab_dir());
+    let _ = fs::write(newtab_refusal_path(session), reason);
+}
+
+pub fn take_newtab_refusal(session: &str) -> Option<String> {
+    let path = newtab_refusal_path(session);
+    let reason = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    Some(reason)
+}
+
+/// A new-tab request spooled while the GUI was closed is stale by next launch.
+pub fn clear_newtab_requests() {
+    if let Ok(entries) = fs::read_dir(newtab_dir()) {
+        for entry in entries.flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Deregister a session and drop its inbox artifacts (pane closed).
 pub fn remove_session(session: &str) {
     let mut reg = load_registry();
@@ -686,6 +777,32 @@ mod tests {
         )
         .unwrap();
         assert!(bare.cwd.is_none());
+    }
+
+    #[test]
+    fn newtab_request_round_trip() {
+        let req = NewTabRequest {
+            v: 1,
+            from: "mux-aaaa".into(),
+            session: "mux-bbbb".into(),
+            cwd: Some("/tmp".into()),
+            title: Some("probe".into()),
+            ts: 42,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: NewTabRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.from, "mux-aaaa");
+        assert_eq!(back.session, "mux-bbbb");
+        assert_eq!(back.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(back.title.as_deref(), Some("probe"));
+        assert_eq!(back.ts, 42);
+        // cwd and title are optional on the wire.
+        let bare: NewTabRequest = serde_json::from_str(
+            r#"{"v":1,"from":"mux-a","session":"mux-b","ts":1}"#,
+        )
+        .unwrap();
+        assert!(bare.cwd.is_none());
+        assert!(bare.title.is_none());
     }
 
     #[test]

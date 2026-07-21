@@ -405,6 +405,7 @@ impl App {
         mesh::clear_split_requests();
         mesh::clear_notify_requests();
         mesh::clear_rename_requests();
+        mesh::clear_newtab_requests();
 
         // Reclaim empty claim dirs that failed checkouts left behind
         // (deleting them at failure time would yank a booting shell's cwd).
@@ -1388,6 +1389,72 @@ impl App {
         }
     }
 
+    fn drain_newtab_requests(&mut self, ctx: &egui::Context) {
+        for req in mesh::take_newtab_requests() {
+            if let Err(reason) = self.apply_newtab_request(ctx, &req) {
+                log::warn!("refused new-tab from {}: {reason}", req.from);
+                mesh::write_newtab_refusal(&req.session, &reason);
+            }
+        }
+    }
+
+    /// `mux new-tab`: open a brand-new tab (not a split) at the caller's
+    /// request. Validates like `apply_split_request`, but builds a fresh
+    /// single-pane `Tab` and - unlike a user's cmd+t - steals no focus, since
+    /// the user may be working elsewhere when an agent opens it.
+    fn apply_newtab_request(
+        &mut self,
+        ctx: &egui::Context,
+        req: &mesh::NewTabRequest,
+    ) -> Result<(), String> {
+        if req.v != 1 {
+            return Err(format!("unsupported new-tab request version {}", req.v));
+        }
+        if mesh::now().saturating_sub(req.ts) > 30 {
+            return Err("request expired before muxterm saw it".to_string());
+        }
+        // The name must be fresh: `new-session -A` on an existing session
+        // would attach it here instead of creating a new one.
+        if !req.session.starts_with(mesh::SESSION_PREFIX)
+            || self.tmux.list_sessions().contains(&req.session)
+            || self
+                .tabs
+                .iter()
+                .any(|t| t.panes.values().any(|p| p.session == req.session))
+        {
+            return Err(format!("session name {:?} is not usable", req.session));
+        }
+        // Only a live muxterm pane may open tabs (authorization).
+        if !self
+            .tabs
+            .iter()
+            .any(|t| t.panes.values().any(|p| p.session == req.from))
+        {
+            return Err(format!("session {} is not a muxterm pane", req.from));
+        }
+        let pane = self
+            .create_pane(ctx, Some(req.session.clone()), req.cwd.clone())
+            .map_err(|e| format!("failed to create pane: {e:#}"))?;
+        let id = pane.id;
+        let mut workspace =
+            Workspace::bare(req.cwd.as_ref().map(PathBuf::from));
+        if let Some(title) = req.title.clone() {
+            workspace.title = title;
+        }
+        let mut panes = HashMap::new();
+        panes.insert(id, pane);
+        self.tabs.push(Tab {
+            tab_id: mesh::new_tab_id(),
+            tree: Node::Leaf(id),
+            panes,
+            focused: id,
+            last_rects: HashMap::new(),
+            workspace,
+        });
+        self.dirty = true;
+        Ok(())
+    }
+
     /// The single close path. `kill` distinguishes an explicit close (cmd+w:
     /// kill the tmux session) from a reactive one (the shell exited, so the
     /// session is already gone). App quit goes through neither - backends
@@ -2318,6 +2385,7 @@ impl eframe::App for App {
             self.drain_split_requests(ctx);
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
+            self.drain_newtab_requests(ctx);
             self.pane_snap = self.tmux.pane_snapshot();
             *self.pane_snap_shared.lock().unwrap() = self.pane_snap.clone();
             // Hook-reported agent states, pruned against liveness: a session
