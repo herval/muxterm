@@ -77,17 +77,18 @@ enum UiAction {
     LayoutChanged,
 }
 
-/// A closed tab whose muxterm-managed worktree had uncommitted work: the
-/// close is done, but the worktree is held pending a user confirmation
-/// (`reclaim_worktree` -> the modal in the update loop) rather than removed or
-/// silently left. Carries everything the removal needs, since the tab is gone.
+/// A tab whose close was deferred because its muxterm-managed worktree holds
+/// uncommitted work: the tab is still *live* (the close was intercepted before
+/// teardown), pending a keep/delete decision from the modal in the update loop
+/// - Archive keeps the workspace, Delete closes it and removes the worktree.
+/// Keyed by stable tab id, not index, so a shuffle can't act on the wrong tab.
 struct WorktreeConfirm {
-    /// The worktree dir to remove if the user confirms.
-    path: PathBuf,
-    /// Root hint for `spawn_worktree_removal` (the owning repo fallback).
-    root: Option<PathBuf>,
-    /// The closed workspace's title, for the prompt.
+    /// The still-open tab awaiting the decision.
+    tab_id: String,
+    /// The workspace title, for the prompt.
     title: String,
+    /// The worktree dir, shown in the prompt.
+    path: PathBuf,
     /// Why it's dirty, straight from `worktree_delete_refusal`.
     reason: String,
 }
@@ -703,20 +704,28 @@ impl App {
             }
         }
 
-        // Landing spot before the removal shifts indices: the archived tab
-        // is never in the visible list, so `nearest_visible` works on the
-        // pre-removal indices and the result maps through the shift.
+        self.remove_tab_and_worktree(ctx, i);
+    }
+
+    /// Tear a tab down and, if it has a live worktree, remove it off-thread.
+    /// Kills every pane's session first (a live shell cwd'd inside the
+    /// vanishing dir showers getcwd errors - the failed-checkout doctrine in
+    /// workspace.rs), drops the tab and its per-tab-id state, repoints `active`
+    /// to a visible neighbour (opening a bare tab if the pile is now all
+    /// archived - the app never quits here), and force-removes the worktree
+    /// (branch preserved). The guards - archived? dirty? in flight? - are the
+    /// *caller's*; by here the decision to destroy is final. Shared by the
+    /// archived-row delete and the close-confirm's Delete.
+    fn remove_tab_and_worktree(&mut self, ctx: &egui::Context, i: usize) {
+        // Landing spot before the removal shifts indices; `nearest_visible`
+        // works on pre-removal indices and the result maps through the shift.
         let landing = nearest_visible(&self.visible_tab_indices(), i);
         let tab = self.tabs.remove(i);
-        // Sessions die before the worktree dir goes - a live shell cwd'd
-        // inside the vanishing dir showers getcwd errors (the
-        // failed-checkout doctrine in workspace.rs).
         for pane in tab.panes.values() {
             self.tmux.kill_session(&pane.session);
             mesh::remove_session(&pane.session);
         }
-        // Per-tab-id leftovers close_pane's last-pane path would cover (or
-        // never has to): pending boots, an in-flight title, worktree
+        // Per-tab-id leftovers: pending boots, an in-flight title, worktree
         // bookkeeping. Session-keyed maps (pane_snap, agent_states, pr, git,
         // bg_jobs) self-heal on the next poll tick, as with close_pane.
         self.pending_panes.remove(&tab.tab_id);
@@ -729,8 +738,6 @@ impl App {
                     self.active =
                         active_after_removal(j, i, self.tabs.len());
                 },
-                // Every remaining tab is archived (or none remain): open a
-                // bare tab like archive_tab does - the app never quits here.
                 None => self.new_tab(ctx, None),
             }
         } else {
@@ -738,6 +745,11 @@ impl App {
                 active_after_removal(self.active, i, self.tabs.len());
         }
         self.dirty = true;
+        let wt_live = tab
+            .workspace
+            .worktree
+            .as_ref()
+            .is_some_and(|w| w.path.exists());
         if wt_live {
             let w = tab.workspace.worktree.expect("wt_live checked");
             workspace::spawn_worktree_removal(w.path, tab.workspace.root);
@@ -1804,6 +1816,39 @@ impl App {
         pane_id: PaneId,
         kill: bool,
     ) {
+        // An explicit close (cmd+w) that would empty a tab whose muxterm-managed
+        // worktree holds uncommitted work defers to a keep/delete modal instead
+        // of tearing the tab down: Archive keeps the workspace (worktree and
+        // sessions intact), Delete closes it and removes the worktree. Only
+        // kill=true - a reactive close means the shell already exited, so
+        // there's no live workspace to archive (reclaim_worktree covers that).
+        if kill {
+            if let Some(tab) = self.tabs.get(tab_idx) {
+                let empties = tab.panes.len() == 1
+                    && tab.panes.contains_key(&pane_id);
+                if empties && !self.pending_worktrees.contains(&tab.tab_id) {
+                    if let Some(w) = tab
+                        .workspace
+                        .worktree
+                        .as_ref()
+                        .filter(|w| w.path.exists())
+                    {
+                        if let Some(reason) =
+                            workspace::worktree_delete_refusal(&w.path)
+                        {
+                            self.confirm_worktree.push(WorktreeConfirm {
+                                tab_id: tab.tab_id.clone(),
+                                title: tab.workspace.title.clone(),
+                                path: w.path.clone(),
+                                reason,
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         let Some(tab) = self.tabs.get_mut(tab_idx) else {
             return;
         };
@@ -1851,13 +1896,13 @@ impl App {
     /// close. Only a *muxterm-managed* worktree that still exists and isn't
     /// mid-checkout is a candidate; branches survive either way (`git worktree
     /// remove` drops only the working dir and its bookkeeping). A clean one is
-    /// removed straight off. A *dirty* one (uncommitted or untracked work,
-    /// `worktree_delete_refusal`) is neither removed nor silently left: it's
-    /// queued for a keep/delete confirmation modal, so the close never
-    /// destroys unsaved work without asking. The panes' sessions are dead by
-    /// here (close_pane killed them before the tab emptied), per the
-    /// getcwd-storm doctrine in workspace.rs.
-    fn reclaim_worktree(&mut self, tab: &Tab) {
+    /// removed straight off; a *dirty* one is left on disk - never discarded.
+    /// (A dirty *explicit* close is intercepted upstream into the keep/delete
+    /// modal, so a dirty worktree only reaches here on a *reactive* close,
+    /// whose shell already exited - nothing live to archive.) The panes'
+    /// sessions are dead by here (close_pane killed them before the tab
+    /// emptied), per the getcwd-storm doctrine in workspace.rs.
+    fn reclaim_worktree(&self, tab: &Tab) {
         let Some(w) = tab.workspace.worktree.as_ref() else {
             return;
         };
@@ -1876,12 +1921,10 @@ impl App {
                 w.path.clone(),
                 tab.workspace.root.clone(),
             ),
-            Some(reason) => self.confirm_worktree.push(WorktreeConfirm {
-                path: w.path.clone(),
-                root: tab.workspace.root.clone(),
-                title: tab.workspace.title.clone(),
-                reason,
-            }),
+            Some(reason) => log::info!(
+                "close: leaving worktree {} in place ({reason})",
+                w.path.display()
+            ),
         }
     }
 
@@ -2897,13 +2940,18 @@ impl eframe::App for App {
         {
             self.new_workspace = None;
         }
-        // Esc on the dirty-worktree modal keeps it on disk (the safe choice).
+        // Esc on the dirty-worktree modal archives the workspace (the safe
+        // choice), matching the modal's default button.
         if !self.confirm_worktree.is_empty()
             && ctx.input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
             })
         {
-            self.confirm_worktree.remove(0);
+            let c = self.confirm_worktree.remove(0);
+            if let Some(i) = self.tabs.iter().position(|t| t.tab_id == c.tab_id)
+            {
+                self.archive_tab(ctx, i);
+            }
         }
         // Open/close the bar *before* search_intercept: cmd+f is already
         // consumed above, but the bar only starts intercepting once it is
@@ -3405,25 +3453,38 @@ impl eframe::App for App {
             }
         }
 
-        // The dirty-worktree confirmation from a tab close (one at a time).
+        // The dirty-worktree confirmation from a deferred tab close (one at a
+        // time). The tab is still live: Delete closes it and removes the
+        // worktree; Archive parks the workspace with its worktree intact.
         if let Some(c) = self.confirm_worktree.first() {
-            match workspace_popup::confirm_worktree_delete(
+            let outcome = workspace_popup::confirm_worktree_delete(
                 ctx,
                 &c.title,
                 &c.path.display().to_string(),
                 &c.reason,
                 &self.ui_theme,
                 &self.font,
-            ) {
-                workspace_popup::ConfirmOutcome::Delete => {
-                    let c = self.confirm_worktree.remove(0);
-                    workspace::spawn_worktree_removal(c.path, c.root);
-                },
-                // Keep leaves it on disk (the pre-confirmation behavior).
-                workspace_popup::ConfirmOutcome::Keep => {
-                    self.confirm_worktree.remove(0);
-                },
-                workspace_popup::ConfirmOutcome::None => {},
+            );
+            let decided = !matches!(
+                outcome,
+                workspace_popup::ConfirmOutcome::None
+            );
+            if decided {
+                let c = self.confirm_worktree.remove(0);
+                if let Some(i) =
+                    self.tabs.iter().position(|t| t.tab_id == c.tab_id)
+                {
+                    match outcome {
+                        workspace_popup::ConfirmOutcome::Delete => {
+                            self.remove_tab_and_worktree(ctx, i)
+                        },
+                        // Archive keeps the workspace and its worktree.
+                        workspace_popup::ConfirmOutcome::Keep => {
+                            self.archive_tab(ctx, i)
+                        },
+                        workspace_popup::ConfirmOutcome::None => {},
+                    }
+                }
             }
         }
 

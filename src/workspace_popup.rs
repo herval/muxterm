@@ -444,12 +444,13 @@ pub fn show(
     outcome
 }
 
-/// A small modal asking whether to delete a just-closed tab's worktree that
-/// still holds uncommitted work, or keep it on disk. Painted in the same
-/// panel idiom as the creation popup. Deleting is the deliberate click and is
-/// never the keyboard default; Esc keeps (wired by the App), so the safe
-/// choice needs no press. `git worktree remove` keeps the branch - only the
-/// working dir and its uncommitted changes go.
+/// A small modal, shown when closing a tab whose worktree still holds
+/// uncommitted work, offering to archive the workspace (keeping it and its
+/// worktree) or delete it. Painted in the same panel idiom as the creation
+/// popup. Deleting is the deliberate click and is never the keyboard default;
+/// Esc archives (wired by the App), so the safe choice needs no press. `git
+/// worktree remove` keeps the branch - only the working dir and its
+/// uncommitted changes go.
 pub fn confirm_worktree_delete(
     ctx: &egui::Context,
     title: &str,
@@ -487,7 +488,7 @@ pub fn confirm_worktree_delete(
         .show(ctx, |ui| {
             ui.set_width(432.0);
             ui.spacing_mut().item_spacing = Vec2::new(0.0, 6.0);
-            panel.divider(ui, "[ Keep or delete worktree? ]", th.accent);
+            panel.divider(ui, "[ Archive or delete? ]", th.accent);
             ui.add_space(2.0);
             panel.row(
                 ui,
@@ -503,7 +504,15 @@ pub fn confirm_worktree_delete(
             panel.row(
                 ui,
                 vec![(
-                    "Deleting discards those uncommitted changes.".into(),
+                    "Archive keeps the workspace and its worktree.".into(),
+                    th.text_dim,
+                )],
+                false,
+            );
+            panel.row(
+                ui,
+                vec![(
+                    "Delete discards those uncommitted changes.".into(),
                     th.text_dim,
                 )],
                 false,
@@ -523,14 +532,15 @@ pub fn confirm_worktree_delete(
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        if panel.button(ui, "[ Keep ]", true, true).clicked() {
+                        if panel.button(ui, "[ Archive ]", true, true).clicked()
+                        {
                             outcome = ConfirmOutcome::Keep;
                         }
                     },
                 );
             });
             ui.add_space(4.0);
-            panel.divider(ui, "esc keeps it on disk", th.text_dim);
+            panel.divider(ui, "esc archives", th.text_dim);
         });
     outcome
 }
@@ -1140,12 +1150,12 @@ mod tests {
         }
         let joined = texts.join("\u{1}");
         for needle in [
-            "[ Keep or delete worktree? ]",
+            "[ Archive or delete? ]",
             "brisk-otter",
             "uncommitted changes (3 entries)",
             "[ Delete worktree ]",
-            "[ Keep ]",
-            "esc keeps it on disk",
+            "[ Archive ]",
+            "esc archives",
         ] {
             assert!(
                 joined.contains(needle),
