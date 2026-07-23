@@ -3098,16 +3098,19 @@ impl eframe::App for App {
                         // Don't echo a title that already is the folder name
                         // (a rename can make them coincide).
                         .filter(|s| *s != ws.title);
-                    // The dot reflects *AI agents only*, self-reported
-                    // through their lifecycle hooks (`mux agent-event`, see
-                    // agent_hooks.rs): "working" while a turn runs (even
-                    // silent thinking), "attention" when the agent stopped
-                    // for a permission/notification. Non-agent programs never
-                    // light it. "Blocked" also covers a pane raising its hand
-                    // (bell / `mux notify`), and outranks working. "Background"
-                    // is the one derived state: an idle agent whose
-                    // run_in_background shell still lives under the pane's
-                    // process tree (bg_jobs.rs) - no hook exists for those.
+                    // The dot is *AI-agent-first*, self-reported through the
+                    // lifecycle hooks (`mux agent-event`, see agent_hooks.rs):
+                    // "working" while a turn runs (even silent thinking),
+                    // "attention" when the agent stopped for a
+                    // permission/notification. "Blocked" also covers a pane
+                    // raising its hand (bell / `mux notify`), and outranks
+                    // working. "Background" is a derived state: an idle agent
+                    // whose run_in_background shell still lives under the
+                    // pane's process tree (bg_jobs.rs) - no hook exists for
+                    // those. Below every agent signal, "Command" lights amber
+                    // for a plain non-agent foreground tool (a build, a dev
+                    // server, vim - `running_command`); a bare shell prompt
+                    // stays Idle.
                     let hook_state = |wanted: &str| {
                         tab.panes.values().any(|p| {
                             self.agent_states
@@ -3129,6 +3132,13 @@ impl eframe::App for App {
                         .any(|p| self.bg_jobs.contains(&p.session))
                     {
                         sidebar::Status::Background
+                    } else if tab.panes.values().any(|p| {
+                        running_command(
+                            self.agent_states.get(&p.session),
+                            self.pane_snap.get(&p.session),
+                        )
+                    }) {
+                        sidebar::Status::Command
                     } else {
                         sidebar::Status::Idle
                     };
@@ -4251,6 +4261,18 @@ fn show_node(
 /// visible index to its left, else the nearest to its right, else None (it was
 /// the last visible tab, so the caller spawns a fresh one). `visible` is the
 /// post-archive visible list — ascending and not containing `removed`.
+/// A pane running a non-agent foreground command (a build, a dev server,
+/// vim): it has no agent lifecycle state - so an *idle* agent, whose
+/// foreground is its own non-shell CLI, keeps the agent icon rather than
+/// flashing this - and its foreground isn't a bare shell. Pure so the join
+/// logic unit-tests without tmux or the poll tick.
+fn running_command(
+    agent_state: Option<&mesh::AgentState>,
+    snap: Option<&tmux::PaneSnap>,
+) -> bool {
+    agent_state.is_none() && snap.is_some_and(|s| !tmux::is_shell(&s.cmd))
+}
+
 fn nearest_visible(visible: &[usize], removed: usize) -> Option<usize> {
     visible
         .iter()
@@ -4317,6 +4339,29 @@ impl eframe::App for ErrorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_command_is_non_agent_non_shell_foreground() {
+        let snap = |cmd: &str| tmux::PaneSnap {
+            cmd: cmd.into(),
+            cwd: None,
+            pid: Some(1),
+            activity: None,
+        };
+        let agent = mesh::AgentState { state: "idle".into(), ts: 0 };
+
+        // A running tool with no agent state: lights the command dot.
+        assert!(running_command(None, Some(&snap("vim"))));
+        assert!(running_command(None, Some(&snap("node"))));
+        // A bare shell prompt is not a running command.
+        assert!(!running_command(None, Some(&snap("zsh"))));
+        assert!(!running_command(None, Some(&snap("-bash"))));
+        // An agent pane keeps its own icon even though its CLI is non-shell -
+        // the idle agent's foreground is `claude`, not a shell.
+        assert!(!running_command(Some(&agent), Some(&snap("claude"))));
+        // No snapshot yet (a just-spawned session): nothing to show.
+        assert!(!running_command(None, None));
+    }
 
     #[test]
     fn tab_labels() {

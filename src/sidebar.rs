@@ -50,6 +50,10 @@ pub enum Status {
     Working,
     /// An agent raised its hand / rang the bell and is waiting: steady red.
     Blocked,
+    /// A non-agent foreground process (a shell command / tool - a build, a
+    /// dev server, vim) is running: a pulsating amber square. Ranks below
+    /// every agent-derived state, so agent runs keep their own icon.
+    Command,
 }
 
 /// One row's render data. `tab_index` maps back to `App.tabs` so click order
@@ -215,6 +219,7 @@ fn pulse(bright: Color32, bg: Color32, time: Option<f64>) -> Color32 {
 ///   runs, but not the agent's own turn.
 /// - Working: a filled play-triangle breathing green (`pulse`).
 /// - Blocked: a steady red exclamation mark (bar + dot).
+/// - Command: a filled amber square breathing (`pulse`) - a non-agent tool.
 fn status_icon(
     painter: &egui::Painter,
     center: Pos2,
@@ -266,6 +271,13 @@ fn status_icon(
                 Pos2::new(center.x, center.y + r * 0.85),
                 w * 1.2,
                 t.status_err,
+            );
+        },
+        Status::Command => {
+            painter.rect_filled(
+                Rect::from_center_size(center, Vec2::splat(r * 1.5)),
+                CornerRadius::same(1),
+                pulse(t.status_warn, t.bg, time),
             );
         },
     }
@@ -379,8 +391,10 @@ fn workspace_row(
     // display refresh rate more or less permanently - even sitting behind
     // other windows. Unfocused, the triangle holds steady and the light
     // stays honest via the App's idle heartbeat and PTY-event repaints.
-    let animate = matches!(row.status, Status::Working | Status::Background)
-        && ui.input(|i| i.focused);
+    let animate = matches!(
+        row.status,
+        Status::Working | Status::Background | Status::Command
+    ) && ui.input(|i| i.focused);
     if animate {
         ui.ctx().request_repaint_after(PULSE_FRAME);
     }
@@ -535,8 +549,8 @@ mod tests {
     /// actually paints: idle's hollow ring (stroked, unfilled circle),
     /// working's play-triangle (filled path), background's hollow triangle
     /// (stroked, unfilled path), blocked's red exclamation (a
-    /// status_err-filled circle for its dot). Guards the "shape, not
-    /// just color" contract.
+    /// status_err-filled circle for its dot), command's amber square (a
+    /// status_warn-filled rect). Guards the "shape, not just color" contract.
     #[test]
     fn sidebar_paints_distinct_status_shapes() {
         let ctx = egui::Context::default();
@@ -580,6 +594,15 @@ mod tests {
                 archived: false,
                 delete_armed: false,
             },
+            Row {
+                tab_index: 4,
+                title: "cmd-ws".into(),
+                subtitle: None,
+                active: false,
+                status: Status::Command,
+                archived: false,
+                delete_armed: false,
+            },
         ];
 
         let input = egui::RawInput {
@@ -587,6 +610,9 @@ mod tests {
                 egui::Pos2::ZERO,
                 Vec2::new(900.0, 700.0),
             )),
+            // Unfocused holds every pulse at its bright base, so the breathing
+            // icons paint their exact theme color (amber square == status_warn).
+            focused: false,
             ..Default::default()
         };
         let mut frame = |ctx: &egui::Context| {
@@ -607,7 +633,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\u{1}");
-        for title in ["resting-ws", "busy-ws", "stuck-ws", "bg-ws"] {
+        for title in ["resting-ws", "busy-ws", "stuck-ws", "bg-ws", "cmd-ws"] {
             assert!(texts.contains(title), "missing {title:?} in {texts:?}");
         }
 
@@ -625,10 +651,14 @@ mod tests {
         let bang_dot = shapes.iter().any(|s| {
             matches!(s, egui::Shape::Circle(c) if c.fill == th.status_err)
         });
+        let amber_square = shapes.iter().any(|s| {
+            matches!(s, egui::Shape::Rect(r) if r.fill == th.status_warn)
+        });
         assert!(ring, "idle ring not painted");
         assert!(triangle, "working play-triangle not painted");
         assert!(hollow_triangle, "background hollow triangle not painted");
         assert!(bang_dot, "blocked exclamation dot not painted");
+        assert!(amber_square, "command amber square not painted");
     }
 
     /// Folding the archived pile hides its rows but keeps the header, and
@@ -716,7 +746,7 @@ mod tests {
         let preset = theme::preset("iterm-dark").unwrap();
         let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
         let font = FontId::monospace(14.0);
-        for status in [Status::Working, Status::Background] {
+        for status in [Status::Working, Status::Background, Status::Command] {
             let rows = vec![Row {
                 tab_index: 0,
                 title: "busy-ws".into(),
