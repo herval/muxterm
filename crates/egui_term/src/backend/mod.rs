@@ -183,6 +183,23 @@ pub struct TerminalBackend {
     /// existence-check candidates in order, pick an opener); without one,
     /// candidates fall back to `open::that` until one succeeds.
     link_opener: Option<Box<dyn Fn(&[String]) + Send + Sync>>,
+    /// muxterm patch P28: would the app open this candidate? P20 hands back
+    /// guesses, and the opener picks the first that resolves - without this
+    /// the hover underline showed the *longest* guess instead, so it
+    /// regularly covered more (or, before P27, less) than the click opens.
+    /// Only the app can answer: resolving a path needs the pane's cwd.
+    /// `None` (the standalone widget) keeps the longest-wins behavior.
+    link_validator: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>,
+    /// muxterm patch P28: the last hover resolution, keyed by the grid
+    /// point and the `generation` it was computed against. The view
+    /// re-issues Hover every frame while cmd is held, so without this the
+    /// regex sweep - and the validator's filesystem checks - would run at
+    /// frame rate under a motionless pointer. Dropped on Clear (which the
+    /// view issues only when something *was* underlined), so a hit
+    /// re-resolves on the next cmd-press while a miss rides the generation:
+    /// a file appearing under a hovered path relights it as soon as the
+    /// pane prints anything, which in a terminal is the same moment.
+    link_hover_memo: Option<(Point, u64, Option<RangeInclusive<Point>>)>,
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
     notifier: Notifier,
@@ -321,6 +338,8 @@ impl TerminalBackend {
             pr_regex: pr_regex(),
             pr_links: None,
             link_opener: None,
+            link_validator: None,
+            link_hover_memo: None,
             term: term.clone(),
             size: terminal_size,
             notifier,
@@ -465,6 +484,25 @@ impl TerminalBackend {
         self.link_opener = Some(Box::new(opener));
     }
 
+    /// muxterm patch P28: register the app's link validator (see the
+    /// field). Called per hovered candidate, so it must be cheap - the app
+    /// answers from its cached pane cwd plus a `Path::exists`, never a
+    /// subprocess.
+    pub fn set_link_validator(
+        &mut self,
+        valid: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) {
+        self.link_validator = Some(Box::new(valid));
+    }
+
+    /// muxterm patch P28: this pane's [`link_pick`].
+    fn link_pick(
+        &self,
+        cands: &[(String, RangeInclusive<Point>)],
+    ) -> Option<RangeInclusive<Point>> {
+        link_pick(self.link_validator.as_deref(), cands)
+    }
+
     /// muxterm patch P26: drop the local selection. The app calls this after
     /// its scroll-intercept has recreated the selection in tmux copy-mode (so
     /// it survives the wheel repaint) - clearing the local one drops the stale
@@ -490,7 +528,10 @@ impl TerminalBackend {
 
     /// muxterm patch P10: is there a URL or path-shaped token under this
     /// grid point right now? The view asks at press time to decide whether
-    /// a cmd+click bypasses tmux mouse reporting.
+    /// a cmd+click bypasses tmux mouse reporting. P28: judged by the same
+    /// pick hover underlines, so a cmd+click on a token that would open
+    /// nothing falls through to normal mouse handling instead of being
+    /// swallowed for nothing.
     pub fn has_link_at(&self, point: Point) -> bool {
         let terminal = self.term.lock();
         link_match_at(
@@ -500,6 +541,7 @@ impl TerminalBackend {
             &self.path_regex,
             self.pr_param(),
         )
+        .and_then(|cands| self.link_pick(&cands))
         .is_some()
     }
 
@@ -512,23 +554,45 @@ impl TerminalBackend {
         match link_action {
             LinkAction::Hover => {
                 // muxterm patch P10: paths hover like URLs, URLs win ties.
-                self.last_content.hovered_hyperlink = link_match_at(
-                    terminal,
-                    point,
-                    &self.url_regex,
-                    &self.path_regex,
-                    self.pr_param(),
-                )
-                .map(|(_, range)| range);
+                // P28: the app picks which candidate is real, and the memo
+                // keeps that off the per-frame path (see the fields).
+                let generation = self.generation;
+                let memo = self
+                    .link_hover_memo
+                    .as_ref()
+                    .filter(|(p, g, _)| *p == point && *g == generation)
+                    .map(|(_, _, hit)| hit.clone());
+                let hit = match memo {
+                    Some(hit) => hit,
+                    None => {
+                        let hit = link_match_at(
+                            terminal,
+                            point,
+                            &self.url_regex,
+                            &self.path_regex,
+                            self.pr_param(),
+                        )
+                        .and_then(|cands| self.link_pick(&cands));
+                        self.link_hover_memo =
+                            Some((point, generation, hit.clone()));
+                        hit
+                    },
+                };
+                self.last_content.hovered_hyperlink = hit;
             },
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
+                self.link_hover_memo = None;
             },
             LinkAction::Open => {
                 // muxterm patch P10: resolve the match at the clicked point
                 // from the live terminal instead of trusting the last hover
                 // (which may be stale or unset if the mouse never moved),
                 // and never panic on a failed open.
+                // P28: the whole candidate list still goes to the opener,
+                // not just the validated pick - the opener re-checks against
+                // a freshly fetched cwd, and a stale snapshot must not cost
+                // a click.
                 let texts = link_match_at(
                     terminal,
                     point,
@@ -536,7 +600,9 @@ impl TerminalBackend {
                     &self.path_regex,
                     self.pr_param(),
                 )
-                .map(|(texts, _)| texts);
+                .map(|cands| {
+                    cands.into_iter().map(|(text, _)| text).collect::<Vec<_>>()
+                });
                 if let Some(texts) = texts {
                     match &self.link_opener {
                         Some(opener) => opener(&texts),
@@ -855,6 +921,27 @@ fn logical_line<T: EventListener>(
 /// wrap join may chain together (a path rarely spans more than three rows).
 const JOIN_CAP: usize = 6;
 
+/// muxterm patch P27: a TUI gutter glyph - the marker an agent CLI prints
+/// in front of a continuation or leaf row (codex `| `, claude code `⎿ `,
+/// tree-drawn `└ `/`├ `/`│ `). Box drawing and block elements
+/// (U+2500..U+259F) plus the ASCII pipe and `⎿` (U+23BF).
+fn is_gutter_char(c: char) -> bool {
+    matches!(c, '|' | '⎿') || ('\u{2500}'..='\u{259F}').contains(&c)
+}
+
+/// muxterm patch P27: index of the first run that is not pure gutter -
+/// where the line's content actually starts (`runs.len()` for an
+/// all-gutter line). A gutter is chrome, not text: it belongs to no token,
+/// so it must neither be chained into a wrap join (the glyph is outside
+/// every token's char class, so leaving it in kills the match) nor count
+/// toward the "lone indented run" test that decides whether the chain
+/// keeps walking.
+fn content_head(chars: &[char], runs: &[(usize, usize)]) -> usize {
+    runs.iter()
+        .position(|&(s, e)| !chars[s..e].iter().copied().all(is_gutter_char))
+        .unwrap_or(runs.len())
+}
+
 /// muxterm patch P20: the [start, end) char spans of the maximal
 /// non-whitespace runs of `chars`.
 fn runs_of(chars: &[char]) -> Vec<(usize, usize)> {
@@ -897,13 +984,17 @@ fn runs_of(chars: &[char]) -> Vec<(usize, usize)> {
 /// check, and gluing the next line's word onto a URL would open a wrong
 /// address. Within one logical line (P19) the text really is contiguous,
 /// so URLs still span soft wraps.
+///
+/// muxterm patch P28: each candidate keeps its own grid span, so hover can
+/// underline the one the app says will actually open rather than the
+/// longest guess (`TerminalBackend::link_pick`).
 fn link_match_at<T: EventListener>(
     term: &Term<T>,
     point: Point,
     url_regex: &regex::Regex,
     path_regex: &regex::Regex,
     pr: Option<(&regex::Regex, &HashSet<u64>)>,
-) -> Option<(Vec<String>, RangeInclusive<Point>)> {
+) -> Option<Vec<(String, RangeInclusive<Point>)>> {
     let (ltext, lpoints) = logical_line(term, point.line);
     let lchars: Vec<char> = ltext.chars().collect();
     // Char index of the clicked cell within the reconstructed line.
@@ -924,23 +1015,31 @@ fn link_match_at<T: EventListener>(
 
     // A run only counts as a wrap *continuation* when it is indented: a
     // boxed TUI indents the rows it wraps onto, while flush-left runs are
-    // separate items (a find/ls column of paths must not glue).
+    // separate items (a find/ls column of paths must not glue). Leading
+    // gutter runs are skipped throughout (P27): codex prefixes every
+    // continuation row of a wrapped command with `| `, which is chrome -
+    // it is neither the line's first token nor a reason to stop chaining.
 
     // Backward: an indented run that starts its line may continue the
     // previous line's trailing run. Keep walking only through lines that
     // are themselves a lone indented run (a pure middle segment); the
     // head line ends the walk.
-    let mut continues = ci == 0 && runs[ci].0 > 0;
+    let mut continues = ci == content_head(&lchars, &runs) && runs[ci].0 > 0;
     let mut top = lpoints[0].line;
     while continues && chain.len() < JOIN_CAP && top > term.topmost_line() {
         let (ptext, ppoints) = logical_line(term, top - 1i32);
         let pchars: Vec<char> = ptext.chars().collect();
         let pruns = runs_of(&pchars);
-        let Some(&last) = pruns.last() else { break };
+        let phead = content_head(&pchars, &pruns);
+        // An all-gutter line carries no token to continue from.
+        if phead == pruns.len() {
+            break;
+        }
+        let last = pruns[pruns.len() - 1];
         top = ppoints[0].line;
         chain.insert(0, run(&pchars, &ppoints, last));
         clicked += 1;
-        continues = pruns.len() == 1 && last.0 > 0;
+        continues = pruns.len() - phead == 1 && last.0 > 0;
     }
 
     // Forward: a run that ends its line may wrap onto the next line's
@@ -952,13 +1051,14 @@ fn link_match_at<T: EventListener>(
         let (ntext, npoints) = logical_line(term, bottom + 1i32);
         let nchars: Vec<char> = ntext.chars().collect();
         let nruns = runs_of(&nchars);
-        let Some(&first) = nruns.first() else { break };
+        let nhead = content_head(&nchars, &nruns);
+        let Some(&first) = nruns.get(nhead) else { break };
         if first.0 == 0 {
             break;
         }
         bottom = npoints[npoints.len() - 1].line;
         chain.push(run(&nchars, &npoints, first));
-        continues = nruns.len() == 1;
+        continues = nruns.len() - nhead == 1;
     }
 
     // Every contiguous sub-chain around the clicked run is a candidate
@@ -1032,17 +1132,32 @@ fn link_match_at<T: EventListener>(
         }
     }
 
-    // Longest match first; hover shows the best candidate's span.
+    // Longest match first, deduped by text - the order the opener walks.
     cands.sort_by_key(|(t, _)| std::cmp::Reverse(t.chars().count()));
-    let mut texts: Vec<String> = Vec::new();
-    let mut span = None;
-    for (text, s) in cands {
-        if !texts.contains(&text) {
-            span.get_or_insert(s);
-            texts.push(text);
+    let mut out: Vec<(String, RangeInclusive<Point>)> = Vec::new();
+    for (text, span) in cands {
+        if !out.iter().any(|(t, _)| *t == text) {
+            out.push((text, span));
         }
     }
-    Some((texts, span?))
+    (!out.is_empty()).then_some(out)
+}
+
+/// muxterm patch P28: the span of the candidate the app would open - the
+/// first the validator accepts, or the longest when no validator is
+/// registered. Underlining this instead of the longest guess is what keeps
+/// the hover highlight and the click in agreement: P20's joins are guesses,
+/// and the longest one regularly reaches past what actually resolves (a
+/// path glued to the next row's first word).
+fn link_pick(
+    validator: Option<&(dyn Fn(&str) -> bool + Send + Sync)>,
+    cands: &[(String, RangeInclusive<Point>)],
+) -> Option<RangeInclusive<Point>> {
+    match validator {
+        Some(valid) => cands.iter().find(|(t, _)| valid(t)),
+        None => cands.first(),
+    }
+    .map(|(_, span)| span.clone())
 }
 
 pub struct RenderableContent {
@@ -1103,7 +1218,7 @@ mod tests {
             &path_regex(),
             None,
         )
-        .map(|(texts, _)| texts)
+        .map(|cands| cands.into_iter().map(|(text, _)| text).collect())
     }
 
     /// The best link text found when clicking (line, col) of `content`.
@@ -1128,7 +1243,7 @@ mod tests {
             &path_regex(),
             Some((&pr_regex(), &set)),
         )
-        .map(|(mut texts, _)| texts.remove(0))
+        .map(|mut cands| cands.remove(0).0)
     }
 
     #[test]
@@ -1353,6 +1468,84 @@ mod tests {
             link_candidates(content, 1, 3),
             Some(vec!["src/b.rs".into()])
         );
+    }
+
+    // muxterm patch P27: codex prefixes every continuation row of a wrapped
+    // command with a `| ` gutter. The glyph is in no token's char class, so
+    // chaining it in truncated the match at the wrap point, and it also
+    // held index 0 - which the backward walk reads as "this run starts its
+    // line" - so the continuation never chained back to its head either.
+    #[test]
+    fn gutter_prefixed_wraps_join_from_both_ends() {
+        let content =
+            "Ran cp /private/tmp/link\r\n  | ed/deep/file.png dest here x";
+        let joined = "/private/tmp/linked/deep/file.png";
+        // The head, which used to stop dead at the gutter.
+        assert!(link_candidates(content, 0, 9).unwrap().contains(&joined.into()));
+        // The continuation, which used to not chain backwards at all.
+        assert!(link_candidates(content, 1, 6).unwrap().contains(&joined.into()));
+    }
+
+    // muxterm patch P27: a gutter run is dropped, never chained - a joined
+    // candidate must not carry the glyph.
+    #[test]
+    fn gutter_glyphs_never_enter_a_candidate() {
+        for content in [
+            "cp /tmp/aa\r\n  | bb/cc.png x y",
+            "cp /tmp/aa\r\n  └ bb/cc.png x y",
+            "cp /tmp/aa\r\n  ⎿ bb/cc.png x y",
+            "cp /tmp/aa\r\n  │ bb/cc.png x y",
+        ] {
+            let cands = link_candidates(content, 0, 5).unwrap();
+            assert!(
+                cands.iter().all(|c| !c.chars().any(is_gutter_char)),
+                "gutter leaked into {cands:?} for {content:?}"
+            );
+            assert!(
+                cands.contains(&"/tmp/aabb/cc.png".to_string()),
+                "no join in {cands:?} for {content:?}"
+            );
+        }
+    }
+
+    // muxterm patch P27: a gutter is chrome, so a `└ `-marked leaf row is
+    // still a lone run for the chain-walk test - and its own path matches
+    // whole regardless.
+    #[test]
+    fn leaf_marked_paths_match_alone() {
+        let content = "  └ /private/tmp/out.png\r\n     pixelWidth: 1254 xxxx";
+        let cands = link_candidates(content, 0, 10).unwrap();
+        assert!(cands.contains(&"/private/tmp/out.png".to_string()));
+    }
+
+    // muxterm patch P28: hover underlines the candidate the app says will
+    // open, not the longest guess P20 produced. Here the longest one glues
+    // the next row's first word onto the path - the wart P20 documented.
+    #[test]
+    fn the_validator_picks_the_hover_span() {
+        let content = "  └ /private/tmp/out.png\r\n     pixelWidth: 1254 xxxx";
+        let cands = link_match_at(
+            &mock_term(content),
+            Point::new(Line(0), Column(10)),
+            &url_regex(),
+            &path_regex(),
+            None,
+        )
+        .unwrap();
+        let path = "/private/tmp/out.png";
+        assert!(cands[0].0.len() > path.len(), "in {cands:?}");
+
+        // No validator: longest wins, and its span reaches onto row 1.
+        assert_eq!(link_pick(None, &cands).unwrap().end().line, Line(1));
+
+        // With one: exactly the path's cells, row 0 only.
+        let real = |t: &str| t == path;
+        let span = link_pick(Some(&real), &cands).unwrap();
+        assert_eq!(span.start(), &Point::new(Line(0), Column(4)));
+        assert_eq!(span.end(), &Point::new(Line(0), Column(3 + path.len())));
+
+        // Nothing validates - nothing underlines (`and/or` goes quiet).
+        assert_eq!(link_pick(Some(&|_: &str| false), &cands), None);
     }
 
     // muxterm patch P20: URLs open without an existence check, so they must

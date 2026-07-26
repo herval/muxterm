@@ -190,9 +190,11 @@ tmux-backed design. Local patches:
   guessed join (multi-run sub-chains are path-only): URLs open without an
   existence check, and gluing the next line's word onto one would open a
   wrong address - within a P19 logical line the text is genuinely
-  contiguous, so URLs still span real soft wraps. Hover highlights the best
-  candidate's span, which can overreach into the next line's first word for
-  prose; the same wart family as P10's `and/or` (highlights, opens nothing).
+  contiguous, so URLs still span real soft wraps. Hover originally
+  highlighted the *longest* candidate's span, which overreached into the
+  next line's first word for prose (the same wart family as P10's `and/or`:
+  highlights, opens nothing) - **P28 fixes both**, by asking the app which
+  candidate actually resolves.
 - **P21** (`src/backend/mod.rs`, `src/lib.rs`, pty event subscription
   thread): visibility-aware repaint gating. Upstream requested an
   unconditional `request_repaint()` per PTY event, so output on any pane -
@@ -285,3 +287,43 @@ tmux-backed design. Local patches:
   wheel sees no local selection and forwards normally, tmux keeping its
   own copy-mode selection). `&self` suffices - the selection lives behind
   the term lock, like the existing selection setters.
+- **P27** (`src/backend/mod.rs`, `is_gutter_char`, `content_head`,
+  `link_match_at`): gutter-aware wrap joining. Agent CLIs print wrapped
+  output inside a box and prefix every continuation row with a gutter glyph
+  - codex `| `, claude code `⎿ `, tree-drawn `└ `/`├ `/`│ `. P20 chains
+  whitespace-delimited *runs* across rows, and the gutter was a run like any
+  other, so a path codex hard-wrapped broke twice over: chaining the glyph
+  into the joined text truncated the match at the wrap point (no token's
+  char class contains `|`), and the glyph holding run index 0 made the
+  backward walk's "this run starts its line" test fail, so the continuation
+  never chained back to its head at all - it stayed a bare-relative token
+  that resolved to nothing and clicked to nothing. A run of pure gutter
+  chars (U+2500..U+259F box drawing and block elements, plus `|` and
+  `⎿`) is now chrome: `content_head` skips any leading gutter runs, so
+  they are dropped from the chain rather than joined into it, and they do
+  not count toward the "lone indented run" test that decides whether the
+  chain keeps walking. The indent rule P20 rests on is untouched (a
+  flush-left column of paths still does not glue).
+- **P28** (`src/backend/mod.rs`, `link_match_at`, `link_pick`,
+  `set_link_validator`, `link_hover_memo`): hover underlines what a click
+  opens. P20 hands back *guesses*, and the app opener walks them in order
+  and takes the first that resolves - but hover took the *longest*, so the
+  underline routinely disagreed with the click (covering a path plus the
+  next row's first word, or lighting up prose like `and/or` that opens
+  nothing). Only the app can settle it: resolving a path needs the pane's
+  cwd. `link_match_at` now returns every candidate *with its own grid span*
+  (it already computed them), and a new `set_link_validator` callback -
+  sibling to P10's `set_link_opener` - decides which one is real;
+  `link_pick` takes the first the validator accepts, falling back to
+  longest-wins when no validator is registered, so the widget still works
+  standalone. `has_link_at` (P10's cmd+click press-swallow gate) uses the
+  same pick, so a cmd+click on a dead token falls through to normal mouse
+  handling instead of being swallowed for nothing. `LinkAction::Open` still
+  hands the opener the *whole* candidate list - it re-checks against a
+  freshly fetched cwd, and a stale snapshot must not cost a click. Since
+  `view` re-issues Hover every frame while cmd is held, the resolution is
+  memoized on `(Point, generation)` and dropped on Clear (so every fresh
+  cmd-press re-resolves); this also takes P19/P20's per-frame regex sweep
+  off the hover path. muxterm implements the validator with
+  `links::resolve_target`, the same function the opener uses, answering
+  from the App's once-a-second pane-cwd snapshot rather than a tmux call.

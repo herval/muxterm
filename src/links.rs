@@ -6,6 +6,12 @@
 //! what filters both the regex's false positives (`and/or` in prose
 //! resolves to nothing) and bad wrap-join guesses (`src/app.rsand` loses
 //! to `src/app.rs`).
+//!
+//! P28 runs that same judgement on *hover*: `resolve_target` doubles as the
+//! widget's link validator, so the cmd-held underline covers exactly the
+//! candidate a click would open instead of P20's longest guess. The hover
+//! path answers from the App's cached pane cwd (`tmux::SharedPanes`, already
+//! refreshed once a second) rather than shelling out per frame.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,27 +34,15 @@ pub fn spawn_open(
     pr_base: Option<String>,
 ) {
     std::thread::spawn(move || {
-        if let Some(url) = pr_base
-            .as_deref()
-            .and_then(|base| texts.iter().find_map(|t| pr_url(t, base)))
-        {
-            let _ = Command::new("/usr/bin/open").arg(&url).status();
-            return;
-        }
-        // One cwd fetch serves every candidate.
+        // One cwd fetch serves every candidate; URLs and PR tokens need none.
         let cwd = texts
             .iter()
-            .any(|t| !is_url(t))
+            .any(|t| !is_url(t) && !is_pr_token(t))
             .then(|| tmux.pane_current_path(&session))
             .flatten();
         let home = std::env::var("HOME").ok();
         let target = texts.iter().find_map(|text| {
-            if is_url(text) {
-                Some(text.clone())
-            } else {
-                resolve_path(text, cwd.as_deref(), home.as_deref())
-                    .map(|p| p.display().to_string())
-            }
+            resolve_target(text, cwd.as_deref(), home.as_deref(), pr_base.as_deref())
         });
         if let Some(target) = target {
             // Every non-URL target is an absolute path (resolve_path
@@ -58,17 +52,45 @@ pub fn spawn_open(
     });
 }
 
+/// What `open` would be handed for this candidate, or None when the
+/// candidate means nothing: a known PR number first (egui_term P24 only
+/// emits `#N` for one), then a URL as-is, then a path that exists.
+///
+/// muxterm patch P28: also the hover validator (`set_link_validator`, wired
+/// in `app::create_pane`), so the underline shows exactly what a click will
+/// open. Both callers going through this one function is what keeps them
+/// from drifting.
+pub fn resolve_target(
+    text: &str,
+    cwd: Option<&str>,
+    home: Option<&str>,
+    pr_base: Option<&str>,
+) -> Option<String> {
+    if let Some(url) = pr_base.and_then(|base| pr_url(text, base)) {
+        return Some(url);
+    }
+    if is_url(text) {
+        return Some(text.to_string());
+    }
+    resolve_path(text, cwd, home).map(|p| p.display().to_string())
+}
+
 /// The repo web base of a PR URL, as GitHub's API hands them out:
 /// "https://github.com/owner/repo/pull/12" -> "https://github.com/owner/repo".
 pub fn pr_base(url: &str) -> Option<&str> {
     url.find("/pull/").map(|i| &url[..i])
 }
 
+/// A bare `#<digits>` token - egui_term P24 emits one only for a PR number
+/// the app registered, so its shape is the whole test.
+fn is_pr_token(text: &str) -> bool {
+    text.strip_prefix('#')
+        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// "#123" -> "<base>/pull/123"; any other token shape is None.
 fn pr_url(text: &str, base: &str) -> Option<String> {
-    let digits = text.strip_prefix('#')?;
-    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| format!("{base}/pull/{digits}"))
+    is_pr_token(text).then(|| format!("{base}/pull/{}", &text[1..]))
 }
 
 /// Mirrors the scheme list of egui_term's URL regex: text the widget
@@ -258,6 +280,37 @@ mod tests {
             Some(PathBuf::from("/repo/src/app.rs"))
         );
         assert_eq!(expand("src/app.rs", None, None), None);
+    }
+
+    // muxterm patch P28: the one judgement hover and click share.
+    #[test]
+    fn resolve_target_covers_prs_urls_and_paths() {
+        let dir = std::env::temp_dir().join("muxterm-links-target-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.rs"), "x").unwrap();
+        let cwd = dir.to_str().unwrap();
+        let base = Some("https://github.com/h/m");
+
+        // A known PR wins, and only with a base to build the URL from.
+        assert_eq!(
+            resolve_target("#12", None, None, base).as_deref(),
+            Some("https://github.com/h/m/pull/12")
+        );
+        assert_eq!(resolve_target("#12", None, None, None), None);
+        // URLs open as-is, no cwd needed.
+        assert_eq!(
+            resolve_target("https://x.com/a", None, None, None).as_deref(),
+            Some("https://x.com/a")
+        );
+        // Paths must exist - this is what filters P20's wrap-join guesses
+        // and prose false positives, on hover as well as on click.
+        assert_eq!(
+            resolve_target("app.rs:9", Some(cwd), None, None),
+            Some(dir.join("app.rs").display().to_string())
+        );
+        assert_eq!(resolve_target("and/or", Some(cwd), None, None), None);
+        assert_eq!(resolve_target("gone.rs", Some(cwd), None, None), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

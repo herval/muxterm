@@ -553,6 +553,32 @@ impl App {
                 base,
             )
         });
+        // egui_term P28: the same judgement, on hover - the underline covers
+        // the candidate a click would open instead of P20's longest guess.
+        // It runs per hovered candidate, so the cwd comes from the poll
+        // tick's snapshot (already refreshed once a second for the sidebar
+        // dots) rather than a tmux call; a pane younger than one tick has
+        // none yet, so its relative paths stay unlit for that moment.
+        let (panes, hover_session) =
+            (self.pane_snap_shared.clone(), session.clone());
+        let pr_bases = self.pr_link_bases.clone();
+        let home = std::env::var("HOME").ok();
+        backend.set_link_validator(move |text| {
+            let base = pr_bases.lock().unwrap().get(&hover_session).cloned();
+            let cwd = panes
+                .lock()
+                .unwrap()
+                .get(&hover_session)
+                .and_then(|p| p.cwd.as_ref())
+                .map(|p| p.display().to_string());
+            crate::links::resolve_target(
+                text,
+                cwd.as_deref(),
+                home.as_deref(),
+                base.as_deref(),
+            )
+            .is_some()
+        });
         Ok(Pane {
             id,
             session,
