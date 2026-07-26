@@ -41,10 +41,12 @@ mux - agent mesh for muxterm panes (team = the panes of one tab)
 
 usage: mux [--as <session>] [--json] <command> [args]
 
-  ask [--agent <a>] [--model <m>] <question...>
-                               one-shot AI query (the \"? \" prompt backend);
-                               agent/model default to muxterm's config.toml,
-                               terminal context is read from stdin
+  ask [-i] [--agent <a>] [--model <m>] [<question...>]
+                               one-shot AI query; agent/model default to
+                               muxterm's config.toml, terminal context is
+                               read from stdin. -i is the interactive
+                               prompt muxterm's \"?\" key opens: question in,
+                               answer out, until ctrl+c/ctrl+d
   whoami                       your session, tab, and registered name
   join <name> [--role <r>] [--desc <t>]
                                register yourself in this tab's team
@@ -548,13 +550,21 @@ impl Scope {
 /// One-shot AI query - what a "?" submit in the GUI actually runs. Needs
 /// no tmux identity, so it also works from any plain terminal.
 fn cmd_ask(mut args: Vec<String>) -> CmdResult {
+    let interactive = take_flag(&mut args, "-i");
+    // Internal, set by the GUI's "?" prompt: where this command's own echo
+    // sits, so it can be wiped before the prompt takes over the pane.
+    let inline = take_opt(&mut args, "--inline")?;
+    // Before anything slow: the echoed command is on screen until this runs.
+    if let Some((up, col)) = inline.as_deref().and_then(ask::parse_inline) {
+        ask::erase_echo(up, col);
+    }
     let agent_flag = take_opt(&mut args, "--agent")?;
     let model_flag = take_opt(&mut args, "--model")?;
-    if args.is_empty() {
+    if args.is_empty() && !interactive {
         return Err((
             EXIT_USAGE,
             format!(
-                "usage: mux ask [--agent {}] [--model <m>] \
+                "usage: mux ask [-i] [--agent {}] [--model <m>] \
                  <question...>  (terminal context on stdin)",
                 muxterm::agent::ids().join("|")
             ),
@@ -577,7 +587,13 @@ fn cmd_ask(mut args: Vec<String>) -> CmdResult {
     };
     let model = model_flag.or(model);
 
-    let code = ask::run(agent, model.as_deref(), &query)
+    // -i: the pane's own AI prompt, looping until ctrl+c/ctrl+d. This is
+    // what the GUI's "?" types; a bare `mux ask <question>` stays the
+    // one-shot the mesh brief documents.
+    if interactive {
+        std::process::exit(ask::repl(agent, model));
+    }
+    let code = ask::run(agent, model.as_deref(), &query, None)
         .map_err(|e| (EXIT_NOT_FOUND, e))?;
     std::process::exit(code);
 }

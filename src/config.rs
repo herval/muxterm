@@ -40,7 +40,8 @@ agent = "{default}"
 # default; set one of its larger models to trade speed for depth.
 # agent_model = ""
 
-# Lines of pane scrollback sent to the agent as context (0 = none).
+# Lines of pane scrollback sent to the agent as context with each
+# question (0 = none). Read by `mux ask` itself, not the GUI.
 # agent_context_lines = 200
 
 # How much unfocused split panes fade toward the background (0.0 - 0.8).
@@ -119,7 +120,6 @@ pub struct ConfigFile {
     /// not the GUI.)
     pub agent: String,
     /// Lines of pane scrollback sent to the agent as context; 0 disables.
-    pub agent_context_lines: u32,
     /// 0.0 disables dimming of unfocused panes; 0.12 is the default wash.
     pub dim_inactive_panes: f32,
     /// Show each pane's title in its top-right corner when the tab is split.
@@ -166,7 +166,6 @@ impl Default for ConfigFile {
         Self {
             theme: "iterm-dark".into(),
             agent: agent::default_agent().id.into(),
-            agent_context_lines: 200,
             dim_inactive_panes: 0.12,
             pane_titles: true,
             copy_on_select: false,
@@ -201,7 +200,6 @@ pub struct Style {
     pub ui: UiTheme,
     pub font: FontId,
     pub agent: &'static Agent,
-    pub agent_context_lines: u32,
     pub pane_titles: bool,
     pub copy_on_select: bool,
     pub git_status: bool,
@@ -337,7 +335,6 @@ pub fn resolve(
             ui,
             font: FontId::monospace(size),
             agent,
-            agent_context_lines: cfg.agent_context_lines,
             pane_titles: cfg.pane_titles,
             copy_on_select: cfg.copy_on_select,
             git_status: cfg.git_status,

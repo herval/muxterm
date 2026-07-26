@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -18,7 +18,7 @@ use egui_term::{
 
 use muxterm::agent::{self, Agent};
 
-use crate::ai_prompt::{self, LineTracker, PromptMachine, Verdict};
+use crate::ai_prompt::{self, LineTracker, Verdict};
 use crate::attention;
 use crate::bg_jobs;
 use crate::config;
@@ -120,12 +120,9 @@ pub struct App {
     dirty: bool,
     config_mtime: Option<SystemTime>,
     last_config_check: Instant,
-    /// The "?" prompt line.
-    ai: PromptMachine,
     /// The cmd+f scrollback-search bar.
     search: SearchBar,
     agent: &'static Agent,
-    agent_context_lines: u32,
     /// Cache of `binary_available` probes; misses are evicted on failed
     /// submits so an install-then-retry works without a restart. Pre-warmed
     /// at startup by a background probe of every registry agent, so the
@@ -347,10 +344,8 @@ impl App {
             dirty: false,
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
-            ai: PromptMachine::default(),
             search: SearchBar::default(),
             agent: style.agent,
-            agent_context_lines: style.agent_context_lines,
             agent_ok: HashMap::new(),
             probe_rx,
             probe_tx,
@@ -2200,9 +2195,6 @@ impl App {
                 } else if !self.settings_open && self.new_workspace.is_none() {
                     if let Some(tab) = self.tabs.get(self.active) {
                         if tab.panes.contains_key(&tab.focused) {
-                            // The bar owns the keyboard; the "?" compose
-                            // line can't coexist with it.
-                            self.ai.cancel();
                             self.search.open(tab.focused);
                         }
                     }
@@ -2309,7 +2301,6 @@ impl App {
         self.theme_name = style.name;
         self.pane_titles = style.pane_titles;
         self.agent = style.agent;
-        self.agent_context_lines = style.agent_context_lines;
         self.pr_status = style.pr_status;
         self.pr_detector = style.pr_detector;
         // One poller serves both the chips and the `#123` links; it only
@@ -2469,10 +2460,12 @@ impl App {
         }
     }
 
-    /// Route keyboard events through the "?" prompt machine before any
-    /// TerminalView clones the frame's input. Events it consumes never
-    /// reach the PTY; a submit types the composed agent command into the
-    /// focused pane, with recent scrollback redirected to its stdin.
+    /// Watch the frame's keyboard input, before any TerminalView clones it,
+    /// for a '?' at an idle shell prompt. That one character is dropped and
+    /// `mux ask -i` typed in its place: the pane's own AI prompt, which owns
+    /// the keyboard from there until the user leaves it (ctrl+c / ctrl+d).
+    /// Nothing about the question - composing, editing, submitting - is the
+    /// GUI's business; this is the whole handoff.
     fn ai_intercept(&mut self, ctx: &egui::Context) {
         if self.settings_open
             || self.new_workspace.is_some()
@@ -2484,23 +2477,17 @@ impl App {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        // A peeked archived workspace is read-only: the "?" prompt must not
-        // arm or type `mux ask` into it.
+        // A peeked archived workspace is read-only: no typing into it.
         if tab.workspace.is_archived() {
-            self.ai.cancel();
             return;
         }
         let focused = tab.focused;
-        self.ai.sync(focused, tab.panes.contains_key(&focused));
         let Some(pane) = tab.panes.get(&focused) else {
             return;
         };
         let mut line = pane.line;
         let session = pane.session.clone();
 
-        // The machine is moved out so the event loop below doesn't have to
-        // borrow self while at_shell holds &self.tmux.
-        let mut machine = std::mem::take(&mut self.ai);
         let tmux = &self.tmux;
         let mut shell_state: Option<bool> = None;
         let mut at_shell = || {
@@ -2510,68 +2497,39 @@ impl App {
             })
         };
 
-        let mut writes: Vec<Vec<u8>> = Vec::new();
-        let mut submit: Option<String> = None;
+        let mut enter = false;
         ctx.input_mut(|i| {
             let events = std::mem::take(&mut i.events);
             let mut kept = Vec::with_capacity(events.len());
             for event in events {
-                match machine.on_event(
-                    &event,
-                    focused,
-                    &mut line,
-                    &mut at_shell,
-                ) {
+                match ai_prompt::on_event(&event, &mut line, &mut at_shell) {
                     Verdict::Pass => kept.push(event),
-                    Verdict::Consume => {},
-                    Verdict::Submit(query) => submit = Some(query),
+                    Verdict::Enter => enter = true,
                 }
             }
             i.events = kept;
         });
 
-        if let Some(query) = submit {
-            // Both binaries must exist: mux runs the query (streaming the
-            // agent's output), the agent CLI answers it.
-            let mut missing: Option<&'static str> = None;
-            for bin in ["mux", self.agent.bin] {
-                let ok = *self
-                    .agent_ok
-                    .entry(bin)
-                    .or_insert_with(|| agent::binary_available(bin));
-                if !ok {
-                    missing = Some(bin);
-                    break;
-                }
-            }
-            if let Some(bin) = missing {
-                self.agent_ok.remove(bin);
-                machine.set_error(format!("{bin} not found in PATH"));
-            } else {
-                let ctx_file = (self.agent_context_lines > 0)
-                    .then(|| {
-                        self.tmux
-                            .capture_pane(&session, self.agent_context_lines)
-                    })
-                    .flatten()
-                    .and_then(|capture| write_context_file(focused, &capture));
-                let mut cmd = agent::ask_command(&query, ctx_file.as_deref())
-                    .into_bytes();
-                cmd.push(b'\r');
-                writes.push(cmd);
-                machine.cancel();
-                line = LineTracker::Known(0);
-            }
-        }
+        // The typed command erases itself, so the prompt that comes up lands
+        // exactly where the '?' was and the pane reads as if the user had
+        // asked at their own shell prompt. Geometry the erase can't be
+        // trusted with just leaves the command visible above the prompt -
+        // cosmetic, and the prompt still works.
+        let write = enter.then(|| {
+            let geometry = self.tmux.cursor_and_size(&session);
+            let mut cmd = inline_ask_command(geometry).into_bytes();
+            cmd.push(b'\r');
+            line = LineTracker::Known(0);
+            cmd
+        });
 
-        self.ai = machine;
         if let Some(pane) = self
             .tabs
             .get_mut(self.active)
             .and_then(|tab| tab.panes.get_mut(&focused))
         {
             pane.line = line;
-            for bytes in writes {
+            if let Some(bytes) = write {
                 pane.backend.process_command(BackendCommand::Write(bytes));
             }
         }
@@ -3257,14 +3215,13 @@ impl eframe::App for App {
                     // A peeked archived workspace is a read-only preview: no
                     // pane is interactive and none holds keyboard focus.
                     let archived = tab.workspace.is_archived();
-                    // While settings, the "?" compose line, or the search
-                    // bar own the keyboard, the sentinel matches no pane,
-                    // so the terminal stops re-grabbing focus every frame.
+                    // While settings or the search bar own the keyboard,
+                    // the sentinel matches no pane, so the terminal stops
+                    // re-grabbing focus every frame.
                     let focused = if archived
                         || self.settings_open
                         || self.new_workspace.is_some()
                         || !self.confirm_worktree.is_empty()
-                        || self.ai.composing()
                         || self.search.active()
                     {
                         PaneId(u64::MAX)
@@ -3367,53 +3324,6 @@ impl eframe::App for App {
                                 ui,
                                 *rect,
                                 line,
-                                &self.ui_theme,
-                            );
-                        }
-                    }
-                    if let ai_prompt::State::Compose { buffer, error } =
-                        &self.ai.state
-                    {
-                        if let Some((rect, pane)) = self.ai.pane.and_then(|p| {
-                            Some((*rects.get(&p)?, tab.panes.get(&p)?))
-                        }) {
-                            // The grid sits inside the solid strip's inset;
-                            // caret math against the full pane claim would
-                            // land one strip-height off.
-                            let rect = bar_h
-                                .and_then(|h| {
-                                    split_bar(
-                                        rect,
-                                        self.ui_theme.bar_edge,
-                                        h,
-                                    )
-                                })
-                                .map_or(rect, |(_, term)| term);
-                            let content = pane.backend.last_content();
-                            let size = &content.terminal_size;
-                            let point = content.grid.cursor.point;
-                            let row = point.line.0
-                                + content.grid.display_offset() as i32;
-                            let caret = Rect::from_min_size(
-                                rect.min
-                                    + Vec2::new(
-                                        size.cell_width
-                                            * point.column.0 as f32,
-                                        size.cell_height * row as f32,
-                                    ),
-                                Vec2::new(
-                                    size.cell_width,
-                                    size.cell_height,
-                                ),
-                            );
-                            draw_ai_overlay(
-                                ui,
-                                rect,
-                                caret,
-                                buffer,
-                                error.as_deref(),
-                                self.agent,
-                                &self.font,
                                 &self.ui_theme,
                             );
                         }
@@ -3568,137 +3478,42 @@ fn canon(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Write the captured scrollback where the agent command's stdin
-/// redirection can read it. $TMPDIR is per-user private on macOS; the file
-/// is overwritten by the pane's next submit and never removed eagerly - the
-/// agent reads it while running.
-fn write_context_file(pane: PaneId, capture: &str) -> Option<PathBuf> {
-    let path =
-        std::env::temp_dir().join(format!("muxterm-ctx-{}.txt", pane.0));
-    let content = format!(
-        "Recent output of this terminal pane (oldest first):\n{capture}\n"
-    );
-    match fs::write(&path, content) {
-        Ok(()) => Some(path),
-        Err(e) => {
-            log::warn!("could not write agent context file: {e:#}");
-            None
-        },
-    }
+/// How many rows above the command's own line the shell's echo of it
+/// starts: the text runs from column `col` for `len` cells at `width`
+/// columns, and the Enter that launched it added the line below.
+fn echo_rows_up(col: u16, len: usize, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    ((col as usize + len.max(1) - 1) / width) as u16 + 1
 }
 
-/// The "?" compose line, drawn inline over the caret's row so the query
-/// reads as if typed at the shell prompt. `caret` is the terminal cursor
-/// cell in screen coordinates.
-fn draw_ai_overlay(
-    ui: &egui::Ui,
-    pane_rect: Rect,
-    caret: Rect,
-    buffer: &str,
-    error: Option<&str>,
-    agent: &Agent,
-    font: &FontId,
-    theme: &UiTheme,
-) {
-    let char_w = caret.width().max(1.0);
-    let row_h = caret.height().max(1.0);
-    // Scrollback can move the caret's row out of view, and a deep prompt
-    // can leave it hugging the right edge; pin the strip to the pane and
-    // keep at least a dozen cells of entry room.
-    let x = caret.min.x.clamp(
-        pane_rect.min.x,
-        (pane_rect.max.x - 12.0 * char_w).max(pane_rect.min.x),
-    );
-    let y = caret.min.y.clamp(
-        pane_rect.min.y,
-        (pane_rect.max.y - row_h).max(pane_rect.min.y),
-    );
-    let rect = Rect::from_min_max(
-        egui::pos2(x, y),
-        egui::pos2(pane_rect.max.x, y + row_h),
-    );
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect.expand2(Vec2::new(3.0, 2.0)).intersect(pane_rect),
-        CornerRadius::same(3),
-        theme::blend(theme.bg, theme.accent, 0.18),
-    );
-
-    let mid = rect.center().y;
-    let prefix =
-        painter.layout_no_wrap("? ".into(), font.clone(), theme.accent);
-    let text_left = rect.min.x + prefix.size().x;
-    painter.galley(
-        egui::pos2(rect.min.x, mid - prefix.size().y / 2.0),
-        prefix,
-        theme.accent,
-    );
-
-    // The hint yields when the row runs out of room, but an error always
-    // shows - it is the only feedback that a submit was rejected.
-    let (hint_text, hint_color) = match error {
-        Some(e) => (e.to_string(), egui::Color32::from_rgb(224, 82, 82)),
-        None => (
-            format!("enter run · esc cancel · {}", agent.label),
-            theme.text_dim,
-        ),
+/// The command a "?" types, carrying the geometry `mux ask` needs to erase
+/// the shell's echo of it (see `agent::ask_command`). The flag's own
+/// characters are typed too, so the row count feeds back into itself -
+/// iterate until it settles, which takes a second pass only when a digit is
+/// added. Falls back to the plain, visible command when the erase can't be
+/// trusted: no geometry, an echo taller than the pane, or a count that
+/// won't settle.
+fn inline_ask_command(geometry: Option<(u16, u16, u16)>) -> String {
+    let plain = agent::ask_command(None);
+    let Some((col, width, height)) = geometry else {
+        return plain;
     };
-    let hint = painter.layout_no_wrap(
-        hint_text,
-        theme.bar_font.clone(),
-        hint_color,
-    );
-    let show_hint = error.is_some()
-        || rect.max.x - 10.0 - hint.size().x - text_left >= 12.0 * char_w;
-    let right_limit = if show_hint {
-        rect.max.x - 10.0 - hint.size().x - char_w
-    } else {
-        rect.max.x - 4.0
-    };
-
-    // Tail-truncate against the hint; the buffer's cursor is always at the
-    // end, so the newest text is the part that must stay visible. One cell
-    // is reserved for the block cursor (monospace makes this exact).
-    let avail = (right_limit - text_left).max(0.0);
-    let budget = ((avail / char_w) as usize).saturating_sub(1);
-    let count = buffer.chars().count();
-    let visible: String = if count > budget {
-        buffer.chars().skip(count - budget).collect()
-    } else {
-        buffer.to_string()
-    };
-    let text =
-        painter.layout_no_wrap(visible, font.clone(), theme.text);
-    let cursor_x = text_left + text.size().x;
-    painter.galley(
-        egui::pos2(text_left, mid - text.size().y / 2.0),
-        text,
-        theme.text,
-    );
-    painter.rect_filled(
-        Rect::from_min_size(
-            egui::pos2(cursor_x + 1.0, y),
-            Vec2::new(char_w, row_h),
-        ),
-        CornerRadius::ZERO,
-        theme.accent,
-    );
-    if show_hint {
-        painter.galley(
-            egui::pos2(
-                rect.max.x - 10.0 - hint.size().x,
-                mid - hint.size().y / 2.0,
-            ),
-            hint,
-            hint_color,
-        );
+    let mut up = echo_rows_up(col, plain.chars().count(), width);
+    for _ in 0..3 {
+        let cmd = agent::ask_command(Some((up, col)));
+        let settled = echo_rows_up(col, cmd.chars().count(), width);
+        if settled == up {
+            return if up < height { cmd } else { plain };
+        }
+        up = settled;
     }
+    plain
 }
 
 /// The worktree-progress line, floated over the agent pane's bottom-left
 /// while its clone/fetch/checkout runs off-thread - the only feedback
-/// between Create and the agent command appearing. Painter-drawn like
-/// draw_ai_overlay: reserves no layout space.
+/// between Create and the agent command appearing. Painter-drawn:
+/// reserves no layout space.
 fn draw_worktree_progress(
     ui: &egui::Ui,
     pane_rect: Rect,
@@ -4339,6 +4154,39 @@ impl eframe::App for ErrorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn echo_rows_up_counts_the_wrap() {
+        // Prompt ends at column 10, a 20-cell command, 80 columns: one row,
+        // and the Enter put us on the line below it.
+        assert_eq!(echo_rows_up(10, 20, 80), 1);
+        // Exactly filling the row is still one row - the wrap is pending
+        // until the newline, which is the row we are counting back from.
+        assert_eq!(echo_rows_up(10, 70, 80), 1);
+        assert_eq!(echo_rows_up(10, 71, 80), 2);
+        assert_eq!(echo_rows_up(0, 161, 80), 3);
+        // Degenerate inputs must still name a row, never panic.
+        assert_eq!(echo_rows_up(0, 0, 0), 1);
+    }
+
+    #[test]
+    fn inline_ask_command_settles_or_stays_plain() {
+        let plain = agent::ask_command(None);
+        // A wide pane: one row, and the flag rides along.
+        let cmd = inline_ask_command(Some((12, 200, 40)));
+        assert_eq!(cmd, agent::ask_command(Some((1, 12))));
+        // The count in the flag matches what the finished string wraps to.
+        assert_eq!(echo_rows_up(12, cmd.chars().count(), 200), 1);
+        // A narrow pane wraps the command; the flag has to agree with the
+        // length it produces, flag included.
+        let cmd = inline_ask_command(Some((18, 20, 40)));
+        let up = echo_rows_up(18, cmd.chars().count(), 20);
+        assert_eq!(cmd, agent::ask_command(Some((up, 18))));
+        assert!(up > 1);
+        // No geometry, and a pane too short to hold the echo, stay visible.
+        assert_eq!(inline_ask_command(None), plain);
+        assert_eq!(inline_ask_command(Some((0, 20, 2))), plain);
+    }
 
     #[test]
     fn running_command_is_non_agent_non_shell_foreground() {

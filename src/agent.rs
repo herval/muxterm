@@ -2,7 +2,7 @@
 //! (settings, probing, the typed command) and `mux ask` (the invocation).
 
 use std::collections::HashMap;
-use std::path::Path;
+
 use std::process::Command;
 
 /// How `mux ask` (src/ask.rs) drives an agent's CLI.
@@ -21,7 +21,7 @@ pub enum AskInvocation {
 pub struct Agent {
     /// Value stored in config.toml.
     pub id: &'static str,
-    /// Human name shown in settings and the compose-line hint.
+    /// Human name shown in settings and the workspace popup.
     pub label: &'static str,
     /// Executable probed before a submit.
     pub bin: &'static str,
@@ -119,15 +119,20 @@ pub fn installed(ok: &HashMap<&'static str, bool>) -> Vec<&'static Agent> {
     }
 }
 
-/// The shell command a "?" submit types into the pane. Everything else -
-/// agent choice, model, streaming flags, output formatting - lives behind
-/// `mux ask` (src/ask.rs), which reads the same config.toml: the visible
-/// command stays short, and pane scrollback travels via stdin redirection.
-pub fn ask_command(query: &str, ctx_file: Option<&Path>) -> String {
-    let mut cmd = format!("mux ask {}", shell_quote(query));
-    if let Some(path) = ctx_file {
-        cmd.push_str(" < ");
-        cmd.push_str(&shell_quote(&path.display().to_string()));
+/// The command a "?" types into the pane: the interactive AI prompt, which
+/// owns the pane until the user leaves it. Everything else - agent choice,
+/// model, the question loop, scrollback context, streaming flags, output
+/// formatting - lives behind `mux ask -i` (src/ask.rs), which reads the
+/// same config.toml, so the typed command stays a fixed short string.
+pub fn ask_command(inline: Option<(u16, u16)>) -> String {
+    let mut cmd = "mux ask -i".to_string();
+    // Internal flag: `<rows-up>,<start-column>` tells `mux ask` where the
+    // shell's echo of this very command sits on screen, so it can wipe it
+    // before printing its own prompt there (src/ask.rs `erase_echo`). The
+    // caller works the geometry out; omitting it just leaves the command
+    // visible above the prompt.
+    if let Some((up, col)) = inline {
+        cmd.push_str(&format!(" --inline {up},{col}"));
     }
     cmd
 }
@@ -280,12 +285,10 @@ mod tests {
     }
 
     #[test]
-    fn ask_commands_compose_with_and_without_context() {
-        assert_eq!(ask_command("fix it", None), "mux ask 'fix it'");
-        assert_eq!(
-            ask_command("what's this", Some(Path::new("/tmp/x.txt"))),
-            "mux ask 'what'\\''s this' < '/tmp/x.txt'"
-        );
+    fn ask_command_opens_the_interactive_prompt() {
+        assert_eq!(ask_command(None), "mux ask -i");
+        // The erase geometry rides along when the caller worked it out.
+        assert_eq!(ask_command(Some((2, 41))), "mux ask -i --inline 2,41");
     }
 
     #[test]

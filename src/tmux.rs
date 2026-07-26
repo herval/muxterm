@@ -226,6 +226,35 @@ impl TmuxCtl {
         (!cmd.is_empty()).then_some(cmd)
     }
 
+    /// Where the shell's prompt ends and how big the pane is:
+    /// `(cursor_col, width, height)` in cells. The "?" prompt's inline
+    /// erase needs all three to work out how many rows the command it types
+    /// will occupy once the shell echoes it. Read from tmux rather than the
+    /// local grid because tmux's is the copy the shell actually wrote to -
+    /// and through `list-panes`, since `display-message -t` resolves pane
+    /// fields empty.
+    pub fn cursor_and_size(&self, session: &str) -> Option<(u16, u16, u16)> {
+        let out = Command::new(&self.bin)
+            .args([
+                "-L",
+                SOCKET,
+                "list-panes",
+                "-t",
+                &format!("={session}"),
+                "-F",
+                "#{cursor_x} #{pane_width} #{pane_height}",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut fields = stdout.lines().next()?.split_whitespace();
+        let mut next = || fields.next()?.parse::<u16>().ok();
+        Some((next()?, next()?, next()?))
+    }
+
     /// Foreground process + pid + cwd of every session's active pane in one
     /// tmux round trip. Polled once a second for the sidebar's working-dot
     /// ("is something other than a shell running?"), the workspace-root sync
