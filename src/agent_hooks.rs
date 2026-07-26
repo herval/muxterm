@@ -46,7 +46,10 @@ const CLAUDE_EVENTS: &[(&str, &str, Option<&str>, bool)] = &[
 /// foreground-process prune covers agent exit) and names the approval event
 /// PermissionRequest.
 const CODEX_EVENTS: &[(&str, &str, Option<&str>, bool)] = &[
-    ("UserPromptSubmit", "working", None, true),
+    // Codex parses non-empty UserPromptSubmit stdout as JSON. The rename
+    // nudge is plain text for Claude prompt context, so keep Codex's hook
+    // silent while still reporting the working state.
+    ("UserPromptSubmit", "working", None, false),
     ("PreToolUse", "working", None, false),
     ("Stop", "idle", None, false),
     ("PermissionRequest", "attention", None, false),
@@ -304,6 +307,16 @@ mod tests {
         };
         assert!(cmd("UserPromptSubmit").ends_with(" --nudge-name"));
         assert!(!cmd("PreToolUse").contains("--nudge-name"));
+    }
+
+    #[test]
+    fn codex_user_prompt_submit_stays_silent() {
+        let mut root = json!({});
+        assert!(merge_hooks(&mut root, CODEX_EVENTS, "/usr/local/bin/mux"));
+        let cmd = root["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert_eq!(cmd, "/usr/local/bin/mux agent-event working");
     }
 
     #[test]

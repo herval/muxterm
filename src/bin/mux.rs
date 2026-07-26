@@ -1342,17 +1342,21 @@ fn cmd_notify(as_session: Option<String>, args: Vec<String>) -> CmdResult {
 /// hook context, so it resolves identity from MUXTERM_SESSION alone (no
 /// tmux round trips), silently no-ops outside muxterm, drains stdin (hooks
 /// pipe a JSON payload; an unread pipe could block the agent), and always
-/// exits 0 (a nonzero PreToolUse hook can block the tool call).
+/// exits 0 (a nonzero PreToolUse hook can block the tool call). The payload's
+/// Codex-specific `model` field also lets stale hook configs stay compatible.
 ///
 /// It prints to stdout in exactly one case: the `--nudge-name` flag, which
 /// agent_hooks wires onto the UserPromptSubmit hook *only* (never PreToolUse,
 /// whose stdout claude reads as a permission decision). When set and the
 /// workspace still wears its codename, it emits one line that claude injects
-/// as prompt context - the "rename me when your plan starts" nudge.
+/// as prompt context - the "rename me when your plan starts" nudge. Codex
+/// requires non-empty stdout to be JSON, so it never receives the text line.
 fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
+    let mut codex_hook = false;
     if !io::stdin().is_terminal() {
         let mut sink = Vec::new();
         let _ = io::stdin().read_to_end(&mut sink);
+        codex_hook = is_codex_hook_input(&sink);
     }
     let session = as_session
         .or_else(|| env::var("MUXTERM_SESSION").ok())
@@ -1369,7 +1373,10 @@ fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
         },
         other => eprintln!("mux: agent-event: unknown state {other:?}"),
     }
-    if state == "working" && args.iter().any(|a| a == "--nudge-name") {
+    if !codex_hook
+        && state == "working"
+        && args.iter().any(|a| a == "--nudge-name")
+    {
         if let Some(st) = state::peek() {
             if let Some((tab_id, _)) = mesh::tab_of_session(&st, &session) {
                 let title = mesh::title_of_tab(&st, &tab_id);
@@ -1380,6 +1387,16 @@ fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
         }
     }
     Ok(())
+}
+
+/// Codex adds the active model slug to every hook payload; Claude does not.
+/// Keep this tolerant because lifecycle reporting must never fail on malformed
+/// or future hook input.
+fn is_codex_hook_input(input: &[u8]) -> bool {
+    match serde_json::from_slice::<serde_json::Value>(input) {
+        Ok(value) => value.get("model").is_some_and(|model| model.is_string()),
+        Err(_) => false,
+    }
 }
 
 /// The one-line UserPromptSubmit nudge, injected while - and only while - the
@@ -2068,5 +2085,16 @@ mod tests {
         // nudge repeats until the rename, then disappears.
         assert_eq!(name_nudge(Some("fix-auth")), None);
         assert_eq!(name_nudge(None), None);
+    }
+
+    #[test]
+    fn codex_hook_input_is_detected_without_affecting_claude() {
+        assert!(is_codex_hook_input(
+            br#"{"hook_event_name":"UserPromptSubmit","model":"gpt-5.6-sol"}"#
+        ));
+        assert!(!is_codex_hook_input(
+            br#"{"hook_event_name":"UserPromptSubmit","prompt":"fix it"}"#
+        ));
+        assert!(!is_codex_hook_input(b"not json"));
     }
 }
