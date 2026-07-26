@@ -385,6 +385,28 @@ pub fn random_title() -> String {
     format!("{adj}-{animal}")
 }
 
+/// A short single-word codename for a pane (an animal, e.g. "otter"), avoiding
+/// any name already in `used`. Scans the `state::ANIMALS` vocabulary from a
+/// random offset for the first free word; only if all 64 are taken does it
+/// suffix a digit. Entropy from uuid v4 (as `random_title` - no rand dep).
+/// Pure so uniqueness unit-tests.
+pub fn random_pane_name(used: &std::collections::HashSet<&str>) -> String {
+    let start = usize::from(uuid::Uuid::new_v4().into_bytes()[0]);
+    let n = state::ANIMALS.len();
+    for i in 0..n {
+        let animal = state::ANIMALS[(start + i) % n];
+        if !used.contains(animal) {
+            return animal.to_string();
+        }
+    }
+    // Every animal is taken: suffix the smallest free digit.
+    let animal = state::ANIMALS[start % n];
+    (2..)
+        .map(|k| format!("{animal}{k}"))
+        .find(|c| !used.contains(c.as_str()))
+        .expect("an unbounded range always finds a free suffix")
+}
+
 /// Is `root` inside a git work tree? Gates the "create worktree" checkbox and
 /// the worktree step. `git` lives in /usr/bin (on PATH even for Finder
 /// launches), so a bare Command is enough - unlike `claude`/`codex`.
@@ -1278,9 +1300,37 @@ fn clean_title(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn tpane(command: &str, split: SplitAxis, size: u8) -> TemplatePane {
         TemplatePane { command: command.to_string(), split, size }
+    }
+
+    #[test]
+    fn random_pane_name_avoids_collisions() {
+        // A single-word animal from the vocabulary, never one already in use.
+        let empty = HashSet::new();
+        let n = random_pane_name(&empty);
+        assert!(state::ANIMALS.contains(&n.as_str()), "unexpected name {n:?}");
+
+        // Assigning across the whole vocabulary yields 64 distinct names.
+        let mut used: HashSet<String> = HashSet::new();
+        for _ in 0..state::ANIMALS.len() {
+            let refs: HashSet<&str> =
+                used.iter().map(String::as_str).collect();
+            let name = random_pane_name(&refs);
+            assert!(used.insert(name), "random_pane_name repeated a name");
+        }
+        assert_eq!(used.len(), state::ANIMALS.len());
+
+        // Once every animal is taken, it falls back to a digit suffix.
+        let refs: HashSet<&str> = used.iter().map(String::as_str).collect();
+        let overflow = random_pane_name(&refs);
+        assert!(!refs.contains(overflow.as_str()));
+        assert!(
+            overflow.chars().last().is_some_and(|c| c.is_ascii_digit()),
+            "overflow name {overflow:?} should carry a digit suffix"
+        );
     }
 
     #[test]

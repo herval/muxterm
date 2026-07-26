@@ -164,6 +164,11 @@ pub enum NodeState {
         /// state files load unchanged - no VERSION bump.
         #[serde(default)]
         cwd: Option<PathBuf>,
+        /// The pane's durable codename (see `Pane.name`), so a name survives
+        /// relaunch. Additive with `#[serde(default)]` (""), so older state
+        /// files load unchanged and get a fresh codename on restore.
+        #[serde(default)]
+        name: String,
     },
     Split {
         axis: SplitAxis,
@@ -193,6 +198,20 @@ impl NodeState {
             NodeState::Split { first, second, .. } => {
                 first.session_list(out);
                 second.session_list(out);
+            },
+        }
+    }
+
+    /// In-order `(session, codename)` for every leaf; the codename is `""` for
+    /// a pane that predates the `name` field.
+    pub fn named_sessions(&self, out: &mut Vec<(String, String)>) {
+        match self {
+            NodeState::Leaf { session, name, .. } => {
+                out.push((session.clone(), name.clone()))
+            },
+            NodeState::Split { first, second, .. } => {
+                first.named_sessions(out);
+                second.named_sessions(out);
             },
         }
     }
@@ -404,6 +423,7 @@ mod tests {
                         tree: NodeState::Leaf {
                             session: "mux-aaaa".into(),
                             cwd: None,
+                            name: String::new(),
                         },
                         focused_session: "mux-aaaa".into(),
                         workspace: None,
@@ -416,10 +436,12 @@ mod tests {
                             first: Box::new(NodeState::Leaf {
                                 session: "mux-bbbb".into(),
                                 cwd: None,
+                                name: String::new(),
                             }),
                             second: Box::new(NodeState::Leaf {
                                 session: "mux-cccc".into(),
                                 cwd: None,
+                                name: String::new(),
                             }),
                         },
                         focused_session: "mux-cccc".into(),
@@ -506,26 +528,31 @@ mod tests {
     // leaf saved before the field (no `cwd` key) loads as None, and a leaf
     // that carries one round-trips it. No VERSION bump, so both parse at v1.
     #[test]
-    fn leaf_cwd_is_optional_and_round_trips() {
-        // Old leaf, no cwd key -> None (the compat path).
+    fn leaf_cwd_and_name_are_optional_and_round_trip() {
+        // Old leaf, no cwd/name keys -> defaults (the compat path).
         let old: NodeState =
             serde_json::from_str(r#"{"Leaf":{"session":"mux-a"}}"#).unwrap();
         match old {
-            NodeState::Leaf { cwd, .. } => assert!(cwd.is_none()),
+            NodeState::Leaf { cwd, name, .. } => {
+                assert!(cwd.is_none());
+                assert!(name.is_empty());
+            },
             _ => panic!("expected a leaf"),
         }
-        // A leaf with a cwd survives a save/load round trip.
+        // A leaf with a cwd and codename survives a save/load round trip.
         let leaf = NodeState::Leaf {
             session: "mux-b".into(),
             cwd: Some(PathBuf::from("/work/proj/src")),
+            name: "otter".into(),
         };
         let back: NodeState =
             serde_json::from_str(&serde_json::to_string(&leaf).unwrap())
                 .unwrap();
         match back {
-            NodeState::Leaf { session, cwd } => {
+            NodeState::Leaf { session, cwd, name } => {
                 assert_eq!(session, "mux-b");
                 assert_eq!(cwd, Some(PathBuf::from("/work/proj/src")));
+                assert_eq!(name, "otter");
             },
             _ => panic!("expected a leaf"),
         }

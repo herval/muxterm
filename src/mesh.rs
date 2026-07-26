@@ -3,7 +3,7 @@
 //! resolution. The tab is the isolation boundary: agents only see peers
 //! whose sessions belong to the same muxterm tab (per state.json).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -207,6 +207,27 @@ pub fn tab_of_session(
         }
     }
     None
+}
+
+/// session -> pane codename across the whole app (state.json leaf names,
+/// empty ones skipped). The durable, always-present pane name the mux CLI
+/// shows and resolves, under any `mux join` registry name. Codenames are
+/// unique among live panes (the GUI dedups at spawn), so a name resolves to
+/// exactly one session.
+pub fn pane_names(state: &StateFile) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for window in &state.windows {
+        for tab in &window.tabs {
+            let mut named = Vec::new();
+            tab.tree.named_sessions(&mut named);
+            for (session, name) in named {
+                if !name.is_empty() {
+                    out.insert(session, name);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The workspace title of the tab with `tab_id`, if it carries a workspace
@@ -696,10 +717,12 @@ mod tests {
                             first: Box::new(NodeState::Leaf {
                                 session: "mux-a".into(),
                                 cwd: None,
+                                name: "otter".into(),
                             }),
                             second: Box::new(NodeState::Leaf {
                                 session: "mux-b".into(),
                                 cwd: None,
+                                name: "falcon".into(),
                             }),
                         },
                     },
@@ -710,6 +733,7 @@ mod tests {
                         tree: NodeState::Leaf {
                             session: "mux-c".into(),
                             cwd: None,
+                            name: String::new(),
                         },
                     },
                 ],
@@ -725,6 +749,13 @@ mod tests {
         assert_eq!(members, vec!["mux-c".to_string()]);
 
         assert!(tab_of_session(&state, "mux-nope").is_none());
+
+        // pane_names collects every non-empty leaf codename across tabs; an
+        // empty name (mux-c, a pre-field leaf) is skipped.
+        let names = pane_names(&state);
+        assert_eq!(names.get("mux-a").map(String::as_str), Some("otter"));
+        assert_eq!(names.get("mux-b").map(String::as_str), Some("falcon"));
+        assert!(!names.contains_key("mux-c"));
     }
 
     #[test]

@@ -514,6 +514,17 @@ impl App {
     ) -> anyhow::Result<Pane> {
         let id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
+        // A fresh codename, unique among the live panes. On restore this is
+        // overwritten by the saved leaf name (restore_tab); it only sticks for
+        // genuinely new panes and for old state files that predate the field.
+        let name = {
+            let used: HashSet<&str> = self
+                .tabs
+                .iter()
+                .flat_map(|t| t.panes.values().map(|p| p.name.as_str()))
+                .collect();
+            workspace::random_pane_name(&used)
+        };
         // Restored sessions may hold half-typed input from the previous
         // run, so the "?" prompt stays inert there until the first Enter.
         let restored = session.is_some();
@@ -547,6 +558,7 @@ impl App {
             session,
             backend,
             title: "shell".into(),
+            name,
             line: if restored {
                 LineTracker::Dirty
             } else {
@@ -1387,7 +1399,7 @@ impl App {
             recovery_dir: &Option<String>,
         ) -> anyhow::Result<Node> {
             match node {
-                NodeState::Leaf { session, cwd } => {
+                NodeState::Leaf { session, cwd, name } => {
                     // Reboot recovery (Layer 1): a leaf whose session the
                     // socket no longer holds is being created fresh (the
                     // server died), so seed it in its saved cwd. `-c` is
@@ -1404,8 +1416,13 @@ impl App {
                     } else {
                         None
                     };
-                    let pane =
+                    let mut pane =
                         app.create_pane(ctx, Some(session), start_dir)?;
+                    // Keep the saved codename; the fresh one create_pane picked
+                    // only stands in for pre-field (empty) state files.
+                    if !name.is_empty() {
+                        pane.name = name;
+                    }
                     let id = pane.id;
                     panes.insert(id, pane);
                     Ok(Node::Leaf(id))
@@ -2240,6 +2257,11 @@ impl App {
                         cwd: snap
                             .get(&session)
                             .and_then(|s| s.cwd.clone()),
+                        // The pane's durable codename, so it survives relaunch.
+                        name: panes
+                            .get(id)
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default(),
                         session,
                     }
                 },
@@ -3279,16 +3301,14 @@ impl eframe::App for App {
                             let Some(pane) = tab.panes.get(id) else {
                                 continue;
                             };
-                            // A lone pane is the whole tab - no title
-                            // badge - but its PR/git chips still show.
-                            let label = if tab.panes.len() > 1 {
-                                tab_label(
-                                    self.agents.get(&pane.session),
-                                    &pane.title,
-                                )
-                            } else {
-                                String::new()
-                            };
+                            // Every pane wears its name: a `mux join` agent
+                            // name (with role) when registered, else its
+                            // durable codename - so any pane can be referred
+                            // to by the name on its bar.
+                            let label = tab_label(
+                                self.agents.get(&pane.session),
+                                &pane.name,
+                            );
                             if let Some(key) = draw_pane_title(
                                 ui,
                                 *rect,

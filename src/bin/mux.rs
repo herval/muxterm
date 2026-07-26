@@ -465,6 +465,9 @@ struct Scope {
     members: Vec<String>,
     all_sessions: HashSet<String>,
     registry: mesh::Registry,
+    /// session -> durable pane codename (state.json), the always-present name
+    /// under any `mux join` registry name. See `Scope::name_of`.
+    pane_names: HashMap<String, String>,
     /// The caller's workspace title, if its tab carries a workspace. Lets the
     /// brief show the agent its own tab name and nudge a rename while it's
     /// still a codename.
@@ -494,31 +497,60 @@ fn scope(tmux: &Tmux, as_session: Option<String>) -> Result<Scope, Fail> {
         }
     }
     let workspace_title = mesh::title_of_tab(&st, &tab_id);
+    let pane_names = mesh::pane_names(&st);
     Ok(Scope {
         session,
         tab_id,
         members,
         all_sessions,
         registry: mesh::load_registry(),
+        pane_names,
         workspace_title,
     })
 }
 
 impl Scope {
-    fn my_display(&self) -> String {
+    /// A session's display name, or None if it has neither a `mux join`
+    /// registry name nor a durable codename (a pane from a pre-field state
+    /// file). Registry name wins so a deliberate `mux join` overrides the
+    /// auto codename.
+    fn display_name(&self, session: &str) -> Option<String> {
         self.registry
             .agents
-            .get(&self.session)
+            .get(session)
             .map(|i| i.name.clone())
-            .unwrap_or_else(|| self.session.clone())
+            .or_else(|| self.pane_names.get(session).cloned())
     }
 
-    /// Resolve a peer argument (agent name or raw session) within this tab.
+    /// A session's name for display, falling back to the raw session id.
+    fn name_of(&self, session: &str) -> String {
+        self.display_name(session)
+            .unwrap_or_else(|| session.to_string())
+    }
+
+    fn my_display(&self) -> String {
+        self.name_of(&self.session)
+    }
+
+    /// Resolve a peer argument (agent name, pane codename, or raw session)
+    /// within this tab.
     fn resolve_peer(&self, arg: &str) -> Result<(String, String), Fail> {
         for (session, info) in &self.registry.agents {
             if info.name == arg {
                 if self.members.contains(session) {
                     return Ok((session.clone(), info.name.clone()));
+                }
+                return Err((
+                    EXIT_NOT_IN_TAB,
+                    format!("{arg:?} is not in your tab"),
+                ));
+            }
+        }
+        // Then a durable pane codename (unique among live panes app-wide).
+        for (session, name) in &self.pane_names {
+            if name == arg {
+                if self.members.contains(session) {
+                    return Ok((session.clone(), name.clone()));
                 }
                 return Err((
                     EXIT_NOT_IN_TAB,
@@ -608,9 +640,14 @@ fn cmd_approve() -> CmdResult {
 fn cmd_whoami(as_session: Option<String>, json: bool) -> CmdResult {
     let tmux = Tmux::new()?;
     let session = resolve_identity(&tmux, as_session)?;
-    let tab = state::peek().and_then(|s| mesh::tab_of_session(&s, &session));
+    let st = state::peek();
+    let tab = st.as_ref().and_then(|s| mesh::tab_of_session(s, &session));
     let registry = mesh::load_registry();
     let info = registry.agents.get(&session);
+    // Name = `mux join` registry name, else the durable pane codename.
+    let name = info.map(|i| i.name.clone()).or_else(|| {
+        st.as_ref().and_then(|s| mesh::pane_names(s).remove(&session))
+    });
 
     if json {
         println!(
@@ -618,7 +655,7 @@ fn cmd_whoami(as_session: Option<String>, json: bool) -> CmdResult {
             serde_json::json!({
                 "session": session,
                 "tab": tab.as_ref().map(|(id, _)| id),
-                "name": info.map(|i| i.name.clone()),
+                "name": name,
                 "role": info.and_then(|i| i.role.clone()),
             })
         );
@@ -627,11 +664,11 @@ fn cmd_whoami(as_session: Option<String>, json: bool) -> CmdResult {
         if let Some((tab_id, _)) = &tab {
             println!("tab={tab_id}");
         }
-        if let Some(info) = info {
-            println!("name={}", info.name);
-            if let Some(role) = &info.role {
-                println!("role={role}");
-            }
+        if let Some(name) = &name {
+            println!("name={name}");
+        }
+        if let Some(role) = info.and_then(|i| i.role.as_ref()) {
+            println!("role={role}");
         }
     }
     Ok(())
@@ -953,7 +990,10 @@ fn cmd_peers(
             continue;
         }
         let info = sc.registry.agents.get(member);
-        if info.is_none() && !all {
+        // Every named pane shows (by codename if unregistered); --all also
+        // includes a pane with no name at all (a pre-field state file).
+        let display = sc.display_name(member);
+        if display.is_none() && !all {
             continue;
         }
         let (cmd, cwd, active) = panes
@@ -962,9 +1002,10 @@ fn cmd_peers(
             .unwrap_or_else(|| ("-".into(), "-".into(), "-".into()));
         let star = if *member == sc.session { "*" } else { "" };
         rows.push(Row {
-            name: info
-                .map(|i| format!("{}{star}", i.name))
-                .unwrap_or_else(|| format!("-{star}")),
+            name: format!(
+                "{}{star}",
+                display.unwrap_or_else(|| "-".into())
+            ),
             role: info
                 .and_then(|i| i.role.clone())
                 .unwrap_or_else(|| "-".into()),
@@ -1879,6 +1920,8 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
 
     let _ = writeln!(out, "## muxterm agent mesh");
     let _ = writeln!(out);
+    // Every pane carries a name (its `mux join` name, else its durable
+    // codename), so the agent always knows who it is and can be addressed.
     if let Some(info) = sc.registry.agents.get(&sc.session) {
         match &info.role {
             Some(role) => {
@@ -1888,6 +1931,12 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
                 let _ = writeln!(out, "You are **{}** in a shared muxterm tab.", info.name);
             },
         }
+    } else if let Some(name) = sc.pane_names.get(&sc.session) {
+        let _ = writeln!(
+            out,
+            "You are **{name}** in a shared muxterm tab (your pane's name; \
+             take a deliberate name/role with `mux join <name> --role <role>`).",
+        );
     } else {
         let _ = writeln!(
             out,
@@ -1897,7 +1946,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
         );
     }
     let _ = writeln!(out);
-    let _ = writeln!(out, "Teammates in this tab:");
+    let _ = writeln!(out, "Teammates in this tab (address any by name):");
     let mut any = false;
     for member in &sc.members {
         if member == &sc.session || !live.contains(member) {
@@ -1911,10 +1960,14 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
                 (None, Some(d)) => writeln!(out, "- **{}**: {d}", info.name),
                 (None, None) => writeln!(out, "- **{}**", info.name),
             };
+        } else if let Some(name) = sc.pane_names.get(member) {
+            // A named-but-unregistered pane: still addressable by codename.
+            any = true;
+            let _ = writeln!(out, "- **{name}**");
         }
     }
     if !any {
-        let _ = writeln!(out, "- (none registered yet)");
+        let _ = writeln!(out, "- (none yet)");
     }
     let _ = writeln!(out);
     let _ = writeln!(out, "Coordinate through the `mux` CLI (run via your shell):");
@@ -2003,6 +2056,52 @@ fn cmd_prune() -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_peer_prefers_registry_then_codename() {
+        use std::collections::BTreeMap;
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "mux-a".to_string(),
+            mesh::AgentInfo {
+                name: "reviewer".into(),
+                role: None,
+                desc: None,
+                joined_at: 0,
+            },
+        );
+        let mut pane_names = HashMap::new();
+        pane_names.insert("mux-a".to_string(), "otter".to_string());
+        pane_names.insert("mux-b".to_string(), "falcon".to_string());
+        pane_names.insert("mux-z".to_string(), "wren".to_string()); // other tab
+        let sc = Scope {
+            session: "mux-a".into(),
+            tab_id: "mux-tab-1".into(),
+            members: vec!["mux-a".into(), "mux-b".into()],
+            all_sessions: ["mux-a", "mux-b", "mux-z"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            registry: mesh::Registry { version: 1, agents },
+            pane_names,
+            workspace_title: None,
+        };
+
+        // A `mux join` name resolves; the same pane's codename still aliases.
+        assert_eq!(sc.resolve_peer("reviewer").unwrap().0, "mux-a");
+        assert_eq!(sc.resolve_peer("otter").unwrap().0, "mux-a");
+        // An unregistered pane resolves by its codename.
+        assert_eq!(
+            sc.resolve_peer("falcon").unwrap(),
+            ("mux-b".to_string(), "falcon".to_string())
+        );
+        // A codename in another tab is rejected, not silently retargeted.
+        assert_eq!(sc.resolve_peer("wren").unwrap_err().0, EXIT_NOT_IN_TAB);
+        // Unknown name.
+        assert_eq!(sc.resolve_peer("ghost").unwrap_err().0, EXIT_NOT_FOUND);
+        // Own display name prefers the registry name over the codename.
+        assert_eq!(sc.my_display(), "reviewer");
+    }
 
     #[test]
     fn parse_retitle_title_and_description() {
