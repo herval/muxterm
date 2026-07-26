@@ -1,0 +1,99 @@
+graph TB
+    subgraph GUI["GUI Layer (app.rs, main.rs)"]
+        App["App\nTabs → Workspaces"]
+        Layout["Layout Tree\n(layout.rs)"]
+        Theme["Theme & Rendering\n(theme.rs, tabbar.rs)"]
+        Search["Search Bar\n(search.rs)"]
+        Links["Link Opener\n(links.rs)"]
+        Attention["Attention Badges\n(attention.rs)"]
+    end
+
+    subgraph Input["Input & Interaction"]
+        AiPrompt["AI Prompt Intercept\n(ai_prompt.rs)"]
+        Keys["Key Bindings\n(keys.rs)"]
+    end
+
+    subgraph Terminal["Terminal Widget"]
+        EguiTerm["egui_term\nVendored + Patched"]
+    end
+
+    subgraph PTY["Per-Pane PTY"]
+        PaneState["Pane State\n(Leaf, Session ID)"]
+        TmuxClient["tmux Client\nSession Socket"]
+    end
+
+    subgraph Core["Core Logic"]
+        State["State Manager\n(state.rs)"]
+        Config["Config & Polling\n(config.rs)"]
+        Workspace["Workspace Mgmt\n(workspace.rs)"]
+        WorkspacePopup["Workspace Popup\n(workspace_popup.rs)"]
+    end
+
+    subgraph Pollers["Background Pollers"]
+        GitStatus["Git Status\n(git_status.rs)"]
+        PrStatus["PR Status\n(pr_status.rs)"]
+        Scrollback["Scrollback Capture\n(scrollback.rs)"]
+        BgJobs["Background Jobs\n(bg_jobs.rs)"]
+    end
+
+    subgraph Mesh["Agent Mesh (mesh.rs + bin/mux.rs)"]
+        MuxCli["mux CLI Commands"]
+        Coordination["Coordination\n(peers/post/tell/ctx)"]
+        AgentHooks["Agent Hooks\n(agent_hooks.rs)"]
+    end
+
+    subgraph Ask["Ask Subsystem (ask.rs)"]
+        AskRepl["? REPL Loop"]
+        AgentExec["Agent Execution\n(claude/codex/pi)"]
+    end
+
+    subgraph Storage["Persistent Storage"]
+        StateJson["state.json\nLayout & Workspace Metadata"]
+        ConfigToml["config.toml\nPreferences"]
+        TmuxConf["tmux.conf\nGenerated at Launch"]
+        MeshData["Mesh State\n(agents.json, inbox/, ctx/)"]
+    end
+
+    App -->|owns| Layout
+    App -->|applies theme| Theme
+    Layout -->|rect splitting| EguiTerm
+    Theme -->|renders to| EguiTerm
+    AiPrompt -->|intercepts ?| AskRepl
+    Keys -->|routes| App
+    Search -->|controls tmux| TmuxClient
+    Links -->|resolves| PaneState
+    Attention -->|marks badges| App
+
+    App -->|routes PTY events| EguiTerm
+    PaneState -->|backs pane| TmuxClient
+    TmuxClient -->|persists| StateJson
+
+    Workspace -->|creates worktree| StateJson
+    WorkspacePopup -->|spawns| Workspace
+    Config -->|polls mtime| App
+
+    GitStatus -->|streams to| App
+    PrStatus -->|streams to| App
+    Scrollback -->|polls panes| TmuxClient
+    BgJobs -->|detects agents| TmuxClient
+
+    App -->|reads/writes| StateJson
+    App -->|coordinates| Coordination
+    MuxCli -->|spools requests| StateJson
+    AgentHooks -->|writes state| MeshData
+
+    AskRepl -->|spawns| AgentExec
+    AgentExec -->|captures context| PaneState
+
+    State -.->|all dicts from| StateJson
+    Config -.->|reads| ConfigToml
+    TmuxClient -.->|via| TmuxConf
+
+    style GUI fill:#e1f5ff
+    style Terminal fill:#fff3e0
+    style PTY fill:#f3e5f5
+    style Core fill:#e8f5e9
+    style Pollers fill:#fce4ec
+    style Mesh fill:#ede7f6
+    style Ask fill:#fff9c4
+    style Storage fill:#eceff1
