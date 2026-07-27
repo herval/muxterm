@@ -1061,8 +1061,11 @@ mod tests {
         let preset = theme::preset("iterm-dark").unwrap();
         let (_, ui_theme) = theme::build(preset, &HashMap::new(), 0.12);
         let font = FontId::monospace(14.0);
-        let mut form =
-            NewWorkspaceForm::new(String::new(), "claude", "opus".into());
+        let mut form = NewWorkspaceForm::new(
+            String::new(),
+            "codex",
+            "gpt-5.6-sol".into(),
+        );
 
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1093,7 +1096,10 @@ mod tests {
             "What do you want to work on?",
             "Agent",
             "Model",
-            "Claude Code",
+            "Codex",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "[ Cancel ]",
             "[ Create ]",
         ] {
@@ -1505,4 +1511,3 @@ mod tests {
         assert!(matches!(outcome, Outcome::Create));
     }
 }
-

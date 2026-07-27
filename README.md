@@ -99,7 +99,7 @@ and **streams the answer** as it's generated, with any tool calls the agent
 makes shown as dim `»` one-liners. The last `agent_context_lines` of the
 pane's scrollback are captured to a temp file and redirected to the agent's
 stdin, so it sees what you were just doing. Questions default to each
-agent's fast model (`haiku` for claude, `gpt-5.4-mini` for codex); set
+agent's fast model (`haiku` for claude, `gpt-5.6-terra` for codex); set
 `agent_model` in config.toml to trade speed for depth. `mux ask` also works
 from any plain terminal.
 
@@ -138,7 +138,7 @@ theme = "iterm-dark"   # bbs | iterm-light | github-light — each theme is a
                        # SF Mono for github-light)
 agent = "claude"       # "?" prompt agent: claude | codex
 agent_model = ""       # --model for "?" answers; empty = the agent's fast
-                       # default (haiku / gpt-5.4-mini)
+                       # default (haiku / gpt-5.6-terra)
 agent_context_lines = 200   # pane scrollback sent as context (0 = none)
 dim_inactive_panes = 0.12   # unfocused-split fade toward bg (0.0 - 0.8)
 pane_titles = true          # per-pane title badge (top-right) on split tabs;

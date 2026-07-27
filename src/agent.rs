@@ -60,8 +60,8 @@ pub const AGENTS: &[Agent] = &[
         id: "codex",
         label: "Codex",
         bin: "codex",
-        fast_model: Some("gpt-5.4-mini"),
-        models: &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+        fast_model: Some("gpt-5.6-terra"),
+        models: &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
         // The write sandbox is deliberate for asks: exec defaults to
         // read-only, but the agent is expected to act on the answer.
         // oneshot_args omits it - read-only is right for titling.
@@ -339,7 +339,7 @@ mod tests {
         let codex = by_id("codex").unwrap();
         assert_eq!(
             oneshot_command(codex, "name this"),
-            "codex exec --model gpt-5.4-mini 'name this'"
+            "codex exec --model gpt-5.6-terra 'name this'"
         );
         let pi = by_id("pi").unwrap();
         assert_eq!(
