@@ -3,9 +3,9 @@
 //! The pane types only `mux ask '<question>' < <ctx-file>`; this module
 //! resolves agent + model from config.toml, spawns the agent CLI, and for
 //! claude renders its stream-json output live: text deltas as they arrive,
-//! tool calls as dim one-liners. (Exec-style agents - codex today - stream
-//! their own progress and are spawned untouched; the dispatch decision is
-//! the registry's `AskInvocation`.)
+//! tool calls as dim one-liners. (Exec-style agents - Codex, Pi, and
+//! OpenCode - stream their own progress and are spawned untouched; the
+//! dispatch decision is the registry's `AskInvocation`.)
 
 use std::collections::HashMap;
 use std::fs;
@@ -1190,6 +1190,10 @@ mod tests {
         assert_eq!(agent.id, "claude");
         assert_eq!(model, None);
 
+        let (agent, model) = parse_config("agent = \"opencode\"\n");
+        assert_eq!(agent.id, "opencode");
+        assert_eq!(model, None);
+
         let (agent, _) = parse_config("not [ valid toml");
         assert_eq!(agent.id, "claude");
     }
@@ -1223,6 +1227,11 @@ mod tests {
         assert_eq!(
             exec_argv(&["-p"], Some("sonnet"), "hi"),
             ["-p", "--model", "sonnet", &styled_query("hi")]
+        );
+        // OpenCode's non-interactive mode, with tool permission auto-approval.
+        assert_eq!(
+            exec_argv(&["run", "--auto"], None, "hi"),
+            ["run", "--auto", &styled_query("hi")]
         );
         // The user's words come first and survive intact.
         assert!(styled_query("hi").starts_with("hi\n"));

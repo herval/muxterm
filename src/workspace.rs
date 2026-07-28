@@ -1284,8 +1284,8 @@ fn generate(agent: &Agent, instruction: &str, body: &str) -> Option<String> {
 }
 
 /// Reduce a model reply to one tidy title line: the last non-empty line
-/// (codex prints its answer last; claude prints only the answer), unquoted and
-/// clipped to a few words.
+/// (Codex/OpenCode print their answer last; Claude prints only the answer),
+/// unquoted and clipped to a few words.
 fn clean_title(raw: &str) -> String {
     let line = raw
         .lines()

@@ -37,9 +37,9 @@ defaults rather than exposing every choice as configuration:
   terminals, message each other, and share a scratchpad (see
   [agent mesh](#agent-mesh)). And AI is one keystroke from any shell: type
   `?` at an idle prompt and the line becomes a compose box — enter runs
-  your question through Claude Code or Codex right in the pane, with your
-  recent scrollback piped in as context, so `? why did this build fail`
-  just works.
+  your question through Claude Code, Codex, Pi, or OpenCode right in the
+  pane, with your recent scrollback piped in as context, so
+  `? why did this build fail` just works.
 - **Themed, not themeable-to-death.** A curated set of themes plus a small
   override surface (`config.toml`, edits apply live). Tab bar, dividers,
   and borders derive from the palette, so the whole window always matches.
@@ -94,14 +94,15 @@ hotkeys or use cmd+[ / cmd+].
 Type `?` as the first character at an idle shell prompt and the pane
 switches to an accent-colored compose line. Enter types `mux ask '…'` into
 the pane like any command; `mux ask` runs your question as a one-shot
-Claude Code (default) or Codex query — pick the agent in settings (cmd+,) —
-and **streams the answer** as it's generated, with any tool calls the agent
-makes shown as dim `»` one-liners. The last `agent_context_lines` of the
-pane's scrollback are captured to a temp file and redirected to the agent's
-stdin, so it sees what you were just doing. Questions default to each
-agent's fast model (`haiku` for claude, `gpt-5.6-terra` for codex); set
-`agent_model` in config.toml to trade speed for depth. `mux ask` also works
-from any plain terminal.
+Claude Code (default), Codex, Pi, or OpenCode query — pick the agent in
+settings (cmd+,) — and **streams the answer** as it's generated, with any
+tool calls the agent makes shown as dim `»` one-liners. The last
+`agent_context_lines` of the pane's scrollback are captured to a temp file
+and redirected to the agent's stdin, so it sees what you were just doing.
+Questions default to each agent's fast model (`haiku` for Claude/Pi,
+`gpt-5.6-terra` for Codex); OpenCode uses the default model in your OpenCode
+configuration. Set `agent_model` in config.toml to choose another model.
+`mux ask` also works from any plain terminal.
 
 ## Git status
 
@@ -136,9 +137,9 @@ theme = "iterm-dark"   # bbs | iterm-light | github-light — each theme is a
                        # full look: palette + font + pane-border weight
                        # (Monaco for the iterms, IBM VGA 8x16 for bbs,
                        # SF Mono for github-light)
-agent = "claude"       # "?" prompt agent: claude | codex
+agent = "claude"       # "?" prompt: claude | codex | pi | opencode
 agent_model = ""       # --model for "?" answers; empty = the agent's fast
-                       # default (haiku / gpt-5.6-terra)
+                       # or configured default
 agent_context_lines = 200   # pane scrollback sent as context (0 = none)
 dim_inactive_panes = 0.12   # unfocused-split fade toward bg (0.0 - 0.8)
 pane_titles = true          # per-pane title badge (top-right) on split tabs;
@@ -242,6 +243,13 @@ but anything with socket access can drive tmux directly.
   (`mux agent-event working --nudge-name`) injects a one-line reminder on each
   prompt — so an agent names its workspace when a task starts instead of
   leaving it on the codename. Both fall silent the moment it's renamed.
+- **Agent status** is self-configuring for all four built-in agents. Muxterm
+  installs lifecycle hooks for Claude and Codex, a Pi extension, and an
+  auto-discovered OpenCode plugin in
+  `~/.config/opencode/plugins/muxterm-status.js`. OpenCode busy/idle,
+  permission, question, error, and shutdown events drive the same sidebar
+  working/attention/idle states as the other agents; every integration is
+  inert outside a muxterm pane.
 - Other agents: `mux run` prints the briefing above them at launch, or wire
   `mux brief` into whatever startup-context mechanism they have (aider
   conventions file, custom system prompts).

@@ -1394,7 +1394,8 @@ fn cmd_notify(as_session: Option<String>, args: Vec<String>) -> CmdResult {
 }
 
 /// The body behind agent lifecycle hooks (claude/codex settings hooks, pi's
-/// extension): record the calling pane's agent state for the sidebar dot.
+/// extension, OpenCode's plugin): record the calling pane's agent state for
+/// the sidebar dot.
 /// Deliberately unlike every other command: it must be safe to run from any
 /// hook context, so it resolves identity from MUXTERM_SESSION alone (no
 /// tmux round trips), silently no-ops outside muxterm, drains stdin (hooks

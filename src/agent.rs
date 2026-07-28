@@ -13,7 +13,7 @@ pub enum AskInvocation {
     ClaudeStream,
     /// Spawn `bin` with these leading args, then `--model <m>` when a model
     /// is set, then the query; the CLI streams its own progress to the
-    /// inherited stdio (codex exec today; the expected shape for new agents).
+    /// inherited stdio (Codex, Pi, and OpenCode today).
     Exec { args: &'static [&'static str] },
 }
 
@@ -31,8 +31,13 @@ pub struct Agent {
     pub fast_model: Option<&'static str>,
     /// Models offered in the workspace-creation model dropdown. Curated (not
     /// every id the CLI accepts) - a bad pick just makes the CLI error; the
-    /// first entry is the dropdown default.
+    /// first entry is the dropdown default. An empty entry means "use the
+    /// CLI's configured default" (needed by provider-agnostic agents).
     pub models: &'static [&'static str],
+    /// Some interactive CLIs take the initial task as a positional argument;
+    /// others (OpenCode) reserve that position for a project path and need a
+    /// named prompt flag instead.
+    pub prompt_flag: Option<&'static str>,
     /// How `mux ask` invokes this CLI (see AskInvocation).
     pub ask: AskInvocation,
     /// Leading args for a quiet captured one-shot (workspace title
@@ -47,6 +52,7 @@ pub const AGENTS: &[Agent] = &[
         bin: "claude",
         fast_model: Some("haiku"),
         models: &["opus", "claude-fable-5", "sonnet", "haiku"],
+        prompt_flag: None,
         ask: AskInvocation::ClaudeStream,
         // --max-turns 1: a title/summary needs exactly one model turn. In
         // print mode a tool attempt has no TTY to approve through and can
@@ -62,6 +68,7 @@ pub const AGENTS: &[Agent] = &[
         bin: "codex",
         fast_model: Some("gpt-5.6-terra"),
         models: &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        prompt_flag: None,
         // The write sandbox is deliberate for asks: exec defaults to
         // read-only, but the agent is expected to act on the answer.
         // oneshot_args omits it - read-only is right for titling.
@@ -81,12 +88,34 @@ pub const AGENTS: &[Agent] = &[
         // multi-provider, so these are Claude-family shorthands (the provider
         // this app is used with) - adjust freely, a bad pick just errors.
         models: &["sonnet", "opus", "haiku"],
+        prompt_flag: None,
         // Print mode acts on its own (runs bash/edit/write) and merges piped
         // stdin into the prompt - exactly the `mux ask` contract. pi has no
         // Claude-style PreToolUse hook, so it runs like codex: autonomous and
         // ungated. Print mode is unrestricted, so no sandbox flag is needed.
         ask: AskInvocation::Exec { args: &["-p"] },
         oneshot_args: &["-p"],
+    },
+    Agent {
+        id: "opencode",
+        label: "OpenCode",
+        bin: "opencode",
+        // OpenCode is multi-provider and its configured default is the only
+        // portable choice. The optional explicit picks use OpenCode Zen's
+        // provider-qualified ids; the empty first entry keeps BYOK and local
+        // provider setups first-class too.
+        fast_model: None,
+        models: &[
+            "",
+            "opencode/gpt-5.6-sol",
+            "opencode/gpt-5.6-terra",
+            "opencode/gpt-5.6-luna",
+        ],
+        prompt_flag: Some("--prompt"),
+        // `run` consumes redirected stdin as extra prompt context. `--auto`
+        // lets asks act through tools while preserving explicit config denies.
+        ask: AskInvocation::Exec { args: &["run", "--auto"] },
+        oneshot_args: &["run"],
     },
 ];
 
@@ -152,6 +181,10 @@ pub fn launch_command(
         cmd.push_str(m);
     }
     cmd.push(' ');
+    if let Some(flag) = agent.prompt_flag {
+        cmd.push_str(flag);
+        cmd.push(' ');
+    }
     cmd.push_str(&shell_quote(prompt));
     cmd
 }
@@ -198,6 +231,17 @@ pub fn oneshot_command(agent: &Agent, prompt: &str) -> String {
     let argv = oneshot_argv(agent, prompt);
     let (prompt, fixed) = argv.split_last().expect("argv has bin + prompt");
     format!("{} {}", fixed.join(" "), shell_quote(prompt))
+}
+
+/// Compact label for the workspace model picker. The stored/passed value
+/// remains provider-qualified; only OpenCode Zen's redundant provider prefix
+/// is elided in the already-labelled OpenCode row.
+pub fn model_label(model: &str) -> &str {
+    if model.is_empty() {
+        "default"
+    } else {
+        model.strip_prefix("opencode/").unwrap_or(model)
+    }
 }
 
 /// POSIX single-quoting: wrap in '...', embedded ' becomes '\''.
@@ -346,6 +390,11 @@ mod tests {
             oneshot_command(pi, "name this"),
             "pi -p --model haiku 'name this'"
         );
+        let opencode = by_id("opencode").unwrap();
+        assert_eq!(
+            oneshot_command(opencode, "name this"),
+            "opencode run 'name this'"
+        );
     }
 
     #[test]
@@ -395,6 +444,20 @@ mod tests {
             launch_command(pi, Some("sonnet"), "fix it"),
             "pi --model sonnet 'fix it'"
         );
+        // OpenCode's positional is a project path, so the task uses --prompt.
+        let opencode = by_id("opencode").unwrap();
+        assert_eq!(
+            launch_command(opencode, None, "fix it"),
+            "opencode --prompt 'fix it'"
+        );
+        assert_eq!(
+            launch_command(
+                opencode,
+                Some("opencode/gpt-5.6-terra"),
+                "fix it"
+            ),
+            "opencode --model opencode/gpt-5.6-terra --prompt 'fix it'"
+        );
     }
 
     #[test]
@@ -404,5 +467,17 @@ mod tests {
         assert_eq!(resume_command(claude, Some("sonnet")), "claude --model sonnet");
         assert_eq!(resume_command(claude, None), "claude");
         assert_eq!(resume_command(claude, Some("")), "claude");
+        let opencode = by_id("opencode").unwrap();
+        assert_eq!(resume_command(opencode, None), "opencode");
+    }
+
+    #[test]
+    fn model_labels_keep_default_and_opencode_compact() {
+        assert_eq!(model_label(""), "default");
+        assert_eq!(model_label("opencode/gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(
+            model_label("anthropic/claude-sonnet-5"),
+            "anthropic/claude-sonnet-5"
+        );
     }
 }

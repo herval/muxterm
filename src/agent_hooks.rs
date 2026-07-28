@@ -8,12 +8,16 @@
 //! - codex: same hook vocabulary and JSON shape, in `~/.codex/hooks.json`
 //! - pi: a generated TypeScript extension in `~/.pi/agent/extensions/`
 //!   (auto-discovered), since pi's hooks are TS modules, not commands
+//! - opencode: a generated JavaScript plugin in
+//!   `~/.config/opencode/plugins/` (auto-discovered)
 //!
 //! Everything here is idempotent and re-run at every launch (from a
 //! background thread in App::new): merges preserve foreign hooks, replace
 //! only muxterm's own entries (refreshing a stale mux path), and rewrite
 //! files only when the content actually changed. An agent whose config dir
 //! doesn't exist is skipped - no config is conjured for uninstalled CLIs.
+//! OpenCode is the one exception: its plugin directory is created when the
+//! binary is installed, so the very first TUI launch already sees the hook.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,6 +84,24 @@ pub fn ensure_installed() {
             &mux,
         );
     }
+    let opencode_dir = home.join(".config").join("opencode");
+    if opencode_dir.exists() || cli_available("opencode") {
+        write_opencode_plugin(
+            &opencode_dir.join("plugins").join("muxterm-status.js"),
+            &mux,
+        );
+    }
+}
+
+/// Strict login-shell binary probe for deciding whether it is appropriate to
+/// create an absent third-party config directory. Unlike the UI's fail-open
+/// probe, any shell/spawn failure means "do not touch it" here.
+fn cli_available(bin: &str) -> bool {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    Command::new(shell)
+        .args(["-ilc", &format!("command -v {bin}")])
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Absolute path of `mux`, resolved through the interactive login shell for
@@ -268,6 +290,127 @@ export default function (pi: any) {{
     )
 }
 
+/// OpenCode auto-discovers global JS plugins. Its event bus covers busy/idle,
+/// permission prompts, user questions, errors, and shutdown, so a tiny plugin
+/// can provide the same sidebar states as the other agents. Generated only
+/// when content differs; malformed user config is never read or rewritten.
+fn write_opencode_plugin(path: &PathBuf, mux: &str) {
+    let content = opencode_plugin(mux);
+    if fs::read_to_string(path).ok().as_deref() == Some(content.as_str()) {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Err(e) = fs::write(path, content) {
+        log::warn!("could not write {}: {e:#}", path.display());
+    } else {
+        log::info!("opencode status plugin written to {}", path.display());
+    }
+}
+
+fn opencode_plugin(mux: &str) -> String {
+    // JSON-encode the path so it lands as a valid JS string literal.
+    let mux_literal =
+        serde_json::to_string(mux).unwrap_or_else(|_| "\"mux\"".into());
+    format!(
+        r#"// managed by muxterm - regenerated at every launch; edits are overwritten.
+// Reports OpenCode's lifecycle to muxterm's sidebar status dot. Inert
+// outside muxterm panes: without MUXTERM_SESSION, agent-event is a no-op.
+import {{ spawn }} from "node:child_process";
+
+const MUX = {mux_literal};
+const active = new Set();
+const blocked = new Set();
+let last;
+let writes = Promise.resolve();
+
+function send(state) {{
+    if (!process.env.MUXTERM_SESSION) return Promise.resolve();
+    // Serialize short-lived helpers so a fast attention -> working -> idle
+    // sequence cannot land in the state file out of order.
+    writes = writes.then(() => new Promise((resolve) => {{
+        try {{
+            const child = spawn(MUX, ["agent-event", state], {{ stdio: "ignore" }});
+            child.once("error", resolve);
+            child.once("exit", resolve);
+        }} catch {{
+            resolve();
+        }}
+    }}));
+    return writes;
+}}
+
+async function publish() {{
+    const state = blocked.size ? "attention" : active.size ? "working" : "idle";
+    if (state === last) return;
+    last = state;
+    await send(state);
+}}
+
+function sessionID(event) {{
+    return event.properties && event.properties.sessionID;
+}}
+
+export const MuxtermStatusPlugin = async () => ({{
+    "chat.message": async (input) => {{
+        active.add(input.sessionID);
+        blocked.delete(input.sessionID);
+        await publish();
+    }},
+    event: async ({{ event }}) => {{
+        const id = sessionID(event);
+        switch (event.type) {{
+            case "session.status":
+                if (!id) return;
+                if (event.properties.status.type === "idle") {{
+                    active.delete(id);
+                    blocked.delete(id);
+                }} else {{
+                    active.add(id); // busy and retry both mean the turn is live
+                }}
+                break;
+            case "session.idle":
+            case "session.deleted":
+                if (!id) return;
+                active.delete(id);
+                blocked.delete(id);
+                break;
+            case "permission.asked":
+            case "permission.updated":
+            case "permission.v2.asked":
+            case "question.asked":
+            case "question.v2.asked":
+            case "session.error":
+                if (!id) return;
+                active.add(id);
+                blocked.add(id);
+                break;
+            case "permission.replied":
+            case "permission.v2.replied":
+            case "question.replied":
+            case "question.rejected":
+            case "question.v2.replied":
+            case "question.v2.rejected":
+                if (!id) return;
+                blocked.delete(id);
+                active.add(id);
+                break;
+            default:
+                return;
+        }}
+        // Sets aggregate every session in this OpenCode process. A child
+        // session going idle cannot extinguish a parent that is still busy.
+        await publish();
+    }},
+    dispose: async () => {{
+        await send("gone");
+    }},
+}});
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +554,29 @@ mod tests {
             "\"/Users/x/.cargo/bin/mux\"",
         ] {
             assert!(ts.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn opencode_plugin_wires_status_attention_and_shutdown() {
+        let js = opencode_plugin("/Users/x/.cargo/bin/mux");
+        for needle in [
+            "chat.message",
+            "session.status",
+            "session.idle",
+            "permission.asked",
+            "permission.updated",
+            "permission.v2.asked",
+            "question.asked",
+            "question.v2.asked",
+            "session.error",
+            "active = new Set()",
+            "blocked = new Set()",
+            "send(\"gone\")",
+            "MUXTERM_SESSION",
+            "\"/Users/x/.cargo/bin/mux\"",
+        ] {
+            assert!(js.contains(needle), "missing {needle}");
         }
     }
 }

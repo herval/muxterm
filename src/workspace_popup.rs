@@ -363,7 +363,8 @@ pub fn show(
                     let selected = form.model == *m;
                     let color = if selected { th.accent } else { th.text };
                     let marker = if selected { "> " } else { "  " };
-                    let label = format!("{marker}{m}   ");
+                    let label =
+                        format!("{marker}{}   ", agent::model_label(m));
                     if panel.seg(ui, &label, color, true, selected).clicked() {
                         form.model = m.to_string();
                     }
@@ -1050,6 +1051,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn opencode_defaults_to_its_configured_model() {
+        assert_eq!(default_model("opencode"), "");
+    }
+
     /// Render the popup headless and check that its labels appear, that the
     /// hand-painted title/marker/button runs are pure ASCII (fallback-font
     /// glyphs carry foreign advance widths that break the char-cell math), and
@@ -1061,11 +1067,8 @@ mod tests {
         let preset = theme::preset("iterm-dark").unwrap();
         let (_, ui_theme) = theme::build(preset, &HashMap::new(), 0.12);
         let font = FontId::monospace(14.0);
-        let mut form = NewWorkspaceForm::new(
-            String::new(),
-            "codex",
-            "gpt-5.6-sol".into(),
-        );
+        let mut form =
+            NewWorkspaceForm::new(String::new(), "opencode", String::new());
 
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1097,6 +1100,8 @@ mod tests {
             "Agent",
             "Model",
             "Codex",
+            "OpenCode",
+            "default",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
