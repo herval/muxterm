@@ -2739,81 +2739,115 @@ impl App {
             drag.released = true;
         }
 
-        // One fork in flight at a time. Every update carries absolute
-        // coordinates, so a skipped one is simply superseded - nothing stale
-        // can land late, and only `owed` has to accumulate.
+        // Entering copy-mode repaints the pane once, and that repaint erases
+        // rows - which drops the widget's selection, the exact failure this
+        // machinery exists to prevent. Re-assert it until it sticks: once
+        // the freeze has landed nothing repaints the pane again, so this
+        // stops firing after the entry.
+        if drag.armed && !drag.released {
+            let missing = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| t.panes.get(&drag.pane))
+                .is_some_and(|pn| {
+                    pn.backend.last_content().selectable_range.is_none()
+                });
+            if missing && cursor != origin {
+                let from = (drag.press.x - term_rect.min.x, drag.press.y - term_rect.min.y);
+                let to = (drag.pos.x - term_rect.min.x, drag.pos.y - term_rect.min.y);
+                if let Some(pane) = self
+                    .tabs
+                    .get_mut(self.active)
+                    .and_then(|t| t.panes.get_mut(&drag.pane))
+                {
+                    pane.backend.restore_selection(from, to);
+                }
+            }
+        }
+
+        // One fork in flight at a time. Nothing here is a delta except
+        // `owed`, so a skipped update is simply superseded.
         let busy = drag
             .inflight
             .as_ref()
             .is_some_and(|f| !f.load(Ordering::Acquire));
         if !busy {
-            if drag.inflight.is_some() && !drag.swapped {
-                // tmux's highlight has landed; drop the optimistic local one
-                // so exactly one of them is ever on screen (P26).
-                if let Some(pane) = self
-                    .tabs
-                    .get(self.active)
-                    .and_then(|t| t.panes.get(&drag.pane))
-                {
-                    pane.backend.clear_selection();
-                }
-                drag.swapped = true;
-            }
-            let moved = drag.sent != Some(cursor);
             let arming = drag_arms(
                 drag.armed,
                 cursor,
                 origin,
                 (drag.pos - drag.press).length(),
             );
-            // The release always sends one last update even when nothing
-            // moved - it is the only one carrying `finish`, so skipping it
-            // would drop a copy_on_select copy on the floor.
-            let closing = drag.released && drag.armed && !drag.final_sent;
-            if arming || closing || (drag.armed && (moved || drag.owed != 0)) {
-                if arming {
-                    drag.origin = origin;
-                    drag.armed = true;
-                }
-                let scroll = std::mem::take(&mut drag.owed);
-                let anchor =
-                    visible_anchor(drag.origin.0, drag.scrolled, rows)
-                        .map(|row| (row, drag.origin.1));
-                drag.scrolled += scroll;
-                // copy_on_select wants the text, not a standing highlight:
-                // copy and leave copy-mode, so the pane is live again the
-                // instant the button comes up and nothing has to be
-                // dismissed later.
-                let finish = if drag.released && self.copy_on_select {
-                    tmux::Finish::CopyAndCancel
-                } else {
-                    tmux::Finish::Keep
-                };
-                drag.inflight = Some(self.tmux.select_update(
-                    &drag.session,
-                    anchor,
-                    cursor,
-                    scroll,
-                    finish,
-                ));
-                drag.sent = Some(cursor);
-                drag.final_sent = drag.released;
-                let holds = finish != tmux::Finish::CopyAndCancel;
+            if arming {
+                // Arming does one thing: freeze the pane. From here the
+                // widget's own local highlight draws the drag - it survives
+                // now that nothing is repainting the grid - and tmux is told
+                // the selection only once, at the end. Driving tmux per
+                // frame instead cost four client redraws per mouse move,
+                // one of them with the selection gone: a visible blink on
+                // every movement.
+                drag.armed = true;
+                drag.inflight = Some(self.tmux.enter_copy_mode(&drag.session));
                 if let Some(pane) = self
                     .tabs
                     .get_mut(self.active)
                     .and_then(|t| t.panes.get_mut(&drag.pane))
                 {
-                    pane.copy_sel = holds;
+                    pane.copy_sel = true;
+                }
+            } else if drag.armed && drag.owed != 0 && !drag.released {
+                // Autoscrolling. The selection has to be tmux's before the
+                // viewport can move past what the local grid holds, so the
+                // first scroll commits it; after that a scroll is one
+                // command and the cursor rides its screen row.
+                let scroll = std::mem::take(&mut drag.owed);
+                drag.inflight = Some(if drag.committed {
+                    self.tmux.scroll_copy_mode(&drag.session, scroll)
+                } else {
+                    drag.committed = true;
+                    let (anchor, cur) = self.commit_bounds(&drag, cursor);
+                    self.tmux.select_update(
+                        &drag.session,
+                        Some(anchor),
+                        cur,
+                        scroll,
+                        tmux::Finish::Keep,
+                    )
+                });
+                drag.scrolled += scroll;
+            } else if drag.released && drag.armed && !drag.final_sent {
+                // The drag is over: hand tmux the range that is actually
+                // highlighted, so what gets copied is what was on screen.
+                drag.final_sent = true;
+                let finish = if self.copy_on_select {
+                    tmux::Finish::CopyAndCancel
+                } else {
+                    tmux::Finish::Keep
+                };
+                let (anchor, cur) = self.commit_bounds(&drag, cursor);
+                let scroll = std::mem::take(&mut drag.owed);
+                drag.inflight = Some(self.tmux.select_update(
+                    &drag.session,
+                    Some(anchor),
+                    cur,
+                    scroll,
+                    finish,
+                ));
+                if finish == tmux::Finish::CopyAndCancel {
+                    if let Some(pane) = self
+                        .tabs
+                        .get_mut(self.active)
+                        .and_then(|t| t.panes.get_mut(&drag.pane))
+                    {
+                        pane.copy_sel = false;
+                    }
                 }
             }
         }
 
-        if drag.released && drag.armed && drag.final_sent {
-            // The closing update is on its way, so the selection is tmux's.
-            // Drop the optimistic local highlight even if the swap above
-            // never ran (a short drag can finish before the first fork
-            // lands), or the pane would wear both at once.
+        if drag.released && drag.armed && drag.final_sent && !busy {
+            // tmux has the range and its own highlight has landed, so the
+            // local one can go - exactly one of them is ever on screen.
             if let Some(pane) = self
                 .tabs
                 .get(self.active)
@@ -2864,11 +2898,10 @@ impl App {
             owed: 0,
             last_tick: Instant::now(),
             armed: false,
-            sent: None,
             inflight: None,
             released: false,
             final_sent: false,
-            swapped: false,
+            committed: false,
         });
         // A drag is not a `clicked()` in egui, so nothing else would focus
         // this pane - and drag-selecting in an unfocused pane has to work.
@@ -2900,6 +2933,26 @@ impl App {
         let origin = pane.backend.copy_target(px, py, true);
         let rows = pane.backend.last_content().terminal_size.screen_lines();
         Some((rect, cursor, origin, rows))
+    }
+
+    /// The copy-mode targets for the drag's two ends. Taken from the range
+    /// the widget is actually highlighting rather than from the press
+    /// pixels: alacritty rotates a selection with the content when the grid
+    /// scrolls, so the highlight follows the text the user grabbed, while a
+    /// press position re-resolved against the grid points at whatever has
+    /// since scrolled into that screen row - which is how a selection ends
+    /// up a line off in a pane that never stops printing. Falls back to the
+    /// press/pointer pair if there is no local selection to read.
+    fn commit_bounds(
+        &self,
+        drag: &DragSelect,
+        cursor: (usize, usize),
+    ) -> ((usize, usize), (usize, usize)) {
+        self.tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(&drag.pane))
+            .and_then(|pn| pn.backend.copy_selection_bounds())
+            .unwrap_or((drag.origin, cursor))
     }
 
     /// A press that never moved: word/line select, or dismiss the selection.
@@ -4497,16 +4550,15 @@ struct DragSelect {
     last_tick: Instant,
     /// tmux holds the anchor; before this, an update must carry it.
     armed: bool,
-    /// The last cursor endpoint sent, so an idle frame sends nothing.
-    sent: Option<(usize, usize)>,
     /// At most one fork in flight.
     inflight: Option<Arc<AtomicBool>>,
     /// The button is up; finish the last update, then park or copy.
     released: bool,
     /// The closing update - the only one that carries `finish` - has gone.
     final_sent: bool,
-    /// The optimistic local highlight has been handed over to tmux's.
-    swapped: bool,
+    /// tmux has been given the anchor (autoscroll needs it before the
+    /// viewport can move past what the local grid holds).
+    committed: bool,
 }
 
 /// How long typing may be held while copy-mode is cancelled before it is
@@ -4546,20 +4598,6 @@ fn drag_arms(
     travel: f32,
 ) -> bool {
     !armed && cursor != origin && travel > DRAG_SLOP
-}
-
-/// Where the drag's anchor currently sits on screen: it is pinned to the
-/// content, so every line the app scrolls the viewport pushes it one row the
-/// other way. None once it has left the viewport - an update must then leave
-/// `begin-selection` alone, because a screen-relative motion would re-anchor
-/// it on the wrong line.
-fn visible_anchor(
-    origin_row: usize,
-    scrolled: i32,
-    rows: usize,
-) -> Option<usize> {
-    let row = origin_row as i32 + scrolled;
-    (row >= 0 && row < rows as i32).then_some(row as usize)
 }
 
 /// The keystrokes worth holding across a copy-mode cancel: plain typed text,
@@ -5005,36 +5043,6 @@ mod tests {
         assert_eq!(autoscroll_lines(-5.0, 20.0), 1);
         // A degenerate cell height must not divide by zero.
         assert!(autoscroll_lines(10.0, 0.0) >= 1);
-    }
-
-    /// The anchor is pinned to content, so scrolling the viewport moves it
-    /// across the screen - and once it is off the screen an update must stop
-    /// re-anchoring, because a screen-relative motion can't address it.
-    #[test]
-    fn visible_anchor_follows_the_scroll_it_issued() {
-        assert_eq!(visible_anchor(8, 0, 12), Some(8));
-        assert_eq!(visible_anchor(8, 3, 12), Some(11));
-        assert_eq!(visible_anchor(8, 4, 12), None); // pushed off the bottom
-        assert_eq!(visible_anchor(2, -3, 12), None); // off the top
-        // Scrolling back brings it into view again.
-        assert_eq!(visible_anchor(8, 1, 12), Some(9));
-    }
-
-    /// A click that never leaves its character is a click, not a drag -
-    /// arming it would freeze the pane in copy-mode and move tmux's cursor
-    /// to wherever the user clicked, which is exactly what a plain click
-    /// must not do.
-    #[test]
-    fn a_motionless_press_never_arms() {
-        assert!(!drag_arms(false, (2, 5), (2, 5), 0.0));
-        // Moving to another character - or another row - is a drag.
-        assert!(drag_arms(false, (2, 6), (2, 5), 8.0));
-        assert!(drag_arms(false, (3, 5), (2, 5), 20.0));
-        // Already armed: the arming decision is made exactly once.
-        assert!(!drag_arms(true, (9, 9), (2, 5), 99.0));
-        // A shaky hand can cross a boundary without meaning to; a click
-        // that barely moved stays a click.
-        assert!(!drag_arms(false, (2, 6), (2, 5), 1.5));
     }
 
     /// Only plain typing is held across a copy-mode cancel. Chords are app

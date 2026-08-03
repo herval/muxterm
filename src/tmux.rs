@@ -418,6 +418,44 @@ impl TmuxCtl {
         self.spawn_argv(select_word_argv(session, cursor, line, finish))
     }
 
+    /// Freeze the pane's view by entering copy-mode, without touching the
+    /// cursor or the selection. This is the whole of what a drag does when
+    /// it arms: the freeze is what stops the pane's repaints from wiping the
+    /// widget's local highlight, and the local highlight is what draws the
+    /// drag - at sixty frames a second, with no forks and nothing to blink.
+    /// tmux only learns the selection when the drag ends.
+    pub fn enter_copy_mode(&self, session: &str) -> Arc<AtomicBool> {
+        self.spawn_argv(
+            ["-L", SOCKET, "copy-mode", "-t", &format!("={session}:")]
+                .map(String::from)
+                .to_vec(),
+        )
+    }
+
+    /// Scroll a pane already in copy-mode, leaving the cursor on its screen
+    /// row so the selection extends with the viewport. One command, so the
+    /// client gets one redraw - repositioning the cursor absolutely would
+    /// send it via `top-line`, and the trip through the top of the pane is
+    /// visible.
+    pub fn scroll_copy_mode(&self, session: &str, lines: i32) -> Arc<AtomicBool> {
+        let cmd = if lines > 0 { "scroll-up" } else { "scroll-down" };
+        self.spawn_argv(
+            [
+                "-L",
+                SOCKET,
+                "send-keys",
+                "-t",
+                &format!("={session}:"),
+                "-X",
+                "-N",
+                &lines.unsigned_abs().to_string(),
+                cmd,
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+    }
+
     /// Leave copy-mode, dropping any selection with it - the pane goes back
     /// to following its program's live output. A no-op when the pane isn't in
     /// a mode, so it is always safe to send.

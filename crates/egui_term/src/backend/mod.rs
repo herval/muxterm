@@ -460,15 +460,69 @@ impl TerminalBackend {
         let y = (y - crate::view::GRID_INSET.y).max(0.0);
         let row = ((y / size.cell_height.max(1.0)) as usize).min(rows - 1);
         let col = x / size.cell_width.max(1.0);
+        (row, stop_at(&self.row_stops_at(row), col, edge))
+    }
+
+    /// muxterm patch P33: the `cursor-right` stops of one *visible* row.
+    fn row_stops_at(&self, row: usize) -> Vec<usize> {
+        let content = self.last_content();
         let grid = &content.grid;
         let line = Line(row as i32 - grid.display_offset() as i32);
-        let stops = row_stops(
-            (0..size.columns()).map(|c| {
-                let cell = &grid[line][Column(c)];
-                (cell.c, cell.flags)
-            }),
-        );
-        (row, stop_at(&stops, col, edge))
+        row_stops((0..content.terminal_size.columns()).map(|c| {
+            let cell = &grid[line][Column(c)];
+            (cell.c, cell.flags)
+        }))
+    }
+
+    /// muxterm patch P33: (re)assert a plain local selection between two
+    /// pane-relative points. Entering copy-mode repaints the pane once, and
+    /// that repaint erases rows - taking the widget's selection with it, the
+    /// very thing this whole mechanism exists to stop. The app re-asserts
+    /// the drag's highlight until it sticks; once the pane is frozen nothing
+    /// repaints it again, so it sticks on the first try after the entry.
+    pub fn restore_selection(&mut self, from: (f32, f32), to: (f32, f32)) {
+        let inset = crate::view::GRID_INSET;
+        self.process_command(BackendCommand::SelectStart(
+            SelectionType::Simple,
+            from.0 - inset.x,
+            from.1 - inset.y,
+        ));
+        self.process_command(BackendCommand::SelectUpdate(
+            to.0 - inset.x,
+            to.1 - inset.y,
+        ));
+    }
+
+    /// muxterm patch P33: the live local selection as a pair of tmux
+    /// copy-mode targets - (row, `cursor-right` count) for each end, the far
+    /// end one character past the last selected cell because tmux's selection
+    /// runs [lower, upper).
+    ///
+    /// The app recreates a drag in copy-mode from *this* rather than from the
+    /// pointer's pixels. alacritty rotates a selection with the content when
+    /// the grid scrolls, so this is the range actually under the highlight
+    /// the user has been watching - whereas a press position re-resolved
+    /// against the grid points wherever that screen row has since ended up.
+    pub fn copy_selection_bounds(
+        &self,
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let content = self.last_content();
+        let range = content.selectable_range?;
+        let off = content.grid.display_offset() as i32;
+        let rows = content.terminal_size.screen_lines();
+        let target = |p: alacritty_terminal::index::Point, past: bool| {
+            let row = ((p.line.0 + off).max(0) as usize).min(rows - 1);
+            let stops = self.row_stops_at(row);
+            let mut idx = stops
+                .iter()
+                .rposition(|&s| s <= p.column.0)
+                .unwrap_or(0);
+            if past {
+                idx = (idx + 1).min(stops.len() - 1);
+            }
+            (row, idx)
+        };
+        Some((target(range.start, false), target(range.end, true)))
     }
 
     pub fn selectable_content(&self) -> String {
