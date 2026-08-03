@@ -13,7 +13,7 @@ use egui::{
 };
 use egui_term::{
     BackendCommand, FontSettings, PtyEvent, RepaintPolicy, TerminalBackend,
-    TerminalFont, TerminalMode, TerminalTheme, TerminalView,
+    TerminalFont, TerminalTheme, TerminalView,
 };
 
 use muxterm::agent::{self, Agent};
@@ -67,6 +67,10 @@ pub struct Tab {
     pub focused: PaneId,
     /// Screen rects from the last frame; drives cmd+opt+arrow navigation.
     pub last_rects: HashMap<PaneId, Rect>,
+    /// Per pane, just the terminal grid's rect - `last_rects` holds the
+    /// pane's whole claim, HUD strip included. Drag-selection maps pixels to
+    /// grid cells, so it needs the grid's own origin.
+    pub last_term_rects: HashMap<PaneId, Rect>,
     /// What this tab is for. Always present: bare for a plain cmd+t shell
     /// tab, rich for a cmd+n workspace (folder/worktree/prompt/agent/title).
     pub workspace: Workspace,
@@ -192,10 +196,14 @@ pub struct App {
     /// while its tab is still here; `mux rename` removes it, so a deliberate
     /// name can't be clobbered by a late auto-title.
     naming: HashSet<String>,
-    /// A `select_and_scroll` fork still in flight (`scroll_intercept`). Wheel
-    /// reports are swallowed while it is pending so the scroll can't outrun
-    /// the copy-mode anchor it is handing off to.
-    scroll_handoff: Option<Arc<AtomicBool>>,
+    /// The mouse drag currently being mirrored into a pane's tmux copy-mode
+    /// selection, if any.
+    drag: Option<DragSelect>,
+    /// Keystrokes held back for the one frame it takes to leave copy-mode,
+    /// so not a byte of them can land in the copy-mode key table. The
+    /// Instant is a deadline: a fork that never returns must not cost the
+    /// user their keyboard.
+    key_hold: Option<(Arc<AtomicBool>, Vec<egui::Event>, Instant)>,
     /// session -> foreground command + cwd, refreshed once a second (one
     /// `list-panes -a` round trip). The command is liveness for the
     /// agent-state files (a pane whose foreground returned to a shell has no
@@ -378,7 +386,8 @@ impl App {
             title_tx,
             title_rx,
             naming: HashSet::new(),
-            scroll_handoff: None,
+            drag: None,
+            key_hold: None,
             pane_snap: HashMap::new(),
             agent_states: std::collections::BTreeMap::new(),
             bg_jobs: HashSet::new(),
@@ -596,6 +605,7 @@ impl App {
                 LineTracker::Known(0)
             },
             attn: attention::Cell::new(Instant::now()),
+            copy_sel: false,
         })
     }
 
@@ -638,6 +648,7 @@ impl App {
                     panes,
                     focused: id,
                     last_rects: HashMap::new(),
+            last_term_rects: HashMap::new(),
                     workspace,
                 });
                 self.active = self.tabs.len() - 1;
@@ -967,6 +978,7 @@ impl App {
             panes,
             focused: id,
             last_rects: HashMap::new(),
+            last_term_rects: HashMap::new(),
             workspace,
         });
         self.active = self.tabs.len() - 1;
@@ -1524,6 +1536,7 @@ impl App {
             panes,
             focused,
             last_rects: HashMap::new(),
+            last_term_rects: HashMap::new(),
             workspace,
         });
         // Recovery runs after the tab exists: the typed input rides the same
@@ -1842,6 +1855,7 @@ impl App {
             panes,
             focused: id,
             last_rects: HashMap::new(),
+            last_term_rects: HashMap::new(),
             workspace,
         });
         self.dirty = true;
@@ -2241,6 +2255,25 @@ impl App {
                 if self.search.active() {
                     self.search.close();
                 } else if !self.settings_open && self.new_workspace.is_none() {
+                    // A selection muxterm is holding has to go first: the
+                    // search moves the same copy-mode cursor, so it would
+                    // otherwise drag the old selection along behind it as it
+                    // jumps between matches. Clearing keeps the pane in
+                    // copy-mode, which is where the search wants it anyway.
+                    let held = self.tabs.get(self.active).and_then(|tab| {
+                        let pane = tab.panes.get(&tab.focused)?;
+                        pane.copy_sel.then(|| pane.session.clone())
+                    });
+                    if let Some(session) = held {
+                        self.tmux.clear_copy_selection(&session);
+                        if let Some(pane) = self
+                            .tabs
+                            .get_mut(self.active)
+                            .and_then(|t| t.panes.get_mut(&t.focused))
+                        {
+                            pane.copy_sel = false;
+                        }
+                    }
                     if let Some(tab) = self.tabs.get(self.active) {
                         if tab.panes.contains_key(&tab.focused) {
                             self.search.open(tab.focused);
@@ -2588,6 +2621,386 @@ impl App {
         }
     }
 
+    /// Mirror a mouse drag into the pane's tmux copy-mode selection. muxterm
+    /// never reports the left button to tmux (egui_term P16), so the App is
+    /// the only thing that knows a drag is happening: it watches egui's own
+    /// pointer state and drives copy-mode over the control socket.
+    ///
+    /// This is what makes a selection durable. A local grid selection is
+    /// anchored to rows tmux rewrites on every repaint, and alacritty drops
+    /// any selection a rewritten row touches - so selecting in a pane that
+    /// prints anything (every agent CLI does, constantly) lost the highlight
+    /// within a second. Entering copy-mode freezes the pane's view, which is
+    /// both what stops the rewrites and what lets a selection reach back into
+    /// scrollback at all.
+    fn drag_intercept(&mut self, ctx: &egui::Context) {
+        if self.settings_open
+            || self.new_workspace.is_some()
+            || !self.confirm_worktree.is_empty()
+        {
+            return;
+        }
+        let (pressed, released, pos, dbl, tri) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_released(),
+                i.pointer.latest_pos().or(i.pointer.interact_pos()),
+                i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                i.pointer.button_triple_clicked(egui::PointerButton::Primary),
+            )
+        });
+
+        if pressed {
+            self.begin_drag(pos);
+        }
+        let Some(mut drag) = self.drag.take() else {
+            return;
+        };
+        if let Some(p) = pos {
+            drag.pos = p;
+        }
+
+        // A live drag owns the wheel: fold it into the scroll the next update
+        // carries, so two-finger scrolling extends the selection instead of
+        // racing it down the PTY while the chain goes over the control
+        // socket - nothing orders those two against each other.
+        let (dy, unit) = ctx.input(|i| {
+            let mut dy = 0.0;
+            let mut unit = None;
+            for e in &i.events {
+                if let egui::Event::MouseWheel { unit: u, delta, .. } = e {
+                    dy += delta.y;
+                    unit = Some(*u);
+                }
+            }
+            (dy, unit)
+        });
+        if let Some(unit) = unit {
+            let (cell_h, rows) = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| t.panes.get(&drag.pane))
+                .map(|pn| {
+                    let size = pn.backend.last_content().terminal_size;
+                    (size.cell_height, size.screen_lines() as f32)
+                })
+                .unwrap_or((1.0, 1.0));
+            let mut acc = 0.0;
+            drag.owed += egui_term::wheel_delta_to_lines(
+                &mut acc, unit, dy, cell_h, rows,
+            );
+            ctx.input_mut(|i| {
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }))
+            });
+        }
+
+        // Everything the update needs from the pane, under one borrow.
+        let Some((term_rect, cursor, origin, rows)) =
+            self.drag_geometry(&drag)
+        else {
+            // The pane went away mid-drag.
+            return;
+        };
+
+        // Autoscroll: a pointer past the top or bottom edge keeps the
+        // viewport moving on a fixed tick, with no further mouse movement.
+        let now = Instant::now();
+        let past_top = term_rect.top() - drag.pos.y;
+        let past_bottom = drag.pos.y - term_rect.bottom();
+        let cell_h = term_rect.height() / (rows.max(1) as f32);
+        if !drag.released && now.duration_since(drag.last_tick) >= AUTOSCROLL_TICK
+        {
+            if past_top > 0.0 {
+                drag.owed += autoscroll_lines(past_top, cell_h);
+                drag.last_tick = now;
+            } else if past_bottom > 0.0 {
+                drag.owed -= autoscroll_lines(past_bottom, cell_h);
+                drag.last_tick = now;
+            }
+        }
+        // egui is reactive and idles; a pointer parked outside the pane
+        // produces no frames of its own, so the drag asks for the next one.
+        if !drag.released && (past_top > 0.0 || past_bottom > 0.0) {
+            ctx.request_repaint_after(AUTOSCROLL_TICK);
+        }
+
+        if released {
+            drag.released = true;
+        }
+
+        // One fork in flight at a time. Every update carries absolute
+        // coordinates, so a skipped one is simply superseded - nothing stale
+        // can land late, and only `owed` has to accumulate.
+        let busy = drag
+            .inflight
+            .as_ref()
+            .is_some_and(|f| !f.load(Ordering::Acquire));
+        if !busy {
+            if drag.inflight.is_some() && !drag.swapped {
+                // tmux's highlight has landed; drop the optimistic local one
+                // so exactly one of them is ever on screen (P26).
+                if let Some(pane) = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.panes.get(&drag.pane))
+                {
+                    pane.backend.clear_selection();
+                }
+                drag.swapped = true;
+            }
+            let moved = drag.sent != Some(cursor);
+            // Arm on the first real movement, never on the press: a stray
+            // click must not freeze a live pane.
+            let arming = !drag.armed && (moved || cursor != origin);
+            // The release always sends one last update even when nothing
+            // moved - it is the only one carrying `finish`, so skipping it
+            // would drop a copy_on_select copy on the floor.
+            let closing = drag.released && drag.armed && !drag.final_sent;
+            if arming || closing || (drag.armed && (moved || drag.owed != 0)) {
+                if arming {
+                    drag.origin = origin;
+                    drag.armed = true;
+                }
+                let scroll = std::mem::take(&mut drag.owed);
+                let anchor =
+                    visible_anchor(drag.origin.0, drag.scrolled, rows)
+                        .map(|row| (row, drag.origin.1));
+                drag.scrolled += scroll;
+                // copy_on_select wants the text, not a standing highlight:
+                // copy and leave copy-mode, so the pane is live again the
+                // instant the button comes up and nothing has to be
+                // dismissed later.
+                let finish = if drag.released && self.copy_on_select {
+                    tmux::Finish::CopyAndCancel
+                } else {
+                    tmux::Finish::Keep
+                };
+                drag.inflight = Some(self.tmux.select_update(
+                    &drag.session,
+                    anchor,
+                    cursor,
+                    scroll,
+                    finish,
+                ));
+                drag.sent = Some(cursor);
+                drag.final_sent = drag.released;
+                let holds = finish != tmux::Finish::CopyAndCancel;
+                if let Some(pane) = self
+                    .tabs
+                    .get_mut(self.active)
+                    .and_then(|t| t.panes.get_mut(&drag.pane))
+                {
+                    pane.copy_sel = holds;
+                }
+            }
+        }
+
+        if drag.released && drag.armed && drag.final_sent {
+            // The closing update is on its way, so the selection is tmux's.
+            // Drop the optimistic local highlight even if the swap above
+            // never ran (a short drag can finish before the first fork
+            // lands), or the pane would wear both at once.
+            if let Some(pane) = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| t.panes.get(&drag.pane))
+            {
+                pane.backend.clear_selection();
+            }
+            return;
+        }
+        if drag.released && !drag.armed {
+            // A press that never became a drag. A double or triple click
+            // selects a word or a line; a plain click dismisses whatever
+            // selection was standing and gives the pane back.
+            self.finish_click(&drag, cursor, dbl, tri);
+            return;
+        }
+        self.drag = Some(drag);
+    }
+
+    /// Start tracking a press that lands on a pane's grid. Nothing reaches
+    /// tmux yet - `drag_intercept` arms on the first movement.
+    fn begin_drag(&mut self, pos: Option<egui::Pos2>) {
+        self.drag = None;
+        let Some(p) = pos else {
+            return;
+        };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.workspace.is_archived() {
+            return;
+        }
+        let Some((&id, _)) =
+            tab.last_term_rects.iter().find(|(_, r)| r.contains(p))
+        else {
+            return;
+        };
+        let Some(pane) = tab.panes.get(&id) else {
+            return;
+        };
+        self.drag = Some(DragSelect {
+            pane: id,
+            session: pane.session.clone(),
+            pos: p,
+            press: p,
+            origin: (0, 0),
+            scrolled: 0,
+            owed: 0,
+            last_tick: Instant::now(),
+            armed: false,
+            sent: None,
+            inflight: None,
+            released: false,
+            final_sent: false,
+            swapped: false,
+        });
+        // A drag is not a `clicked()` in egui, so nothing else would focus
+        // this pane - and drag-selecting in an unfocused pane has to work.
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if tab.focused != id && tab.panes.contains_key(&id) {
+                tab.focused = id;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// The drag's pane geometry: its grid rect, the copy-mode target under
+    /// the pointer and under the press, and the pane's row count.
+    fn drag_geometry(
+        &self,
+        drag: &DragSelect,
+    ) -> Option<(Rect, (usize, usize), (usize, usize), usize)> {
+        let tab = self.tabs.get(self.active)?;
+        let rect = *tab.last_term_rects.get(&drag.pane)?;
+        let pane = tab.panes.get(&drag.pane)?;
+        // Clamp into the grid: past an edge the endpoint pins to the last
+        // row/column and autoscroll does the travelling.
+        let local = |p: egui::Pos2| {
+            (p.x - rect.min.x, (p.y - rect.min.y).clamp(0.0, rect.height()))
+        };
+        let (cx, cy) = local(drag.pos);
+        let (px, py) = local(drag.press);
+        let cursor = pane.backend.copy_target(cx, cy, true);
+        let origin = pane.backend.copy_target(px, py, true);
+        let rows = pane.backend.last_content().terminal_size.screen_lines();
+        Some((rect, cursor, origin, rows))
+    }
+
+    /// A press that never moved: word/line select, or dismiss the selection.
+    fn finish_click(
+        &mut self,
+        drag: &DragSelect,
+        cursor: (usize, usize),
+        dbl: bool,
+        tri: bool,
+    ) {
+        if dbl || tri {
+            let cell = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| t.panes.get(&drag.pane))
+                .and_then(|pn| {
+                    let tab = self.tabs.get(self.active)?;
+                    let rect = tab.last_term_rects.get(&drag.pane)?;
+                    Some(pn.backend.copy_target(
+                        drag.pos.x - rect.min.x,
+                        drag.pos.y - rect.min.y,
+                        false,
+                    ))
+                })
+                .unwrap_or(cursor);
+            let finish = if self.copy_on_select {
+                tmux::Finish::Copy
+            } else {
+                tmux::Finish::Keep
+            };
+            self.tmux.select_word(&drag.session, cell, tri, finish);
+            if let Some(pane) = self
+                .tabs
+                .get_mut(self.active)
+                .and_then(|t| t.panes.get_mut(&drag.pane))
+            {
+                pane.copy_sel = true;
+            }
+            return;
+        }
+        // A plain click clears a standing selection and unfreezes the pane -
+        // the idiomatic "click anywhere to dismiss".
+        let held = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.panes.get(&drag.pane))
+            .is_some_and(|pn| pn.copy_sel);
+        if held {
+            self.tmux.cancel_copy_mode(&drag.session);
+            if let Some(pane) = self
+                .tabs
+                .get_mut(self.active)
+                .and_then(|t| t.panes.get_mut(&drag.pane))
+            {
+                pane.copy_sel = false;
+            }
+        }
+    }
+
+    /// Typing into a pane muxterm parked in copy-mode would reach tmux's
+    /// copy-mode key table, not the program. Hold those keystrokes for the
+    /// one frame it takes to leave copy-mode, then re-inject them - so not a
+    /// byte lands in the wrong place and nothing is lost. Only plain text and
+    /// Enter/Backspace are held: they are what "just start typing" means, and
+    /// none of them is bound to an app action that re-running could repeat.
+    fn select_key_intercept(&mut self, ctx: &egui::Context) {
+        if let Some((flag, events, since)) = self.key_hold.take() {
+            // Release the keys the moment the cancel lands - or when the
+            // deadline passes, because a tmux that never answered is no
+            // reason for the keyboard to stop working. Late keys reaching
+            // copy-mode is a far smaller failure than losing them.
+            if flag.load(Ordering::Acquire)
+                || since.elapsed() >= KEY_HOLD_LIMIT
+            {
+                ctx.input_mut(|i| i.events.extend(events));
+            } else {
+                self.key_hold = Some((flag, events, since));
+                ctx.request_repaint();
+            }
+            return;
+        }
+        if self.search.active() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get(&tab.focused) else {
+            return;
+        };
+        if !pane.copy_sel {
+            return;
+        }
+        let session = pane.session.clone();
+        let pane_id = tab.focused;
+        let held: Vec<egui::Event> = ctx.input(|i| {
+            i.events.iter().filter(|e| is_typing(e)).cloned().collect()
+        });
+        if held.is_empty() {
+            return;
+        }
+        ctx.input_mut(|i| i.events.retain(|e| !is_typing(e)));
+        self.key_hold =
+            Some((self.tmux.cancel_copy_mode(&session), held, Instant::now()));
+        if let Some(pane) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|t| t.panes.get_mut(&pane_id))
+        {
+            pane.copy_sel = false;
+        }
+        ctx.request_repaint();
+    }
+
     /// cmd+c when the selection lives in tmux, not in the local grid: the
     /// widget sees an empty local selection and ignores the Copy event, so
     /// a copy-mode selection (the copy_on_select=off drag path, or any
@@ -2618,138 +3031,27 @@ impl App {
         if pane.backend.last_content().selectable_range.is_some() {
             return;
         }
-        if self.tmux.selection_present(&pane.session) {
-            self.tmux.copy_selection(&pane.session);
+        let session = pane.session.clone();
+        let pane_id = tab.focused;
+        // When muxterm parked this pane in copy-mode it already knows a
+        // selection is standing, so the blocking `selection_present` probe is
+        // a fork it can skip. `copy_selection` copies *and* cancels, which is
+        // also how the pane gets its live view back after a cmd+c.
+        let ours = pane.copy_sel;
+        if ours || self.tmux.selection_present(&session) {
+            self.tmux.copy_selection(&session);
+        }
+        if ours {
+            if let Some(pane) = self
+                .tabs
+                .get_mut(self.active)
+                .and_then(|t| t.panes.get_mut(&pane_id))
+            {
+                pane.copy_sel = false;
+            }
         }
     }
 
-    /// Keep a mouse selection alive when the wheel scrolls it away. muxterm
-    /// forwards the wheel to tmux (patch P2), which repaints the pane and
-    /// wipes the local selection (the widget anchors it to on-screen rows).
-    /// When the focused pane has a live selection and the wheel fires over it,
-    /// recreate that selection in tmux copy-mode at the same visible
-    /// coordinates and scroll there: tmux owns scrollback, so the selection
-    /// persists, scrolls with the content (copy-mode style: it extends as it
-    /// scrolls), and stays copyable via `copy_intercept`. One-shot -
-    /// `clear_selection` drops the local copy so the next wheel forwards
-    /// normally and tmux keeps its own copy-mode selection. Must run before
-    /// any TerminalView clones the frame's input, like the other intercepts.
-    fn scroll_intercept(&mut self, ctx: &egui::Context) {
-        if self.settings_open
-            || self.new_workspace.is_some()
-            || !self.confirm_worktree.is_empty()
-        {
-            return;
-        }
-        // This frame's wheel: summed vertical delta plus the unit (mice report
-        // lines, trackpads points). No wheel event -> nothing to do.
-        let (dy, unit) = ctx.input(|i| {
-            let mut dy = 0.0;
-            let mut unit = None;
-            for e in &i.events {
-                if let egui::Event::MouseWheel { unit: u, delta, .. } = e {
-                    dy += delta.y;
-                    unit = Some(*u);
-                }
-            }
-            (dy, unit)
-        });
-        let Some(unit) = unit else {
-            return;
-        };
-        if dy == 0.0 {
-            return;
-        }
-        // A previous handoff's fork is still in flight. Forwarding a wheel
-        // report now would scroll the pane before tmux replays the anchor
-        // coordinates, so the copy-mode selection would land on the wrong
-        // rows - the report goes down the PTY, the handoff over the control
-        // socket, and nothing orders the two. Swallow until it lands; the
-        // window is one fork, and wheel events keep frames coming, so the
-        // flag is re-checked immediately.
-        if let Some(done) = &self.scroll_handoff {
-            if done.load(Ordering::Acquire) {
-                self.scroll_handoff = None;
-            } else {
-                ctx.input_mut(|i| {
-                    i.events
-                        .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }))
-                });
-                return;
-            }
-        }
-        let hover = ctx.input(|i| i.pointer.hover_pos());
-
-        // Gather everything from the focused pane under one immutable borrow,
-        // then drop it before touching tmux / the mutable re-borrow.
-        let handoff = {
-            let Some(tab) = self.tabs.get(self.active) else {
-                return;
-            };
-            let Some(pane) = tab.panes.get(&tab.focused) else {
-                return;
-            };
-            // Only hijack a scroll aimed at the focused pane itself.
-            let Some(&rect) = tab.last_rects.get(&tab.focused) else {
-                return;
-            };
-            if !hover.is_some_and(|p| rect.contains(p)) {
-                return;
-            }
-            let content = pane.backend.last_content();
-            let Some(range) = content.selectable_range else {
-                return;
-            };
-            // Only when the wheel is being forwarded to tmux (its `mouse on`);
-            // a local scroll already preserves the selection.
-            if !content.terminal_mode.intersects(TerminalMode::MOUSE_MODE) {
-                return;
-            }
-            // Selection points are absolute grid coords; under tmux
-            // display_offset stays ~0, so line.0 is the visible row (the
-            // selection was made on-screen, so it is non-negative here).
-            let off = content.grid.display_offset() as i64;
-            let row = |line: i32| (line as i64 + off).max(0) as usize;
-            let sr = row(range.start.line.0);
-            let sc = range.start.column.0;
-            let er = row(range.end.line.0);
-            let ec = range.end.column.0;
-            // The widget's own conversion (egui_term P29), so the handoff
-            // scrolls exactly as far as an ordinary wheel would. The
-            // accumulator is a throwaway: this consumes one frame's delta and
-            // then the local selection is gone, so there is no remainder to
-            // carry - but a sub-line flick must still prime a line, since the
-            // handoff is committed by now and a motionless one reads as a
-            // dropped gesture.
-            let cell_h = content.terminal_size.cell_height;
-            let viewport = content.terminal_size.screen_lines() as f32;
-            let mut acc = 0.0;
-            let mut lines = egui_term::wheel_delta_to_lines(
-                &mut acc, unit, dy, cell_h, viewport,
-            );
-            if lines == 0 {
-                lines = dy.signum() as i32; // at least one line in the direction
-            }
-            (pane.session.clone(), sr, sc, er, ec, lines)
-        };
-
-        let (session, sr, sc, er, ec, lines) = handoff;
-        self.scroll_handoff =
-            Some(self.tmux.select_and_scroll(&session, sr, sc, er, ec, lines));
-        if let Some(pane) = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.panes.get(&t.focused))
-        {
-            pane.backend.clear_selection();
-        }
-        // Swallow the wheel so the widget doesn't also forward it (which would
-        // scroll twice and, worse, wipe the selection we just handed off).
-        ctx.input_mut(|i| {
-            i.events
-                .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }))
-        });
-    }
 
     /// Re-probe agents whose CLI was last seen missing, so installing one
     /// while muxterm runs makes it appear the next time a picker opens.
@@ -3006,7 +3308,10 @@ impl eframe::App for App {
         self.search_intercept(ctx);
         self.ai_intercept(ctx);
         self.copy_intercept(ctx);
-        self.scroll_intercept(ctx);
+        // After search_intercept, so an open bar keeps the keyboard, and
+        // before the drag can arm on the same frame.
+        self.select_key_intercept(ctx);
+        self.drag_intercept(ctx);
 
         self.drain_pty_events(ctx);
         // Looking at a tab acknowledges its badges: seeing the active tab
@@ -3283,6 +3588,7 @@ impl eframe::App for App {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let rect = ui.max_rect();
                     let mut rects = HashMap::new();
+                    let mut term_rects = HashMap::new();
                     // A solid HUD strip reserves layout space (floating
                     // chips reserve none), gated on pane_titles - the HUD
                     // loop below is the only thing that paints the strip,
@@ -3324,6 +3630,7 @@ impl eframe::App for App {
                         !archived,
                         bar_h,
                         &mut rects,
+                        &mut term_rects,
                         &mut ui_actions,
                     );
                     if tab.panes.len() > 1 {
@@ -3426,6 +3733,7 @@ impl eframe::App for App {
                         }
                     }
                     tab.last_rects = rects;
+                    tab.last_term_rects = term_rects;
                 }
             });
 
@@ -4007,6 +4315,7 @@ fn show_node(
     // Some = the theme's solid HUD strip reserves this much of each pane.
     bar_h: Option<f32>,
     rects: &mut HashMap<PaneId, Rect>,
+    term_rects: &mut HashMap<PaneId, Rect>,
     ui_actions: &mut Vec<UiAction>,
 ) {
     match node {
@@ -4020,6 +4329,7 @@ fn show_node(
             let split =
                 bar_h.and_then(|h| split_bar(rect, ui_theme.bar_edge, h));
             let term_rect = split.map_or(rect, |(_, term)| term);
+            term_rects.insert(*id, term_rect);
             let mut child =
                 ui.new_child(egui::UiBuilder::new().max_rect(term_rect));
             let view = TerminalView::new(&mut child, &mut pane.backend)
@@ -4128,7 +4438,7 @@ fn show_node(
             show_node(
                 ui, first, first_rect, path << 1, panes, focused, font,
                 term_theme, ui_theme, copy_on_select, interactive, bar_h,
-                rects, ui_actions,
+                rects, term_rects, ui_actions,
             );
             show_node(
                 ui,
@@ -4144,9 +4454,91 @@ fn show_node(
                 interactive,
                 bar_h,
                 rects,
+                term_rects,
                 ui_actions,
             );
         },
+    }
+}
+
+/// A mouse drag muxterm is mirroring into a pane's tmux copy-mode selection.
+/// No left-button report ever reaches tmux (egui_term P16), so the App is the
+/// only thing that knows a drag is happening.
+struct DragSelect {
+    pane: PaneId,
+    session: String,
+    /// Latest pointer position, which may be outside the pane (autoscroll).
+    pos: egui::Pos2,
+    /// Where the button went down. The anchor is resolved from this at arm
+    /// time rather than at the press, so it is read off the same grid the
+    /// cursor is - a pane that scrolled in between can't skew one against
+    /// the other.
+    press: egui::Pos2,
+    /// Anchor as a (row, cursor-right count) in the viewport when it armed.
+    origin: (usize, usize),
+    /// Lines the app has scrolled the viewport since (>0 = toward older).
+    /// The anchor is pinned to content, so this is what moves it on screen.
+    scrolled: i32,
+    /// Autoscroll/wheel lines earned but not yet sent (a fork was in flight).
+    owed: i32,
+    last_tick: Instant,
+    /// tmux holds the anchor; before this, an update must carry it.
+    armed: bool,
+    /// The last cursor endpoint sent, so an idle frame sends nothing.
+    sent: Option<(usize, usize)>,
+    /// At most one fork in flight.
+    inflight: Option<Arc<AtomicBool>>,
+    /// The button is up; finish the last update, then park or copy.
+    released: bool,
+    /// The closing update - the only one that carries `finish` - has gone.
+    final_sent: bool,
+    /// The optimistic local highlight has been handed over to tmux's.
+    swapped: bool,
+}
+
+/// How long typing may be held while copy-mode is cancelled before it is
+/// let through regardless. One fork is ~4ms; this is a stuck-fork backstop,
+/// not a latency the user should ever feel.
+const KEY_HOLD_LIMIT: Duration = Duration::from_millis(400);
+
+/// Autoscroll steps at most this often. egui is reactive and idles, so the
+/// rate has to be owned by a tick rather than by however many frames some
+/// other pane's output happens to produce.
+const AUTOSCROLL_TICK: Duration = Duration::from_millis(50);
+
+/// Lines per autoscroll tick for a pointer `past` points beyond the pane's
+/// edge: one line right at the border, so a hair over it creeps rather than
+/// jumps, ramping to ten a tick at arm's length.
+fn autoscroll_lines(past: f32, cell_h: f32) -> i32 {
+    let rows = (past / cell_h.max(1.0)).max(0.0);
+    (1.0 + rows * 0.5).min(10.0) as i32
+}
+
+/// Where the drag's anchor currently sits on screen: it is pinned to the
+/// content, so every line the app scrolls the viewport pushes it one row the
+/// other way. None once it has left the viewport - an update must then leave
+/// `begin-selection` alone, because a screen-relative motion would re-anchor
+/// it on the wrong line.
+fn visible_anchor(
+    origin_row: usize,
+    scrolled: i32,
+    rows: usize,
+) -> Option<usize> {
+    let row = origin_row as i32 + scrolled;
+    (row >= 0 && row < rows as i32).then_some(row as usize)
+}
+
+/// The keystrokes worth holding across a copy-mode cancel: plain typed text,
+/// Enter and Backspace. Everything else (arrows, Escape, chords) either means
+/// something in copy-mode or is an app binding that must not be replayed.
+fn is_typing(e: &egui::Event) -> bool {
+    match e {
+        egui::Event::Text(_) => true,
+        egui::Event::Key { key, pressed: true, modifiers, .. } => {
+            !modifiers.command
+                && matches!(key, egui::Key::Enter | egui::Key::Backspace)
+        },
+        _ => false,
     }
 }
 
@@ -4565,5 +4957,55 @@ mod tests {
                 "{t} missing on the strip: {texts:?}"
             );
         }
+    }
+
+    /// The autoscroll ramp: a hair past the edge creeps, arm's length runs,
+    /// and nothing runs away.
+    #[test]
+    fn autoscroll_lines_ramps_from_one_and_caps() {
+        assert_eq!(autoscroll_lines(0.0, 20.0), 1);
+        assert_eq!(autoscroll_lines(20.0, 20.0), 1);
+        assert_eq!(autoscroll_lines(200.0, 20.0), 6);
+        assert_eq!(autoscroll_lines(10_000.0, 20.0), 10);
+        // A pointer that isn't past the edge at all still can't go backwards.
+        assert_eq!(autoscroll_lines(-5.0, 20.0), 1);
+        // A degenerate cell height must not divide by zero.
+        assert!(autoscroll_lines(10.0, 0.0) >= 1);
+    }
+
+    /// The anchor is pinned to content, so scrolling the viewport moves it
+    /// across the screen - and once it is off the screen an update must stop
+    /// re-anchoring, because a screen-relative motion can't address it.
+    #[test]
+    fn visible_anchor_follows_the_scroll_it_issued() {
+        assert_eq!(visible_anchor(8, 0, 12), Some(8));
+        assert_eq!(visible_anchor(8, 3, 12), Some(11));
+        assert_eq!(visible_anchor(8, 4, 12), None); // pushed off the bottom
+        assert_eq!(visible_anchor(2, -3, 12), None); // off the top
+        // Scrolling back brings it into view again.
+        assert_eq!(visible_anchor(8, 1, 12), Some(9));
+    }
+
+    /// Only plain typing is held across a copy-mode cancel. Chords are app
+    /// bindings that were already applied this frame and must not replay.
+    #[test]
+    fn only_plain_typing_is_held() {
+        assert!(is_typing(&egui::Event::Text("a".into())));
+        let key = |key, command| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command,
+                ..Default::default()
+            },
+        };
+        assert!(is_typing(&key(egui::Key::Enter, false)));
+        assert!(is_typing(&key(egui::Key::Backspace, false)));
+        assert!(!is_typing(&key(egui::Key::Enter, true)));
+        // Arrows and Escape mean something in copy-mode; leave them alone.
+        assert!(!is_typing(&key(egui::Key::ArrowUp, false)));
+        assert!(!is_typing(&key(egui::Key::Escape, false)));
     }
 }

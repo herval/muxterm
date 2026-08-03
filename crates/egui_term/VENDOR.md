@@ -374,3 +374,39 @@ tmux-backed design. Local patches:
   itself reports the primary button up, *unless* this frame's queue carries
   the release, which the event loop handles normally (P8 copy-on-select
   needs the final motion applied first).
+- **P33** (`src/backend/mod.rs`, `copy_target`, `row_stops`, `stop_at`,
+  `src/view.rs`, `GRID_INSET`): pixel positions as tmux copy-mode motions.
+  muxterm drives a pane's tmux copy-mode selection from the app side - the
+  left button is still never reported (P16), so a drag is mirrored by
+  chained `-X` commands over the control socket - because a *local*
+  selection is anchored to grid rows tmux rewrites on every repaint, and
+  alacritty drops any selection a rewritten row touches: selecting in a
+  pane that prints anything lost the highlight within a second. The one
+  thing the app cannot work out for itself is where a pointer lands in
+  tmux's terms. `cursor-right -N` counts *characters*, not columns, so a
+  wide CJK glyph is one press but two cells, and a column number handed
+  straight to it overshoots by one press per wide glyph before the target;
+  and it does not stop at the end of a row - it wraps onto the next one -
+  so a count past the row's content walks the cursor *down* instead of
+  clamping (measured against tmux 3.7b: press 7 lands at column 8, press
+  13 at column 20, press 17 at column 24, and press 18 wraps to the next
+  row). `copy_target` answers both off the rendered grid, which is the
+  same copy tmux is showing: `row_stops` lists the column each character
+  starts at, skipping wide-char spacer cells and dropping the trailing run
+  of blanks the way tmux's own line length does (it walks back over spaces
+  and padding and never looks at their colors, so a row an agent CLI
+  padded with coloured spaces ends at its last glyph), plus one final
+  entry for the end-of-content boundary - a legal cursor stop, one press
+  past which wraps. `stop_at` snaps to the nearest *boundary* rather than
+  to the cell, because tmux's selection runs `[lower, upper)` in content
+  order: that makes a press and release inside one cell select nothing and
+  a drag past a glyph's midpoint take it whole, the same rule
+  `selection_side` already applies locally, and it spares the app from
+  biasing an endpoint by drag direction. `GRID_INSET` (P17) becomes
+  `pub(crate)` so the mapping subtracts the same offset the renderer and
+  `process_mouse_move` do. Input handling is untouched: the widget still
+  owns the local selection, which now serves as optimistic feedback for
+  the first frames of a drag, and P26's `clear_selection` gains its real
+  caller - the app hands the highlight over to tmux's own (`mode-style
+  reverse`, which arrives as `ESC[7m` and renders through the same fg/bg
+  swap, so the swap is invisible) once the first update lands.

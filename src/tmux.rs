@@ -58,6 +58,27 @@ bind -T copy-mode WheelUpPane send-keys -X scroll-up
 bind -T copy-mode WheelDownPane send-keys -X scroll-down
 bind -T copy-mode-vi WheelUpPane send-keys -X scroll-up
 bind -T copy-mode-vi WheelDownPane send-keys -X scroll-down
+# muxterm drives copy-mode selections itself - one chained tmux invocation
+# per drag update (TmuxCtl::select_update), because the left button is never
+# reported to tmux (egui_term P16). These four settle what a selection looks
+# like and how it can be dismissed.
+# mode-keys is otherwise guessed from $EDITOR, and the vi table binds Escape
+# to clear-selection rather than cancel - which would leave a pane sitting
+# frozen in copy-mode after the user tried to dismiss a selection.
+setw -g mode-keys emacs
+# The selection highlight. `reverse` reaches the client as ESC[7m, which the
+# widget renders with the same fg/bg swap it paints its own local selection
+# with - so the handoff from the optimistic local highlight to tmux's own is
+# invisible.
+setw -g mode-style reverse
+# Hide copy-mode's [12/340] position readout: entering copy-mode to hold a
+# selection would otherwise flash a counter into the pane's top-right corner
+# on every drag.
+setw -g copy-mode-position-format ''
+# Double-click selects a whole non-whitespace run, matching egui_term P14
+# (which cut alacritty's semantic boundaries down to whitespace). tmux's
+# default separators would stop select-word at the first slash or colon.
+set -g word-separators ' '
 "##;
 
 /// Theme-derived colors for tmux's copy-mode search highlight, built by
@@ -363,33 +384,68 @@ impl TmuxCtl {
             .output();
     }
 
-    /// Recreate a local grid selection as a tmux copy-mode selection, then
-    /// scroll - so the selection survives a wheel scroll (which forwards to
-    /// tmux and repaints the pane, wiping the local selection). Rows/cols are
-    /// 0-based within the *visible* pane; `lines` is signed (>0 = wheel up =
-    /// scroll toward older lines). Sequenced like `search_op`: one fork, argv
-    /// chained with lone `;` elements. Once tmux owns the selection it keeps
-    /// it across further scrolling (extending along, copy-mode style) and
-    /// cmd+c copies it via the existing `copy_intercept` path.
+    /// Drive one step of a pane's copy-mode selection (see `select_argv`).
+    /// muxterm never forwards the left button (egui_term P16), so a drag is
+    /// mirrored into tmux from the app side: this is how a selection comes to
+    /// live somewhere that survives the pane's repaints and reaches into
+    /// scrollback.
     ///
-    /// Runs on a detached thread - the fork cost the UI thread a whole frame
-    /// at the exact moment the user is scrolling, which is what made the
-    /// handoff feel like a stutter. The returned flag flips once `output()`
-    /// returns, i.e. once the server has *executed* the sequence; the caller
-    /// holds wheel reports back until then, because those travel down the PTY
-    /// while this goes over the control socket and nothing orders the two.
-    pub fn select_and_scroll(
+    /// Runs on a detached thread - one chained fork measures ~4ms, which is a
+    /// whole frame at the moment the user is dragging. The returned flag
+    /// flips once `output()` returns, i.e. once the server has *executed* the
+    /// sequence; the caller keeps at most one update in flight and lets every
+    /// later one supersede it (each carries absolute coordinates, so a
+    /// skipped update costs nothing).
+    pub fn select_update(
         &self,
         session: &str,
-        sr: usize,
-        sc: usize,
-        er: usize,
-        ec: usize,
-        lines: i32,
+        anchor: Option<(usize, usize)>,
+        cursor: (usize, usize),
+        scroll: i32,
+        finish: Finish,
     ) -> Arc<AtomicBool> {
+        self.spawn_argv(select_argv(session, anchor, cursor, scroll, finish))
+    }
+
+    /// Double/triple click: select the word or logical line under `cursor`.
+    pub fn select_word(
+        &self,
+        session: &str,
+        cursor: (usize, usize),
+        line: bool,
+        finish: Finish,
+    ) -> Arc<AtomicBool> {
+        self.spawn_argv(select_word_argv(session, cursor, line, finish))
+    }
+
+    /// Leave copy-mode, dropping any selection with it - the pane goes back
+    /// to following its program's live output. A no-op when the pane isn't in
+    /// a mode, so it is always safe to send.
+    pub fn cancel_copy_mode(&self, session: &str) -> Arc<AtomicBool> {
+        self.spawn_argv(
+            ["-L", SOCKET, "copy-mode", "-q", "-t", &format!("={session}:")]
+                .map(String::from)
+                .to_vec(),
+        )
+    }
+
+    /// Drop the selection but stay in copy-mode (the pane keeps its scroll
+    /// position) - what cmd+f wants before it moves the copy-mode cursor.
+    pub fn clear_copy_selection(&self, session: &str) {
+        let bin = self.bin.clone();
+        let t = format!("={session}:");
+        std::thread::spawn(move || {
+            let _ = Command::new(&bin)
+                .args(["-L", SOCKET, "send-keys", "-t", &t, "-X"])
+                .arg("clear-selection")
+                .output();
+        });
+    }
+
+    /// Run a prepared argv off the UI thread, flagging completion.
+    fn spawn_argv(&self, argv: Vec<String>) -> Arc<AtomicBool> {
         let done = Arc::new(AtomicBool::new(false));
         let bin = self.bin.clone();
-        let argv = select_scroll_argv(session, sr, sc, er, ec, lines);
         let flag = done.clone();
         std::thread::spawn(move || {
             let _ = Command::new(&bin).args(argv).output();
@@ -662,13 +718,48 @@ fn escape_semi(query: &str) -> String {
 /// [right ec] ; [scroll]`. `top-line`+`start-of-line` give a stable anchor
 /// (top-left of the visible screen); zero-count motions are skipped. Pure so
 /// it unit-tests without a tmux server (the risky copy-mode motion sequence).
-fn select_scroll_argv(
+/// What the last step of a selection update does with the result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finish {
+    /// Leave the selection standing (cmd+c copies it later).
+    Keep,
+    /// copy_on_select: copy through tmux's OSC 52 and keep both the
+    /// selection and copy-mode, so the highlight survives the release.
+    Copy,
+    /// Copy and leave copy-mode, unfreezing the pane.
+    CopyAndCancel,
+}
+
+/// The argv (after `tmux`) for one copy-mode selection update. `row` is
+/// 0-based within the *visible* pane; the second element is a count of
+/// `cursor-right` presses - characters, not columns, which is what
+/// egui_term's `copy_target` counts and clamps so the cursor can never wrap
+/// onto the next row.
+///
+/// `anchor` is Some while the drag origin is still on screen. tmux pins the
+/// anchor to the *content*, so re-issuing `begin-selection` there every
+/// update is self-healing; once autoscroll has pushed the origin past an
+/// edge, leaving it alone is the only way to keep it - a screen-relative
+/// motion cannot address an off-screen row.
+///
+/// `scroll` comes last, and that ordering is the whole anchor rule:
+/// scrolling moves the viewport but leaves the *cursor* on its screen row,
+/// so the cursor end travels into older lines while the anchor stays put.
+/// Anchoring the moving end instead collapses the selection to nothing and
+/// then inverts it (measured: a 3-row selection + `scroll-up -N 3` left
+/// selection_present=0).
+///
+/// No `start-of-line` anywhere: on the continuation row of a soft-wrapped
+/// line it jumps *up* to the logical line's start (measured), which is most
+/// of an agent CLI's output. `top-line` already parks the cursor at column 0
+/// of the viewport's top row, and `cursor-down` counts screen rows whether
+/// they are wrapped or not.
+fn select_argv(
     session: &str,
-    sr: usize,
-    sc: usize,
-    er: usize,
-    ec: usize,
-    lines: i32,
+    anchor: Option<(usize, usize)>,
+    cursor: (usize, usize),
+    scroll: i32,
+    finish: Finish,
 ) -> Vec<String> {
     // A `; send-keys -t <target> -X <args...>` step (a nested fn, not a
     // closure, so it doesn't borrow `argv` for the whole build).
@@ -677,31 +768,70 @@ fn select_scroll_argv(
         argv.extend(["send-keys", "-t", t, "-X"].map(String::from));
         argv.extend(args.iter().map(|s| s.to_string()));
     }
+    fn seek(argv: &mut Vec<String>, t: &str, (row, col): (usize, usize)) {
+        step(argv, t, &["top-line"]);
+        if row > 0 {
+            step(argv, t, &["-N", &row.to_string(), "cursor-down"]);
+        }
+        if col > 0 {
+            step(argv, t, &["-N", &col.to_string(), "cursor-right"]);
+        }
+    }
     let t = format!("={session}:");
+    // copy-mode first, and *bare*: it is a true no-op on a pane already in
+    // it, so every update self-heals a pane something else knocked out. `-e`
+    // is deliberately not used here - it would cancel the mode, and the
+    // selection with it, the moment a scroll reached the bottom.
     let mut argv: Vec<String> = ["-L", SOCKET, "copy-mode", "-t", t.as_str()]
         .map(String::from)
         .to_vec();
-    step(&mut argv, &t, &["top-line"]);
-    step(&mut argv, &t, &["start-of-line"]);
-    if sr > 0 {
-        step(&mut argv, &t, &["-N", &sr.to_string(), "cursor-down"]);
+    if let Some(a) = anchor {
+        seek(&mut argv, &t, a);
+        step(&mut argv, &t, &["begin-selection"]);
     }
-    if sc > 0 {
-        step(&mut argv, &t, &["-N", &sc.to_string(), "cursor-right"]);
+    seek(&mut argv, &t, cursor);
+    if scroll != 0 {
+        let cmd = if scroll > 0 { "scroll-up" } else { "scroll-down" };
+        step(&mut argv, &t, &["-N", &scroll.unsigned_abs().to_string(), cmd]);
     }
-    step(&mut argv, &t, &["begin-selection"]);
-    if er > sr {
-        step(&mut argv, &t, &["-N", &(er - sr).to_string(), "cursor-down"]);
+    match finish {
+        Finish::Keep => {},
+        Finish::Copy => step(&mut argv, &t, &["copy-selection-no-clear"]),
+        Finish::CopyAndCancel => {
+            step(&mut argv, &t, &["copy-selection-and-cancel"])
+        },
     }
-    // Reset the column before extending to the end column, so uneven line
-    // lengths never leave the cursor short.
-    step(&mut argv, &t, &["start-of-line"]);
-    if ec > 0 {
-        step(&mut argv, &t, &["-N", &ec.to_string(), "cursor-right"]);
-    }
-    if lines != 0 {
-        let cmd = if lines > 0 { "scroll-up" } else { "scroll-down" };
-        step(&mut argv, &t, &["-N", &lines.unsigned_abs().to_string(), cmd]);
+    argv
+}
+
+/// The argv for a one-shot word/line selection (double/triple click). tmux
+/// repositions the cursor after every motion while word or line mode is
+/// active, so these are never followed by drag updates - a later drag
+/// re-issues `begin-selection`, which resets to character mode.
+fn select_word_argv(
+    session: &str,
+    cursor: (usize, usize),
+    line: bool,
+    finish: Finish,
+) -> Vec<String> {
+    let mut argv = select_argv(session, None, cursor, 0, Finish::Keep);
+    let t = format!("={session}:");
+    let cmd = if line { "select-line" } else { "select-word" };
+    argv.push(";".into());
+    argv.extend(["send-keys", "-t", t.as_str(), "-X", cmd].map(String::from));
+    match finish {
+        Finish::Keep => {},
+        Finish::Copy | Finish::CopyAndCancel => {
+            let last = if finish == Finish::Copy {
+                "copy-selection-no-clear"
+            } else {
+                "copy-selection-and-cancel"
+            };
+            argv.push(";".into());
+            argv.extend(
+                ["send-keys", "-t", t.as_str(), "-X", last].map(String::from),
+            );
+        },
     }
     argv
 }
@@ -743,48 +873,81 @@ mod tests {
     }
 
     #[test]
-    fn select_scroll_argv_sequence_and_skips() {
-        // Multi-line selection, scroll up: full motion sequence, `=name:`
-        // target, count-carrying steps present.
-        let a = select_scroll_argv("mux-aaaa", 2, 3, 4, 10, 3);
+    fn select_argv_anchors_then_moves_then_scrolls() {
+        // Anchor at (row 2, 3 presses), cursor at (row 4, 10), scroll up 3.
+        let a = select_argv("mux-aaaa", Some((2, 3)), (4, 10), 3, Finish::Keep);
         assert_eq!(a[..5], ["-L", SOCKET, "copy-mode", "-t", "=mux-aaaa:"]);
         assert_eq!(x_cmds(&a), [
             "top-line",
-            "start-of-line",
-            "cursor-down",   // to start row (sr=2)
-            "cursor-right",  // to start col (sc=3)
+            "cursor-down",  // to the anchor row
+            "cursor-right", // to the anchor column
             "begin-selection",
-            "cursor-down",   // to end row (er-sr=2)
-            "start-of-line",
-            "cursor-right",  // to end col (ec=10)
-            "scroll-up",     // lines>0
-        ]);
-        // The scroll step carries the line count.
-        let joined = a.join(" ");
-        assert!(joined.contains("-X -N 3 scroll-up"), "{joined}");
-        assert!(joined.contains("-X -N 2 cursor-down"), "{joined}");
-
-        // Zero offsets are skipped (sr=sc=0, er==sr), and lines<0 scrolls down.
-        let b = select_scroll_argv("mux-bbbb", 0, 0, 0, 5, -2);
-        assert_eq!(x_cmds(&b), [
             "top-line",
-            "start-of-line",
-            "begin-selection",
-            "start-of-line",
-            "cursor-right", // ec=5
-            "scroll-down",  // lines<0
+            "cursor-down",  // to the cursor row
+            "cursor-right", // to the cursor column
+            "scroll-up",    // scroll > 0
         ]);
-        assert!(b.join(" ").contains("-X -N 2 scroll-down"));
+        let joined = a.join(" ");
+        assert!(joined.contains("-X -N 2 cursor-down"), "{joined}");
+        assert!(joined.contains("-X -N 10 cursor-right"), "{joined}");
+        assert!(joined.contains("-X -N 3 scroll-up"), "{joined}");
+        // `start-of-line` walks *up* to the start of a soft-wrapped logical
+        // line, which is most of an agent CLI's output - it must never
+        // appear between an absolute seek's steps.
+        assert!(!joined.contains("start-of-line"), "{joined}");
 
-        // A zero-line handoff still recreates the selection but must not
-        // emit a scroll step in either direction.
-        let c = select_scroll_argv("mux-cccc", 1, 0, 1, 3, 0);
-        assert!(
-            !x_cmds(&c).iter().any(|x| x.starts_with("scroll")),
-            "{:?}",
-            x_cmds(&c),
+        // The scroll always comes last: that ordering is what leaves the
+        // cursor end riding the viewport while the anchor stays put.
+        assert_eq!(x_cmds(&a).last().unwrap(), "scroll-up");
+
+        // Zero row/column offsets emit no motion; a negative scroll goes the
+        // other way.
+        let b = select_argv("mux-bbbb", None, (0, 0), -2, Finish::Keep);
+        assert_eq!(x_cmds(&b), ["top-line", "scroll-down"]);
+        assert!(b.join(" ").contains("-X -N 2 scroll-down"));
+    }
+
+    #[test]
+    fn select_argv_without_an_anchor_only_moves_the_cursor() {
+        // Once autoscroll has pushed the origin off screen there is no row to
+        // re-anchor to, and re-issuing begin-selection would land it on the
+        // wrong line - so the update carries the cursor alone.
+        let a = select_argv("mux-aaaa", None, (4, 10), 0, Finish::Keep);
+        assert_eq!(x_cmds(&a), ["top-line", "cursor-down", "cursor-right"]);
+        assert_eq!(a.iter().filter(|s| *s == "top-line").count(), 1);
+        assert!(!a.iter().any(|s| s == "begin-selection"));
+    }
+
+    #[test]
+    fn select_argv_finish_variants() {
+        let keep = select_argv("s", None, (1, 1), 0, Finish::Keep);
+        assert!(!keep.iter().any(|s| s.starts_with("copy-selection")));
+
+        let copy = select_argv("s", None, (1, 1), 0, Finish::Copy);
+        assert_eq!(x_cmds(&copy).last().unwrap(), "copy-selection-no-clear");
+
+        let cancel = select_argv("s", None, (1, 1), 0, Finish::CopyAndCancel);
+        assert_eq!(
+            x_cmds(&cancel).last().unwrap(),
+            "copy-selection-and-cancel",
         );
-        assert!(x_cmds(&c).contains(&"begin-selection".to_string()));
+    }
+
+    #[test]
+    fn select_word_argv_seeks_then_selects() {
+        let w = select_word_argv("s", (2, 5), false, Finish::Keep);
+        assert_eq!(x_cmds(&w), [
+            "top-line",
+            "cursor-down",
+            "cursor-right",
+            "select-word",
+        ]);
+        let l = select_word_argv("s", (0, 0), true, Finish::Copy);
+        assert_eq!(x_cmds(&l), [
+            "top-line",
+            "select-line",
+            "copy-selection-no-clear",
+        ]);
     }
 
     #[test]
@@ -934,6 +1097,16 @@ mod tests {
             assert!(text.contains(
                 "bind -n WheelUpPane if -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' {send -M} {copy-mode -e ; send-keys -X scroll-up}"
             ));
+            // Selections are driven by muxterm, so the conf has to settle
+            // what one looks like and how it can be dismissed.
+            for line in [
+                "setw -g mode-keys emacs",
+                "setw -g mode-style reverse",
+                "setw -g copy-mode-position-format ''",
+                "set -g word-separators ' '",
+            ] {
+                assert!(text.contains(line), "missing: {line}");
+            }
             // No *binding* may reintroduce a multi-line wheel step (the
             // comment above them names tmux's default, so skip comments).
             let directives = text

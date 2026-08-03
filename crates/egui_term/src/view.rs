@@ -31,7 +31,9 @@ const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 // so the right/bottom edges never overflow; the floor-division remainder
 // becomes the right/bottom gutter. Draw origin, mouse->grid mapping, and
 // the resize all share this offset so they stay aligned.
-const GRID_INSET: Vec2 = Vec2::new(6.0, 3.0);
+// P33: pub(crate) so the copy-mode coordinate mapping in `backend` subtracts
+// the same offset the renderer and process_mouse_move do.
+pub(crate) const GRID_INSET: Vec2 = Vec2::new(6.0, 3.0);
 
 #[derive(Debug, Clone)]
 enum InputAction {

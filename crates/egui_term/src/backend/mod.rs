@@ -433,6 +433,44 @@ impl TerminalBackend {
         viewport_to_point(display_offset, Point::new(line, col))
     }
 
+    /// muxterm patch P33: where a pane-relative pixel position lands as a
+    /// tmux copy-mode motion - the visible row, and how many `cursor-right`
+    /// presses from that row's column 0 reach it.
+    ///
+    /// Two conversions the app cannot do for itself. tmux counts
+    /// *characters*, not columns: a wide CJK glyph is one press but two
+    /// cells, so a column number handed straight to `cursor-right -N`
+    /// overshoots by one press per wide glyph before it. And `cursor-right`
+    /// does not stop at the end of a row - it wraps onto the next one - so a
+    /// count past the row's content walks the cursor *down* instead of
+    /// clamping. Both are answered off the rendered grid, which is the same
+    /// copy tmux is showing.
+    ///
+    /// `edge` picks the nearest character *boundary* rather than the
+    /// character under the pointer: tmux's selection runs [lower, upper) in
+    /// content order, so boundaries make a press and release inside one cell
+    /// select nothing and a drag past a glyph's midpoint take it whole - the
+    /// rule `selection_side` already uses for the local selection. `false`
+    /// picks the character itself (double/triple click).
+    pub fn copy_target(&self, x: f32, y: f32, edge: bool) -> (usize, usize) {
+        let content = self.last_content();
+        let size = &content.terminal_size;
+        let rows = size.screen_lines().max(1);
+        let x = (x - crate::view::GRID_INSET.x).max(0.0);
+        let y = (y - crate::view::GRID_INSET.y).max(0.0);
+        let row = ((y / size.cell_height.max(1.0)) as usize).min(rows - 1);
+        let col = x / size.cell_width.max(1.0);
+        let grid = &content.grid;
+        let line = Line(row as i32 - grid.display_offset() as i32);
+        let stops = row_stops(
+            (0..size.columns()).map(|c| {
+                let cell = &grid[line][Column(c)];
+                (cell.c, cell.flags)
+            }),
+        );
+        (row, stop_at(&stops, col, edge))
+    }
+
     pub fn selectable_content(&self) -> String {
         let content = self.last_content();
         let mut result = String::new();
@@ -866,6 +904,59 @@ fn pr_regex() -> regex::Regex {
     regex::Regex::new(r"#\d+\b").unwrap()
 }
 
+/// muxterm patch P33: the `cursor-right` stops of one grid row - the column
+/// each character starts at, in order, plus a final entry for the
+/// end-of-content boundary (a legal stop; one press further wraps onto the
+/// next row). Wide-char spacer cells are not characters. The trailing run of
+/// blanks is dropped the way tmux's own line length does it: it walks back
+/// over spaces and padding cells and never looks at their colors, so a row
+/// an agent CLI padded with coloured spaces ends at its last glyph.
+fn row_stops(cells: impl Iterator<Item = (char, Flags)>) -> Vec<usize> {
+    let mut stops = Vec::new();
+    let mut end = 0usize; // 1 past the last non-blank column
+    let mut chars = 0usize; // characters up to and including that column
+    let mut col = 0usize;
+    for (c, flags) in cells {
+        if flags.contains(Flags::WIDE_CHAR_SPACER) {
+            col += 1;
+            continue;
+        }
+        stops.push(col);
+        // The cell walk advances one column per cell - a wide glyph's second
+        // column arrives as its spacer - but the *content* it ends at is two
+        // columns on, which is where the end boundary belongs.
+        let w = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+        if c != ' ' {
+            end = col + w;
+            chars = stops.len();
+        }
+        col += 1;
+    }
+    stops.truncate(chars);
+    stops.push(end);
+    stops
+}
+
+/// muxterm patch P33: the `cursor-right` count for a pointer at fractional
+/// column `col`, snapped to the nearest boundary (`edge`) or to the
+/// character containing it. Never exceeds the row's content, so the cursor
+/// cannot be walked onto the next row.
+fn stop_at(stops: &[usize], col: f32, edge: bool) -> usize {
+    if edge {
+        return (0..stops.len())
+            .min_by(|&a, &b| {
+                let d = |i: usize| (stops[i] as f32 - col).abs();
+                d(a).total_cmp(&d(b))
+            })
+            .unwrap_or(0);
+    }
+    stops
+        .iter()
+        .rposition(|&s| (s as f32) <= col)
+        .unwrap_or(0)
+        .min(stops.len().saturating_sub(2))
+}
+
 /// muxterm patch P19: a grid row wraps into the next when it carries the
 /// WRAPLINE flag (native alacritty soft-wrap) *or* its last column holds a
 /// glyph (a full row). tmux repaints soft-wrapped output as discrete
@@ -1228,6 +1319,90 @@ mod tests {
             None,
         )
         .map(|cands| cands.into_iter().map(|(text, _)| text).collect())
+    }
+
+    /// One grid row's cells, wide glyphs occupying a WIDE_CHAR cell plus a
+    /// WIDE_CHAR_SPACER, padded with blanks to `width` like a real row.
+    fn cells(s: &str, width: usize) -> Vec<(char, Flags)> {
+        let mut out = Vec::new();
+        for c in s.chars() {
+            let wide = matches!(c,
+                '\u{1100}'..='\u{115F}'
+                    | '\u{2E80}'..='\u{A4CF}'
+                    | '\u{AC00}'..='\u{D7A3}'
+                    | '\u{F900}'..='\u{FAFF}'
+                    | '\u{FF00}'..='\u{FF60}');
+            if wide {
+                out.push((c, Flags::WIDE_CHAR));
+                out.push((' ', Flags::WIDE_CHAR_SPACER));
+            } else {
+                out.push((c, Flags::empty()));
+            }
+        }
+        while out.len() < width {
+            out.push((' ', Flags::empty()));
+        }
+        out.truncate(width);
+        out
+    }
+
+    /// P33: tmux's `cursor-right` counts characters, so a wide glyph is one
+    /// press but two columns. Measured against tmux 3.7b on this exact
+    /// string: `-N 7` lands at cx=8, `-N 13` at cx=20, `-N 17` at cx=24.
+    #[test]
+    fn row_stops_counts_characters_not_columns() {
+        let stops = row_stops(cells("wide: 日本語テキスト end", 40).into_iter());
+        assert_eq!(stops, vec![
+            0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 21, 22, 23, 24,
+        ]);
+        // The three measured tmux stops, by press count.
+        assert_eq!(stops[7], 8);
+        assert_eq!(stops[13], 20);
+        assert_eq!(stops[17], 24);
+    }
+
+    /// The trailing blanks are dropped the way tmux's line length is, and
+    /// the final entry is the end-of-content boundary - a legal stop, one
+    /// press past which wraps onto the next row.
+    #[test]
+    fn row_stops_trims_trailing_blanks_like_tmux() {
+        assert_eq!(*row_stops(cells("xy日z  ", 20).into_iter()).last().unwrap(), 5);
+        // A row ending in a wide glyph ends past both of its columns.
+        assert_eq!(*row_stops(cells("abc日", 20).into_iter()).last().unwrap(), 5);
+        // An all-blank row has nowhere to go but column 0.
+        assert_eq!(row_stops(cells("", 20).into_iter()), vec![0]);
+        // Colour never enters into it: a padded row still ends at its glyph.
+        assert_eq!(*row_stops(cells("hi    ", 20).into_iter()).last().unwrap(), 2);
+    }
+
+    /// `edge` snaps to the nearest character boundary, which is what makes a
+    /// drag past a glyph's midpoint take it whole - and never returns a stop
+    /// that would walk the cursor onto the next row.
+    #[test]
+    fn stop_at_snaps_to_the_nearest_boundary() {
+        let stops = row_stops(cells("xy日z", 20).into_iter()); // [0,1,2,4,5]
+        assert_eq!(stop_at(&stops, 6.4, true), 4); // past the end -> boundary
+        assert_eq!(stop_at(&stops, 3.6, true), 3); // past the wide glyph
+        assert_eq!(stop_at(&stops, 2.2, true), 2); // still before it
+        // Without `edge` the character containing the point wins, and the
+        // end boundary is never it.
+        assert_eq!(stop_at(&stops, 3.0, false), 2); // inside the wide glyph
+        assert_eq!(stop_at(&stops, 4.5, false), 3);
+        assert_eq!(stop_at(&stops, 99.0, false), 3);
+        // Every result is a real press count for this row.
+        for c in [0.0f32, 1.4, 2.9, 5.5, 40.0] {
+            assert!(stop_at(&stops, c, true) < stops.len());
+            assert!(stop_at(&stops, c, false) <= stops.len() - 2);
+        }
+    }
+
+    /// Press and release inside the same half-cell must select nothing.
+    #[test]
+    fn stop_at_inside_one_cell_selects_nothing() {
+        let stops = row_stops(cells("abcd", 20).into_iter());
+        assert_eq!(stop_at(&stops, 0.1, true), stop_at(&stops, 0.4, true));
+        // ...but crossing the midpoint takes the character.
+        assert!(stop_at(&stops, 0.4, true) < stop_at(&stops, 0.6, true));
     }
 
     /// The best link text found when clicking (line, col) of `content`.
