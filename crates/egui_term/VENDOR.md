@@ -410,3 +410,23 @@ tmux-backed design. Local patches:
   caller - the app hands the highlight over to tmux's own (`mode-style
   reverse`, which arrives as `ESC[7m` and renders through the same fg/bg
   swap, so the swap is invisible) once the first update lands.
+- **P34** (`src/theme.rs`, `readable`, `contrast_ratio`, `src/view.rs`,
+  `set_min_contrast`): a contrast floor for cell text. A theme only owns the
+  16 ANSI slots - the 256-color cube and truecolor escapes are fixed values
+  it has no say over - so a TUI that assumes a dark background paints text
+  that vanishes on a light theme. Measured from a real pane: xterm index 230
+  (`#ffffd7`) on `#ffffff` is a contrast ratio of 1.02, text the same color
+  as the paper. `readable` bisects a blend of the foreground toward black or
+  white, whichever the background is *not*, until it meets a target WCAG
+  ratio, and returns it untouched when it already does - so a palette chosen
+  deliberately is unaffected and only the genuinely unreadable moves (index
+  230 lands on `#96967e` at exactly 3.0, while the same pane's `#af8700` at
+  3.34 is left alone). Blending toward an extreme rather than desaturating
+  is what keeps the hue: the text stays recognisably yellow, it just stops
+  being invisible. Applied in `show` *after* the dim multiply and the
+  inverse/selection swap, so what is guarded is the pair actually painted,
+  and memoised per (fg, bg) pair - a grid holds a handful of them and the
+  bisection is far too costly to run per cell. The ratio joins the P22 cache
+  key, since changing it recolors shapes already cached. Default 1.0, which
+  disables the guard: the widget standalone still renders exactly what the
+  application asked for, and muxterm sets it from config `min_contrast`.

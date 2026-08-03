@@ -113,6 +113,8 @@ pub struct App {
     /// Mouse selections copy to the clipboard as soon as they finish
     /// (config `copy_on_select`; the tmux side lives in tmux.conf).
     copy_on_select: bool,
+    /// Contrast floor for terminal text (config `min_contrast`); 1.0 off.
+    min_contrast: f32,
     settings_open: bool,
     /// Which settings tab shows; survives close so cmd+shift+n's "no
     /// projects yet" jump lands on Projects.
@@ -349,6 +351,7 @@ impl App {
             theme_name: style.name,
             pane_titles: style.pane_titles,
             copy_on_select: style.copy_on_select,
+            min_contrast: style.min_contrast,
             settings_open: false,
             settings_tab: settings::Tab::default(),
             project_draft: settings::ProjectDraft::default(),
@@ -2416,6 +2419,7 @@ impl App {
             self.git.clear();
         }
         self.copy_on_select = style.copy_on_select;
+        self.min_contrast = style.min_contrast;
         // The drag-end side of copy-on-select and the cmd+f search
         // highlight are tmux settings; rewrite the conf and re-source it
         // into the running server whenever its content actually changed
@@ -3693,6 +3697,7 @@ impl eframe::App for App {
                         &self.term_theme,
                         &self.ui_theme,
                         self.copy_on_select,
+                        self.min_contrast,
                         !archived,
                         bar_h,
                         &mut rects,
@@ -4375,6 +4380,7 @@ fn show_node(
     term_theme: &TerminalTheme,
     ui_theme: &UiTheme,
     copy_on_select: bool,
+    min_contrast: f32,
     // False for a peeked archived workspace: panes render as a dimmed,
     // read-only preview - no input, no divider drag, no focus ring.
     interactive: bool,
@@ -4406,6 +4412,7 @@ fn show_node(
                 }))
                 .set_theme(term_theme.clone())
                 .set_copy_on_select(copy_on_select)
+                .set_min_contrast(min_contrast)
                 .set_interactive(interactive);
             let response = child.add(view);
             if !interactive {
@@ -4503,8 +4510,8 @@ fn show_node(
             );
             show_node(
                 ui, first, first_rect, path << 1, panes, focused, font,
-                term_theme, ui_theme, copy_on_select, interactive, bar_h,
-                rects, term_rects, ui_actions,
+                term_theme, ui_theme, copy_on_select, min_contrast,
+                interactive, bar_h, rects, term_rects, ui_actions,
             );
             show_node(
                 ui,
@@ -4517,6 +4524,7 @@ fn show_node(
                 term_theme,
                 ui_theme,
                 copy_on_select,
+                min_contrast,
                 interactive,
                 bar_h,
                 rects,

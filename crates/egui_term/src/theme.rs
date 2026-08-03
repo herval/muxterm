@@ -87,6 +87,62 @@ impl Default for TerminalTheme {
     }
 }
 
+/// muxterm patch P34: WCAG relative luminance.
+fn luminance(c: Color32) -> f32 {
+    let ch = |v: u8| {
+        let s = v as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+}
+
+/// muxterm patch P34: the WCAG contrast ratio between two colors, 1.0 (identical)
+/// to 21.0 (black on white).
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+/// muxterm patch P34: push `fg` away from `bg` until it reads at `target`
+/// contrast, leaving it alone when it already does. A terminal's 256-color
+/// cube and its truecolor escapes are fixed values the theme has no say over,
+/// so an app that assumes a dark background - most TUIs - paints near-white
+/// text that vanishes on a light one. Blending toward black or white (whichever
+/// the background is not) is what preserves the hue: the color stays
+/// recognisably itself, it just stops being invisible.
+pub fn readable(fg: Color32, bg: Color32, target: f32) -> Color32 {
+    if target <= 1.0 || contrast_ratio(fg, bg) >= target {
+        return fg;
+    }
+    let toward = if luminance(bg) > 0.18 {
+        Color32::BLACK
+    } else {
+        Color32::WHITE
+    };
+    // The ratio is monotonic in the blend factor, so bisect it. Twelve
+    // rounds put the answer inside half a step of 8-bit color.
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..12 {
+        let mid = 0.5 * (lo + hi);
+        if contrast_ratio(mix(fg, toward, mid), bg) >= target {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    mix(fg, toward, hi)
+}
+
 impl TerminalTheme {
     pub fn new(palette: Box<ColorPalette>) -> Self {
         let hash = {
@@ -229,4 +285,78 @@ fn hex_to_color(hex: &str) -> anyhow::Result<Color32> {
     let b = u8::from_str_radix(&hex[5..7], 16)?;
 
     Ok(Color32::from_rgb(r, g, b))
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    /// xterm 256-color index 230 (#ffffd7) on a white background: the exact
+    /// pair that made a light theme unreadable. Its ratio is ~1.05 - text and
+    /// paper are the same color - and the guard has to fix it without
+    /// turning it grey.
+    #[test]
+    fn near_white_text_on_white_becomes_legible() {
+        let cream = Color32::from_rgb(0xff, 0xff, 0xd7);
+        let white = Color32::from_rgb(0xff, 0xff, 0xff);
+        assert!(contrast_ratio(cream, white) < 1.1);
+        let fixed = readable(cream, white, 3.0);
+        assert!(
+            contrast_ratio(fixed, white) >= 3.0,
+            "ratio {} for {fixed:?}",
+            contrast_ratio(fixed, white),
+        );
+        // Still recognisably the same hue: yellow keeps red and green high
+        // and blue lowest.
+        assert!(fixed.b() < fixed.r() && fixed.b() < fixed.g());
+    }
+
+    /// A color that already reads is returned untouched - the guard must not
+    /// flatten a palette that was chosen deliberately.
+    #[test]
+    fn adequate_contrast_is_left_alone() {
+        let bg = Color32::from_rgb(0x1d, 0x1e, 0x23);
+        for fg in [
+            Color32::from_rgb(0xff, 0xff, 0xff),
+            Color32::from_rgb(0x9a, 0x67, 0x00),
+            Color32::from_rgb(0x00, 0xa6, 0x00),
+        ] {
+            if contrast_ratio(fg, bg) >= 3.0 {
+                assert_eq!(readable(fg, bg, 3.0), fg);
+            }
+        }
+        // And a ratio of 1.0 disables the guard entirely.
+        let invisible = Color32::from_rgb(0x1d, 0x1e, 0x23);
+        assert_eq!(readable(invisible, bg, 1.0), invisible);
+    }
+
+    /// On a dark background the guard lifts text toward white instead.
+    #[test]
+    fn dark_text_on_dark_is_lifted_not_darkened() {
+        let bg = Color32::from_rgb(0x00, 0x00, 0x00);
+        let nearly_black = Color32::from_rgb(0x10, 0x10, 0x18);
+        let fixed = readable(nearly_black, bg, 3.0);
+        assert!(contrast_ratio(fixed, bg) >= 3.0);
+        assert!(fixed.r() > nearly_black.r());
+    }
+
+    /// Every 256-cube color against both extremes ends up legible, and the
+    /// guard always terminates.
+    #[test]
+    fn the_guard_reaches_its_target_for_every_cube_color() {
+        for r in [0u8, 0x5f, 0x87, 0xaf, 0xd7, 0xff] {
+            for g in [0u8, 0x5f, 0x87, 0xaf, 0xd7, 0xff] {
+                for b in [0u8, 0x5f, 0x87, 0xaf, 0xd7, 0xff] {
+                    let fg = Color32::from_rgb(r, g, b);
+                    for bg in [Color32::WHITE, Color32::BLACK] {
+                        let out = readable(fg, bg, 3.0);
+                        assert!(
+                            contrast_ratio(out, bg) >= 2.99,
+                            "{fg:?} on {bg:?} -> {out:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

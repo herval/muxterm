@@ -75,6 +75,10 @@ pub struct TerminalView<'a> {
     // (keyboard, pointer, link hover) - a read-only preview, e.g. a peeked
     // archived workspace. On by default.
     interactive: bool,
+    // muxterm patch P34: the contrast ratio a cell's text must reach against
+    // the background it is painted on. 1.0 (the default) disables the guard,
+    // so the widget standalone renders exactly what the app asked for.
+    min_contrast: f32,
 }
 
 impl Widget for TerminalView<'_> {
@@ -116,6 +120,7 @@ impl<'a> TerminalView<'a> {
             bindings_layout: BindingsLayout::new(),
             copy_on_select: false,
             interactive: true,
+            min_contrast: 1.0,
         }
     }
 
@@ -146,6 +151,14 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_copy_on_select(mut self, copy_on_select: bool) -> Self {
         self.copy_on_select = copy_on_select;
+        self
+    }
+
+    /// muxterm patch P34: floor every cell's text contrast against whatever
+    /// it is painted on. 1.0 disables it.
+    #[inline]
+    pub fn set_min_contrast(mut self, ratio: f32) -> Self {
+        self.min_contrast = ratio;
         self
     }
 
@@ -408,6 +421,7 @@ impl<'a> TerminalView<'a> {
             theme_hash: self.theme.cache_key(),
             ppp_bits: layout.ctx.pixels_per_point().to_bits(),
             hover,
+            min_contrast_bits: self.min_contrast.to_bits(),
         };
         let atlas_ratio = painter.fonts(|f| f.font_atlas_fill_ratio());
         if let Some(cache) = &self.backend.render_cache {
@@ -453,6 +467,11 @@ impl<'a> TerminalView<'a> {
         // (row, column) the previous cell ended at; a mismatch (row change
         // or the spacer skipped after a wide char) breaks both runs.
         let mut run_cursor: Option<(i32, usize)> = None;
+        // P34: one entry per distinct (fg, bg) pair in the grid.
+        let mut contrast_cache: std::collections::HashMap<
+            ([u8; 4], [u8; 4]),
+            Color32,
+        > = std::collections::HashMap::new();
 
         for indexed in content.grid.display_iter() {
             let flags = indexed.cell.flags;
@@ -494,6 +513,16 @@ impl<'a> TerminalView<'a> {
 
             if is_inverse || is_selected {
                 std::mem::swap(&mut fg, &mut bg);
+            }
+
+            // muxterm patch P34: after the swap, so what is guarded is the
+            // pair actually painted. Memoised on the pair - a grid uses a
+            // handful of them, and the bisection is far too costly per cell.
+            if self.min_contrast > 1.0 {
+                let key = (fg.to_array(), bg.to_array());
+                fg = *contrast_cache.entry(key).or_insert_with(|| {
+                    crate::theme::readable(fg, bg, self.min_contrast)
+                });
             }
 
             if run_cursor != Some((line_num, column)) {
@@ -703,6 +732,9 @@ struct RenderCacheKey {
     /// generation because the P10 hover re-sync rewrites it on every
     /// cmd-held frame without marking the backend dirty.
     hover: Option<RangeInclusive<TerminalGridPoint>>,
+    /// P34: the contrast floor recolors cells, so a live config change to it
+    /// has to invalidate the shapes it already produced.
+    min_contrast_bits: u32,
 }
 
 /// A horizontal stretch of cells sharing one background color.

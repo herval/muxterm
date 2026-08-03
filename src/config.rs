@@ -50,6 +50,15 @@ agent = "{default}"
 # Show each pane's title in its top-right corner when the tab is split.
 # pane_titles = true
 
+# Minimum contrast ratio (WCAG, 1.0-21.0) between a cell's text and what it
+# is painted on. A terminal's 256-color and truecolor escapes are fixed
+# values no theme can remap, so a TUI that assumes a dark background paints
+# near-white text that vanishes on a light theme; this pushes such text
+# toward black or white until it is legible, and leaves everything that
+# already reads alone. 1.0 disables it and shows exactly what the app asked
+# for. 3.0 is WCAG AA for large text.
+# min_contrast = 3.0
+
 # Copy mouse selections straight to the clipboard (iTerm's "copy on
 # select"). Off by default: select, then copy explicitly with cmd+c.
 copy_on_select = false
@@ -122,6 +131,9 @@ pub struct ConfigFile {
     /// Lines of pane scrollback sent to the agent as context; 0 disables.
     /// 0.0 disables dimming of unfocused panes; 0.12 is the default wash.
     pub dim_inactive_panes: f32,
+    /// Contrast floor (WCAG ratio) for terminal text against its own
+    /// background; 1.0 disables. See the sample config for why.
+    pub min_contrast: f32,
     /// Show each pane's title in its top-right corner when the tab is split.
     pub pane_titles: bool,
     /// Mouse selections copy to the clipboard as soon as they finish.
@@ -167,6 +179,7 @@ impl Default for ConfigFile {
             theme: "iterm-dark".into(),
             agent: agent::default_agent().id.into(),
             dim_inactive_panes: 0.12,
+            min_contrast: 3.0,
             pane_titles: true,
             copy_on_select: false,
             git_status: true,
@@ -202,6 +215,7 @@ pub struct Style {
     pub agent: &'static Agent,
     pub pane_titles: bool,
     pub copy_on_select: bool,
+    pub min_contrast: f32,
     pub git_status: bool,
     pub pr_status: bool,
     pub pr_detector: bool,
@@ -337,6 +351,7 @@ pub fn resolve(
             agent,
             pane_titles: cfg.pane_titles,
             copy_on_select: cfg.copy_on_select,
+            min_contrast: cfg.min_contrast,
             git_status: cfg.git_status,
             pr_status: cfg.pr_status,
             pr_detector: cfg.pr_detector,
