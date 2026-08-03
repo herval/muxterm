@@ -192,6 +192,10 @@ pub struct App {
     /// while its tab is still here; `mux rename` removes it, so a deliberate
     /// name can't be clobbered by a late auto-title.
     naming: HashSet<String>,
+    /// A `select_and_scroll` fork still in flight (`scroll_intercept`). Wheel
+    /// reports are swallowed while it is pending so the scroll can't outrun
+    /// the copy-mode anchor it is handing off to.
+    scroll_handoff: Option<Arc<AtomicBool>>,
     /// session -> foreground command + cwd, refreshed once a second (one
     /// `list-panes -a` round trip). The command is liveness for the
     /// agent-state files (a pane whose foreground returned to a shell has no
@@ -374,6 +378,7 @@ impl App {
             title_tx,
             title_rx,
             naming: HashSet::new(),
+            scroll_handoff: None,
             pane_snap: HashMap::new(),
             agent_states: std::collections::BTreeMap::new(),
             bg_jobs: HashSet::new(),
@@ -2649,8 +2654,29 @@ impl App {
             }
             (dy, unit)
         });
-        if unit.is_none() || dy == 0.0 {
+        let Some(unit) = unit else {
             return;
+        };
+        if dy == 0.0 {
+            return;
+        }
+        // A previous handoff's fork is still in flight. Forwarding a wheel
+        // report now would scroll the pane before tmux replays the anchor
+        // coordinates, so the copy-mode selection would land on the wrong
+        // rows - the report goes down the PTY, the handoff over the control
+        // socket, and nothing orders the two. Swallow until it lands; the
+        // window is one fork, and wheel events keep frames coming, so the
+        // flag is re-checked immediately.
+        if let Some(done) = &self.scroll_handoff {
+            if done.load(Ordering::Acquire) {
+                self.scroll_handoff = None;
+            } else {
+                ctx.input_mut(|i| {
+                    i.events
+                        .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }))
+                });
+                return;
+            }
         }
         let hover = ctx.input(|i| i.pointer.hover_pos());
 
@@ -2688,12 +2714,19 @@ impl App {
             let sc = range.start.column.0;
             let er = row(range.end.line.0);
             let ec = range.end.column.0;
-            let cell_h = content.terminal_size.cell_height.max(1.0);
-            let mut lines = match unit {
-                Some(egui::MouseWheelUnit::Line) => dy.round() as i32,
-                Some(egui::MouseWheelUnit::Point) => (dy / cell_h).round() as i32,
-                _ => 0,
-            };
+            // The widget's own conversion (egui_term P29), so the handoff
+            // scrolls exactly as far as an ordinary wheel would. The
+            // accumulator is a throwaway: this consumes one frame's delta and
+            // then the local selection is gone, so there is no remainder to
+            // carry - but a sub-line flick must still prime a line, since the
+            // handoff is committed by now and a motionless one reads as a
+            // dropped gesture.
+            let cell_h = content.terminal_size.cell_height;
+            let viewport = content.terminal_size.screen_lines() as f32;
+            let mut acc = 0.0;
+            let mut lines = egui_term::wheel_delta_to_lines(
+                &mut acc, unit, dy, cell_h, viewport,
+            );
             if lines == 0 {
                 lines = dy.signum() as i32; // at least one line in the direction
             }
@@ -2701,7 +2734,8 @@ impl App {
         };
 
         let (session, sr, sc, er, ec, lines) = handoff;
-        self.tmux.select_and_scroll(&session, sr, sc, er, ec, lines);
+        self.scroll_handoff =
+            Some(self.tmux.select_and_scroll(&session, sr, sc, er, ec, lines));
         if let Some(pane) = self
             .tabs
             .get(self.active)

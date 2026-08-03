@@ -132,6 +132,15 @@ impl Default for TerminalSize {
     }
 }
 
+impl TerminalSize {
+    /// muxterm patch P29: visible rows, reachable without naming alacritty's
+    /// Dimensions trait - muxterm has no alacritty dependency of its own, and
+    /// its scroll_intercept needs the viewport height for a Page wheel.
+    pub fn screen_lines(&self) -> usize {
+        self.num_lines as usize
+    }
+}
+
 impl Dimensions for TerminalSize {
     fn total_lines(&self) -> usize {
         self.screen_lines()

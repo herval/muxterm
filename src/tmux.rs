@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use egui_term::BackendSettings;
@@ -41,6 +43,21 @@ bind -n S-PPage copy-mode -u
 # mouse-mode app and move its cursor.
 bind -n MouseDown1Pane if -F '#{mouse_any_flag}' {send -M} {select-pane -t =}
 bind -n MouseUp1Pane if -F '#{mouse_any_flag}' {send -M} {select-pane -t =}
+# One wheel report scrolls one line. The client already sends exactly the
+# number of reports the gesture earned (egui_term P29 measures the delta in
+# rendered cell heights), so tmux's default copy-mode step of `-N 5` scaled
+# every flick by five and turned scrolling into jumps. The root binding keeps
+# the stock guard verbatim - `send -M` is how a pager gets the wheel
+# translated into arrow keys (#{alternate_on}) and how a mouse-tracking app
+# gets the report at all (#{mouse_any_flag}) - and only changes the arm that
+# enters copy-mode, which used to swallow the report that opened it. `-e`
+# still auto-exits at the bottom. WheelDownPane needs no root binding: with
+# no scrollback to enter, tmux's default already does the right thing.
+bind -n WheelUpPane if -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' {send -M} {copy-mode -e ; send-keys -X scroll-up}
+bind -T copy-mode WheelUpPane send-keys -X scroll-up
+bind -T copy-mode WheelDownPane send-keys -X scroll-down
+bind -T copy-mode-vi WheelUpPane send-keys -X scroll-up
+bind -T copy-mode-vi WheelDownPane send-keys -X scroll-down
 "##;
 
 /// Theme-derived colors for tmux's copy-mode search highlight, built by
@@ -354,6 +371,13 @@ impl TmuxCtl {
     /// chained with lone `;` elements. Once tmux owns the selection it keeps
     /// it across further scrolling (extending along, copy-mode style) and
     /// cmd+c copies it via the existing `copy_intercept` path.
+    ///
+    /// Runs on a detached thread - the fork cost the UI thread a whole frame
+    /// at the exact moment the user is scrolling, which is what made the
+    /// handoff feel like a stutter. The returned flag flips once `output()`
+    /// returns, i.e. once the server has *executed* the sequence; the caller
+    /// holds wheel reports back until then, because those travel down the PTY
+    /// while this goes over the control socket and nothing orders the two.
     pub fn select_and_scroll(
         &self,
         session: &str,
@@ -362,10 +386,16 @@ impl TmuxCtl {
         er: usize,
         ec: usize,
         lines: i32,
-    ) {
-        let _ = Command::new(&self.bin)
-            .args(select_scroll_argv(session, sr, sc, er, ec, lines))
-            .output();
+    ) -> Arc<AtomicBool> {
+        let done = Arc::new(AtomicBool::new(false));
+        let bin = self.bin.clone();
+        let argv = select_scroll_argv(session, sr, sc, er, ec, lines);
+        let flag = done.clone();
+        std::thread::spawn(move || {
+            let _ = Command::new(&bin).args(argv).output();
+            flag.store(true, Ordering::Release);
+        });
+        done
     }
 
     /// iTerm-style cmd+k: clear the pane's visible screen and its scrollback.
@@ -745,6 +775,16 @@ mod tests {
             "scroll-down",  // lines<0
         ]);
         assert!(b.join(" ").contains("-X -N 2 scroll-down"));
+
+        // A zero-line handoff still recreates the selection but must not
+        // emit a scroll step in either direction.
+        let c = select_scroll_argv("mux-cccc", 1, 0, 1, 3, 0);
+        assert!(
+            !x_cmds(&c).iter().any(|x| x.starts_with("scroll")),
+            "{:?}",
+            x_cmds(&c),
+        );
+        assert!(x_cmds(&c).contains(&"begin-selection".to_string()));
     }
 
     #[test]
@@ -865,6 +905,45 @@ mod tests {
             assert!(text.contains(
                 "bind -n MouseUp1Pane if -F '#{mouse_any_flag}' {send -M} {select-pane -t =}"
             ));
+        }
+    }
+
+    /// One wheel report = one line. tmux's default copy-mode step is `-N 5`,
+    /// which multiplied every gesture by five on top of a client that already
+    /// sends one report per line earned (egui_term P29).
+    #[test]
+    fn conf_binds_one_line_wheel_steps() {
+        for text in [conf(true, &style()), conf(false, &style())] {
+            for table in ["copy-mode", "copy-mode-vi"] {
+                for (key, cmd) in [
+                    ("WheelUpPane", "scroll-up"),
+                    ("WheelDownPane", "scroll-down"),
+                ] {
+                    assert!(
+                        text.contains(&format!(
+                            "bind -T {table} {key} send-keys -X {cmd}\n"
+                        )),
+                        "{table}/{key} must scroll exactly one line",
+                    );
+                }
+            }
+            // The root binding's guard is load-bearing: `alternate_on` is what
+            // gives pagers wheel->arrow translation and `mouse_any_flag` is
+            // what lets a tracking app see the wheel at all. Only the
+            // copy-mode-entering arm may differ from tmux's default.
+            assert!(text.contains(
+                "bind -n WheelUpPane if -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' {send -M} {copy-mode -e ; send-keys -X scroll-up}"
+            ));
+            // No *binding* may reintroduce a multi-line wheel step (the
+            // comment above them names tmux's default, so skip comments).
+            let directives = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>();
+            assert!(
+                !directives.iter().any(|l| l.contains("-X -N")),
+                "a counted wheel step came back: {directives:?}",
+            );
         }
     }
 

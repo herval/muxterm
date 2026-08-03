@@ -1,4 +1,3 @@
-use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point as TerminalGridPoint;
 use alacritty_terminal::term::cell;
 use alacritty_terminal::term::TermMode;
@@ -53,7 +52,9 @@ pub struct TerminalViewState {
     // than by re-checking modifiers, which the user may have let go of
     // before releasing the button.
     relayed_click: bool,
-    scroll_pixels: f32,
+    // muxterm patch P29: the sub-line remainder of the wheel gesture, in
+    // *lines* (upstream accumulated pixels against the font's point size).
+    scroll_lines: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
 }
 
@@ -202,6 +203,22 @@ impl<'a> TerminalView<'a> {
         let accepts_keyboard = layout.has_focus();
         let accepts_pointer = layout.contains_pointer() || state.is_dragged;
 
+        // muxterm patch P32: un-stick a drag whose release never arrived
+        // (focus stolen mid-drag, a native dialog, a release delivered to
+        // another window). is_dragged is only cleared by a release event, and
+        // accepts_pointer includes it, so the selection kept extending on
+        // every later mouse move with no button held. Trust egui's own
+        // pointer state instead - except while this frame carries the
+        // release, which the event loop below handles normally (P8
+        // copy-on-select needs the final motion applied first).
+        if state.is_dragged
+            && layout.ctx.input(|i| {
+                !i.pointer.primary_down() && !i.pointer.primary_released()
+            })
+        {
+            state.is_dragged = false;
+        }
+
         // muxterm patch P10: cmd-held link hover, synced every frame rather
         // than only on mouse-move events, so pressing cmd in place lights
         // the link up, releasing cmd (or leaving the pane) clears it, and
@@ -239,7 +256,17 @@ impl<'a> TerminalView<'a> {
         }
 
         let events = layout.ctx.input(|i| i.events.clone());
-        for event in events {
+        // muxterm patch P31: a high-rate pointer can queue several moves in
+        // one frame, and each used to issue a SelectUpdate - a term-lock
+        // acquisition and selection recompute - though only the last position
+        // of a run can ever render. Only the move that *ends a run* updates
+        // the selection. Deliberately per-run and not per-frame: a release
+        // sitting between two moves must still see the selection extended to
+        // the move before it, or P8 copy-on-select copies a stale range.
+        let mut events = events.into_iter().peekable();
+        while let Some(event) = events.next() {
+            let ends_move_run =
+                !matches!(events.peek(), Some(egui::Event::PointerMoved(_)));
             let mut input_actions = vec![];
 
             match event {
@@ -277,8 +304,10 @@ impl<'a> TerminalView<'a> {
                     input_actions.push(process_mouse_wheel(
                         state,
                         self.backend,
-                        &modifiers,
-                        self.font.font_type().size,
+                        // P29: rows are drawn at font_measure's height, so
+                        // that - not the font's point size - is what one
+                        // line of wheel travel is worth.
+                        self.font.font_measure(&layout.ctx).height,
                         unit,
                         delta,
                     ))
@@ -315,6 +344,7 @@ impl<'a> TerminalView<'a> {
                         self.backend,
                         pos,
                         &modifiers,
+                        ends_move_run,
                     )
                 },
                 _ => {},
@@ -859,26 +889,54 @@ fn process_keyboard_key(
     }
 }
 
+/// muxterm patch P29: the one wheel-delta -> whole-lines conversion, shared
+/// with muxterm's scroll_intercept so a copy-mode handoff scrolls exactly
+/// what the widget would have. `accum` carries the sub-line remainder across
+/// events and frames; a direction flip forfeits it (a reversed gesture owes
+/// nothing to the old one). Point deltas are measured in rendered cell
+/// heights - not the font's point size, which is ~1.3x smaller and made
+/// every trackpad tick over-report lines - and a Page is one viewport.
+pub fn wheel_delta_to_lines(
+    accum: &mut f32,
+    unit: MouseWheelUnit,
+    delta_y: f32,
+    cell_height: f32,
+    viewport_lines: f32,
+) -> i32 {
+    let delta_lines = match unit {
+        MouseWheelUnit::Line => delta_y,
+        MouseWheelUnit::Point => delta_y / cell_height.max(1.0),
+        MouseWheelUnit::Page => delta_y * viewport_lines,
+    };
+    // Multiplication rather than signum(): signum is +-1.0 for +-0.0, which
+    // would read a fresh (zero) accumulator as a flip.
+    if *accum * delta_lines < 0.0 {
+        *accum = 0.0;
+    }
+    *accum += delta_lines;
+    let lines = accum.trunc();
+    *accum -= lines;
+    lines as i32
+}
+
 fn process_mouse_wheel(
     state: &mut TerminalViewState,
     backend: &mut TerminalBackend,
-    modifiers: &Modifiers,
-    font_size: f32,
+    cell_height: f32,
     unit: MouseWheelUnit,
     delta: Vec2,
 ) -> InputAction {
-    let lines = match unit {
-        MouseWheelUnit::Line => {
-            (delta.y.signum() * delta.y.abs().ceil()) as i32
-        },
-        MouseWheelUnit::Point => {
-            state.scroll_pixels -= delta.y;
-            let lines = (state.scroll_pixels / font_size).trunc();
-            state.scroll_pixels %= font_size;
-            -lines as i32
-        },
-        MouseWheelUnit::Page => 0,
-    };
+    // Viewport rows for the Page unit only; a frame of staleness is harmless
+    // (and this is the one metric font_measure cannot give us).
+    let viewport_lines =
+        backend.last_content().terminal_size.screen_lines() as f32;
+    let lines = wheel_delta_to_lines(
+        &mut state.scroll_lines,
+        unit,
+        delta.y,
+        cell_height,
+        viewport_lines,
+    );
 
     if lines == 0 {
         return InputAction::Ignore;
@@ -897,9 +955,15 @@ fn process_mouse_wheel(
         };
         let point = state.current_mouse_position_on_grid;
         for _ in 0..lines.abs() {
+            // muxterm patch P30: report a *bare* wheel. The modifier bits are
+            // added to the button code (shift+4, alt+8, cmd+16), so a held
+            // modifier turned button 64/65 into 68/69 or 80/81, which tmux
+            // does not route through its wheel bindings at all - scrolling
+            // with cmd held (link hover) or shift held simply stopped
+            // working. Same call as P25's relayed clicks.
             backend.process_command(BackendCommand::MouseReport(
                 button.clone(),
-                *modifiers,
+                Modifiers::default(),
                 point,
                 true,
             ));
@@ -1105,6 +1169,7 @@ fn process_mouse_move(
     backend: &TerminalBackend,
     position: Pos2,
     modifiers: &Modifiers,
+    ends_move_run: bool,
 ) -> Vec<InputAction> {
     let terminal_content = backend.last_content();
     // P17: shift into grid space past the top-left inset before mapping to
@@ -1121,7 +1186,8 @@ fn process_mouse_move(
     let mut actions = vec![];
     // muxterm patch P16: drags are always the local selection - left-button
     // events are never reported to the application (see process_left_button).
-    if state.is_dragged {
+    // P31: only the move that ends a run needs to move the selection.
+    if state.is_dragged && ends_move_run {
         actions.push(InputAction::BackendCall(BackendCommand::SelectUpdate(
             cursor_x, cursor_y,
         )));
@@ -1136,4 +1202,69 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed a gesture through the converter, collecting what each event emits.
+    fn run(unit: MouseWheelUnit, deltas: &[f32], cell: f32) -> Vec<i32> {
+        let mut accum = 0.0;
+        deltas
+            .iter()
+            .map(|d| wheel_delta_to_lines(&mut accum, unit, *d, cell, 40.0))
+            .collect()
+    }
+
+    /// A trackpad's pixel deltas are worth a line when they add up to a
+    /// *rendered row*. Upstream divided by the font's point size (~1.3x
+    /// smaller), so a slow drift emitted a line early and often.
+    #[test]
+    fn trackpad_points_accumulate_to_cell_height() {
+        assert_eq!(
+            run(MouseWheelUnit::Point, &[10.0, 10.0, 10.0, 10.0], 30.0),
+            vec![0, 0, 1, 0],
+        );
+    }
+
+    /// Sub-line wheel deltas wait in the accumulator instead of each
+    /// rounding up to a whole line (upstream's ceil made this 1,1,1).
+    #[test]
+    fn line_deltas_no_longer_ceil() {
+        assert_eq!(
+            run(MouseWheelUnit::Line, &[0.4, 0.4, 0.4], 30.0),
+            vec![0, 0, 1],
+        );
+        // A full notch still scrolls immediately, undivided.
+        assert_eq!(run(MouseWheelUnit::Line, &[3.0], 30.0), vec![3]);
+    }
+
+    /// Reversing direction forfeits the remainder: the new gesture owes
+    /// nothing to the old one, and carrying it would make the first flick
+    /// back feel dead (or overshoot by a line).
+    #[test]
+    fn direction_flip_forfeits_remainder() {
+        let mut accum = 0.0;
+        let mut go = |d: f32| {
+            wheel_delta_to_lines(&mut accum, MouseWheelUnit::Line, d, 30.0, 40.0)
+        };
+        assert_eq!(go(0.9), 0);
+        assert_eq!(go(-0.9), 0);
+        assert_eq!(go(-0.2), -1);
+    }
+
+    /// A page is a viewport, not a dropped event (upstream returned 0).
+    #[test]
+    fn page_scrolls_viewport_lines() {
+        assert_eq!(run(MouseWheelUnit::Page, &[1.0], 30.0), vec![40]);
+    }
+
+    /// Sign convention is load-bearing: positive delta must stay "scroll up"
+    /// (MouseButton::ScrollUp / SGR 64), matching both upstream arms.
+    #[test]
+    fn positive_delta_scrolls_up() {
+        assert!(run(MouseWheelUnit::Line, &[3.0], 30.0)[0] > 0);
+        assert!(run(MouseWheelUnit::Point, &[90.0], 30.0)[0] > 0);
+    }
 }

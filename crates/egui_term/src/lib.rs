@@ -12,4 +12,4 @@ pub use backend::{
 pub use bindings::{Binding, BindingAction, InputKind, KeyboardBinding};
 pub use font::{FontSettings, TerminalFont};
 pub use theme::{ColorPalette, TerminalTheme};
-pub use view::TerminalView;
+pub use view::{wheel_delta_to_lines, TerminalView};

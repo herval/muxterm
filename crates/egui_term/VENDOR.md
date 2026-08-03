@@ -327,3 +327,50 @@ tmux-backed design. Local patches:
   off the hover path. muxterm implements the validator with
   `links::resolve_target`, the same function the opener uses, answering
   from the App's once-a-second pane-cwd snapshot rather than a tmux call.
+- **P29** (`src/view.rs`, `process_mouse_wheel`, `wheel_delta_to_lines`,
+  `src/backend/mod.rs`, `TerminalSize::screen_lines`): honest wheel math.
+  Trackpad (Point) deltas were divided by the font's *point* size while a
+  rendered row is `font_measure(..).height` - ~1.3x taller - so every tick
+  bought more lines than it had travelled; wheel (Line) deltas were
+  `ceil`'d per event, turning any sub-line nudge into a whole line with no
+  remainder carried across frames; Page deltas were dropped on the floor.
+  One pure `pub` helper now normalizes every unit to fractional lines
+  (Point / cell height, Page x viewport rows), accumulates the remainder in
+  the view state across events *and* frames, and emits only whole lines - a
+  direction flip forfeits the stale remainder, since a reversed gesture owes
+  nothing to the old one. Each emitted line is still one SGR report under
+  tmux (P2); the matching `-N`-less tmux.conf wheel bindings live in
+  muxterm, because tmux's *default* copy-mode step is 5 lines per report and
+  multiplied the whole gesture by five. Exported from the crate so muxterm's
+  `scroll_intercept` computes its copy-mode handoff with the same function
+  and the two can't disagree on what a flick is worth; `TerminalSize` grew
+  an inherent `screen_lines()` so the app can pass the viewport height
+  without naming alacritty's `Dimensions` trait (muxterm has no alacritty
+  dependency of its own).
+- **P30** (`src/view.rs`, `process_mouse_wheel`): wheel reports carry no
+  modifiers. The modifier bits are *added* to the SGR button code (shift+4,
+  alt+8, cmd+16), so a held modifier turned button 64/65 into 68/69 or
+  80/81, which tmux doesn't route through its wheel bindings at all -
+  scrolling silently stopped working with cmd held (i.e. while hovering
+  links, P10) or shift held. The report now carries `Modifiers::default()`,
+  the same stripping P25 does for relayed clicks, so what the wheel does
+  never depends on what else is pressed.
+- **P31** (`src/view.rs`, `process_input`, `process_mouse_move`): drag
+  selection updates coalesce to one per frame. egui can queue several
+  `PointerMoved` events in a single frame (a high-rate trackpad does), and
+  each one issued a `SelectUpdate` - a term-lock acquisition and a selection
+  recompute - though only the last position of a run can ever be rendered.
+  Now only the move that *ends a run* of consecutive moves carries the
+  `SelectUpdate`. Per-run and not per-frame on purpose: a release queued
+  between two moves has to see the selection extended through the move
+  before it, or P8 copy-on-select copies a stale range. Every move still
+  updates the grid position and link hover, which are cheap and last-wins,
+  so handlers interleaved between moves keep exact coordinates.
+- **P32** (`src/view.rs`, `process_input`): un-stick a lost drag. A release
+  egui never delivered - focus stolen mid-drag, a native dialog, a release
+  that landed in another window - left `is_dragged` set forever, and
+  `accepts_pointer` includes it, so the pane went on extending its selection
+  under a pointer with no button held. The flag now also clears when egui
+  itself reports the primary button up, *unless* this frame's queue carries
+  the release, which the event loop handles normally (P8 copy-on-select
+  needs the final motion applied first).
