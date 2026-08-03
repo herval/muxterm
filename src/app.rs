@@ -2640,18 +2640,26 @@ impl App {
         {
             return;
         }
-        let (pressed, released, pos, dbl, tri) = ctx.input(|i| {
+        let (pressed, released, pos, dbl, tri, mods) = ctx.input(|i| {
             (
                 i.pointer.primary_pressed(),
                 i.pointer.primary_released(),
                 i.pointer.latest_pos().or(i.pointer.interact_pos()),
                 i.pointer.button_double_clicked(egui::PointerButton::Primary),
                 i.pointer.button_triple_clicked(egui::PointerButton::Primary),
+                i.modifiers,
             )
         });
 
         if pressed {
-            self.begin_drag(pos);
+            // cmd+click opens a link (egui_term P10) and option+click is the
+            // deliberate mouse-report relay (P25). Neither is a selection,
+            // and a press the widget is going to swallow must not start one.
+            if mods.command || mods.alt {
+                self.drag = None;
+            } else {
+                self.begin_drag(pos);
+            }
         }
         let Some(mut drag) = self.drag.take() else {
             return;
@@ -2675,7 +2683,9 @@ impl App {
             }
             (dy, unit)
         });
-        if let Some(unit) = unit {
+        // Only an armed drag owns the wheel. Before that the press is still
+        // just a click, and scrolling must keep working normally.
+        if let Some(unit) = unit.filter(|_| drag.armed) {
             let (cell_h, rows) = self
                 .tabs
                 .get(self.active)
@@ -2750,9 +2760,12 @@ impl App {
                 drag.swapped = true;
             }
             let moved = drag.sent != Some(cursor);
-            // Arm on the first real movement, never on the press: a stray
-            // click must not freeze a live pane.
-            let arming = !drag.armed && (moved || cursor != origin);
+            let arming = drag_arms(
+                drag.armed,
+                cursor,
+                origin,
+                (drag.pos - drag.press).length(),
+            );
             // The release always sends one last update even when nothing
             // moved - it is the only one carrying `finish`, so skipping it
             // would drop a copy_on_select copy on the floor.
@@ -4514,6 +4527,27 @@ fn autoscroll_lines(past: f32, cell_h: f32) -> i32 {
     (1.0 + rows * 0.5).min(10.0) as i32
 }
 
+/// How far the pointer must travel before a press counts as a drag. A cell
+/// is only ~7pt wide, so a shaky hand can cross a character boundary without
+/// meaning to; this keeps a sloppy click a click. Below egui's own 6pt
+/// click tolerance, so anything egui still calls a click stays one.
+const DRAG_SLOP: f32 = 4.0;
+
+/// Whether a press has become a drag: has the pointer left the character it
+/// went down on, and actually travelled? Compared against the *press*, never
+/// against the last update sent - that is None before the first one, which
+/// would read every press as movement. Arming enters copy-mode, which freezes
+/// the pane and parks tmux's cursor at the click, so a plain click must never
+/// reach it.
+fn drag_arms(
+    armed: bool,
+    cursor: (usize, usize),
+    origin: (usize, usize),
+    travel: f32,
+) -> bool {
+    !armed && cursor != origin && travel > DRAG_SLOP
+}
+
 /// Where the drag's anchor currently sits on screen: it is pinned to the
 /// content, so every line the app scrolls the viewport pushes it one row the
 /// other way. None once it has left the viewport - an update must then leave
@@ -4984,6 +5018,23 @@ mod tests {
         assert_eq!(visible_anchor(2, -3, 12), None); // off the top
         // Scrolling back brings it into view again.
         assert_eq!(visible_anchor(8, 1, 12), Some(9));
+    }
+
+    /// A click that never leaves its character is a click, not a drag -
+    /// arming it would freeze the pane in copy-mode and move tmux's cursor
+    /// to wherever the user clicked, which is exactly what a plain click
+    /// must not do.
+    #[test]
+    fn a_motionless_press_never_arms() {
+        assert!(!drag_arms(false, (2, 5), (2, 5), 0.0));
+        // Moving to another character - or another row - is a drag.
+        assert!(drag_arms(false, (2, 6), (2, 5), 8.0));
+        assert!(drag_arms(false, (3, 5), (2, 5), 20.0));
+        // Already armed: the arming decision is made exactly once.
+        assert!(!drag_arms(true, (9, 9), (2, 5), 99.0));
+        // A shaky hand can cross a boundary without meaning to; a click
+        // that barely moved stays a click.
+        assert!(!drag_arms(false, (2, 6), (2, 5), 1.5));
     }
 
     /// Only plain typing is held across a copy-mode cancel. Chords are app
