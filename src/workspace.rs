@@ -699,6 +699,41 @@ pub fn parse_ls_remote(out: &str) -> Vec<Branch> {
         .collect()
 }
 
+/// Refresh a local repo's branch list from its remotes, then re-enumerate.
+/// The popup's list comes from local refs (`list_branches`), so a branch
+/// pushed since the last fetch simply isn't there - the typeahead finds
+/// nothing and the name reads as a *new* branch, which would quietly fork
+/// from HEAD instead of checking out the branch the user meant. Fetching
+/// every remote (a repo can have more than origin) is what turns that into
+/// a `Track`.
+///
+/// Best-effort by design: capped at FETCH_TIMEOUT and the list is
+/// re-enumerated whether or not the fetch succeeded, so an offline machine
+/// or an unauthenticated remote degrades to exactly the local state it
+/// already had. Network; run via `spawn_fetch_branches`.
+pub fn fetch_branches(root: &Path) -> Vec<Branch> {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-C")
+        .arg(root)
+        .args(["fetch", "--all", "--quiet"]);
+    let _ = agent::output_with_timeout(&mut cmd, FETCH_TIMEOUT);
+    list_branches(root)
+}
+
+/// `fetch_branches` off-thread, streamed back to the popup's poll. Same
+/// channel + repaint wiring as `spawn_remote_branches`.
+pub fn spawn_fetch_branches(
+    root: PathBuf,
+    tx: Sender<Vec<Branch>>,
+    ctx: egui::Context,
+) {
+    thread::spawn(move || {
+        let _ = tx.send(fetch_branches(&root));
+        ctx.request_repaint();
+    });
+}
+
 /// `list_remote_branches` off-thread, streamed back to the popup's poll.
 /// Same channel + repaint wiring as spawn_worktree.
 pub fn spawn_remote_branches(
@@ -1971,6 +2006,71 @@ ffeedd refs/heads/
             &BranchChoice::Existing("main".into()),
         );
         assert!(err.is_err(), "second checkout of main must fail");
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// The reported case, end to end with real git: a branch pushed to the
+    /// remote after this clone last fetched is invisible to `list_branches`,
+    /// so the typeahead finds nothing and the name would resolve as a *new*
+    /// branch - forking from HEAD instead of checking out what the user
+    /// meant. One fetch turns it into a `Track`.
+    #[test]
+    fn fetching_finds_a_branch_pushed_since_the_last_clone() {
+        let (scratch, git) = scratch_git("fetchbr");
+        // A bare "remote", a clone that will go stale, and a second clone
+        // standing in for whoever pushed the branch. All local paths, so
+        // the test never touches the network.
+        let origin = scratch.join("origin.git");
+        fs::create_dir_all(&origin).unwrap();
+        git(&scratch, &["init", "--bare", "-b", "main", "origin.git"]);
+
+        let author = scratch.join("author");
+        seed_repo(&git, &author);
+        git(&author, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&author, &["push", "-u", "origin", "main"]);
+
+        let clone = scratch.join("clone");
+        git(
+            &scratch,
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+
+        // Someone pushes a new branch after our clone was made.
+        git(&author, &["branch", "feat/pushed-later"]);
+        git(&author, &["push", "origin", "feat/pushed-later"]);
+
+        let names = |bs: &[Branch]| -> Vec<String> {
+            bs.iter().map(|b| b.name.clone()).collect()
+        };
+
+        // Stale: the branch simply isn't there, and the typed name reads as
+        // a request to create one.
+        let before = list_branches(&clone);
+        assert!(
+            !names(&before).contains(&"feat/pushed-later".to_string()),
+            "precondition: the clone has not fetched it yet: {:?}",
+            names(&before),
+        );
+        assert_eq!(
+            resolve_branch("feat/pushed-later", &before),
+            BranchChoice::New("feat/pushed-later".into()),
+        );
+
+        // After the refresh it is a remote branch to track.
+        let after = fetch_branches(&clone);
+        assert!(
+            names(&after).contains(&"feat/pushed-later".to_string()),
+            "fetch should surface it: {:?}",
+            names(&after),
+        );
+        assert_eq!(
+            resolve_branch("feat/pushed-later", &after),
+            BranchChoice::Track {
+                name: "feat/pushed-later".into(),
+                remote: "origin".into(),
+            },
+        );
 
         fs::remove_dir_all(&scratch).unwrap();
     }

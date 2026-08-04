@@ -12,8 +12,8 @@
 //! `git ls-remote` (async; `poll_remote_branches`), falling back to a plain
 //! field with deferred resolution when the probe fails.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use egui::text::LayoutJob;
@@ -65,6 +65,15 @@ pub struct NewWorkspaceForm {
     /// typeahead), None = unreachable (submit refuses - a clone would only
     /// fail later and messier). Cached across project-row clicks.
     remote_branches: HashMap<String, Option<Vec<Branch>>>,
+    /// In-flight `git fetch` + re-enumerate for a *local* repo whose branch
+    /// list turned up nothing for what the user typed. Keyed by root, so an
+    /// answer that lands after the folder moved on can't paint another
+    /// repo's branches into the picker.
+    fetch_rx: Option<(String, Receiver<Vec<Branch>>)>,
+    /// Repo roots already refreshed this session, so a name that genuinely
+    /// doesn't exist anywhere (the ordinary "create a new branch" case)
+    /// costs one fetch rather than one per keystroke.
+    fetched: HashSet<String>,
 }
 
 impl NewWorkspaceForm {
@@ -85,6 +94,8 @@ impl NewWorkspaceForm {
             checked: String::from("\0"), // force a first check
             remote_rx: None,
             remote_branches: HashMap::new(),
+            fetch_rx: None,
+            fetched: HashSet::new(),
         };
         form.refresh_repo();
         // A git repo defaults the checkbox on - the common case for cmd+n.
@@ -193,6 +204,57 @@ impl NewWorkspaceForm {
         }
     }
 
+    /// A typed branch that matches nothing may simply not have been fetched
+    /// yet: the list comes from local refs, so a branch pushed since the last
+    /// fetch is invisible, and the name would read as a *new* branch and
+    /// quietly fork from HEAD instead of checking out what the user meant.
+    /// One `git fetch` per repo per session fixes that, off-thread and
+    /// best-effort - an offline machine just keeps the list it had.
+    ///
+    /// Deliberately not run for an un-cloned repo project: that list already
+    /// comes from `ls-remote`, which is live.
+    fn poll_branch_fetch(&mut self, ctx: &egui::Context) {
+        if let Some((root, rx)) = &self.fetch_rx {
+            match rx.try_recv() {
+                Ok(branches) => {
+                    if *root == self.folder.trim() {
+                        self.branches = branches;
+                    }
+                    self.fetch_rx = None;
+                },
+                Err(TryRecvError::Empty) => {},
+                Err(TryRecvError::Disconnected) => self.fetch_rx = None,
+            }
+        }
+        if self.fetch_rx.is_some()
+            || !self.is_repo
+            || self.clone_needed().is_some()
+        {
+            return;
+        }
+        let query = self.branch.trim();
+        if query.is_empty() || !filter_branches(&self.branches, query).is_empty()
+        {
+            return;
+        }
+        let root = self.folder.trim().to_string();
+        if root.is_empty() || !self.fetched.insert(root.clone()) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        crate::workspace::spawn_fetch_branches(
+            PathBuf::from(&root),
+            tx,
+            ctx.clone(),
+        );
+        self.fetch_rx = Some((root, rx));
+    }
+
+    /// Whether a branch refresh is in flight (the picker says so).
+    pub fn fetching_branches(&self) -> bool {
+        self.fetch_rx.is_some()
+    }
+
     /// Why Create must not fire yet, if anything: an un-cloned repo
     /// project only proceeds once the `ls-remote` preflight has proven the
     /// URL reachable. Everything else (local projects, cloned repos,
@@ -239,6 +301,7 @@ pub fn show(
     if !form.projects.is_empty() {
         form.poll_remote_branches(ctx);
     }
+    form.poll_branch_fetch(ctx);
     let mut outcome = Outcome::None;
 
     let panel = Panel {
@@ -722,6 +785,17 @@ fn branch_picker(
     }
     if let Some(name) = pick {
         form.branch = name;
+    }
+    if form.fetching_branches() {
+        // The name matched nothing, so a fetch is out looking for it -
+        // say so rather than letting the row read "create branch" for the
+        // second it takes to find out otherwise.
+        panel.row(
+            ui,
+            vec![("-> fetching branches...".to_string(), th.text_dim)],
+            false,
+        );
+        return;
     }
     let (caption, color) = match form.branch_choice() {
         BranchChoice::Codename => (
