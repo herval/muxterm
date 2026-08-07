@@ -407,17 +407,6 @@ impl TmuxCtl {
         self.spawn_argv(select_argv(session, anchor, cursor, scroll, finish))
     }
 
-    /// Double/triple click: select the word or logical line under `cursor`.
-    pub fn select_word(
-        &self,
-        session: &str,
-        cursor: (usize, usize),
-        line: bool,
-        finish: Finish,
-    ) -> Arc<AtomicBool> {
-        self.spawn_argv(select_word_argv(session, cursor, line, finish))
-    }
-
     /// Freeze the pane's view by entering copy-mode, without touching the
     /// cursor or the selection. This is the whole of what a drag does when
     /// it arms: the freeze is what stops the pane's repaints from wiping the
@@ -761,9 +750,6 @@ fn escape_semi(query: &str) -> String {
 pub enum Finish {
     /// Leave the selection standing (cmd+c copies it later).
     Keep,
-    /// copy_on_select: copy through tmux's OSC 52 and keep both the
-    /// selection and copy-mode, so the highlight survives the release.
-    Copy,
     /// Copy and leave copy-mode, unfreezing the pane.
     CopyAndCancel,
 }
@@ -834,41 +820,8 @@ fn select_argv(
     }
     match finish {
         Finish::Keep => {},
-        Finish::Copy => step(&mut argv, &t, &["copy-selection-no-clear"]),
         Finish::CopyAndCancel => {
             step(&mut argv, &t, &["copy-selection-and-cancel"])
-        },
-    }
-    argv
-}
-
-/// The argv for a one-shot word/line selection (double/triple click). tmux
-/// repositions the cursor after every motion while word or line mode is
-/// active, so these are never followed by drag updates - a later drag
-/// re-issues `begin-selection`, which resets to character mode.
-fn select_word_argv(
-    session: &str,
-    cursor: (usize, usize),
-    line: bool,
-    finish: Finish,
-) -> Vec<String> {
-    let mut argv = select_argv(session, None, cursor, 0, Finish::Keep);
-    let t = format!("={session}:");
-    let cmd = if line { "select-line" } else { "select-word" };
-    argv.push(";".into());
-    argv.extend(["send-keys", "-t", t.as_str(), "-X", cmd].map(String::from));
-    match finish {
-        Finish::Keep => {},
-        Finish::Copy | Finish::CopyAndCancel => {
-            let last = if finish == Finish::Copy {
-                "copy-selection-no-clear"
-            } else {
-                "copy-selection-and-cancel"
-            };
-            argv.push(";".into());
-            argv.extend(
-                ["send-keys", "-t", t.as_str(), "-X", last].map(String::from),
-            );
         },
     }
     argv
@@ -961,31 +914,13 @@ mod tests {
         let keep = select_argv("s", None, (1, 1), 0, Finish::Keep);
         assert!(!keep.iter().any(|s| s.starts_with("copy-selection")));
 
-        let copy = select_argv("s", None, (1, 1), 0, Finish::Copy);
-        assert_eq!(x_cmds(&copy).last().unwrap(), "copy-selection-no-clear");
-
+        // copy_on_select copies and hands the pane straight back, so the
+        // copy step is always last and always the cancelling one.
         let cancel = select_argv("s", None, (1, 1), 0, Finish::CopyAndCancel);
         assert_eq!(
             x_cmds(&cancel).last().unwrap(),
             "copy-selection-and-cancel",
         );
-    }
-
-    #[test]
-    fn select_word_argv_seeks_then_selects() {
-        let w = select_word_argv("s", (2, 5), false, Finish::Keep);
-        assert_eq!(x_cmds(&w), [
-            "top-line",
-            "cursor-down",
-            "cursor-right",
-            "select-word",
-        ]);
-        let l = select_word_argv("s", (0, 0), true, Finish::Copy);
-        assert_eq!(x_cmds(&l), [
-            "top-line",
-            "select-line",
-            "copy-selection-no-clear",
-        ]);
     }
 
     #[test]

@@ -201,6 +201,10 @@ pub struct App {
     /// The mouse drag currently being mirrored into a pane's tmux copy-mode
     /// selection, if any.
     drag: Option<DragSelect>,
+    /// A double/triple click whose word has gone to tmux: the widget makes
+    /// its own selection from the same click, later in that frame, so the
+    /// local highlight can only be dropped once tmux's has landed.
+    word_clear: Option<(PaneId, Arc<AtomicBool>)>,
     /// Keystrokes held back for the one frame it takes to leave copy-mode,
     /// so not a byte of them can land in the copy-mode key table. The
     /// Instant is a deadline: a fork that never returns must not cost the
@@ -390,6 +394,7 @@ impl App {
             title_rx,
             naming: HashSet::new(),
             drag: None,
+            word_clear: None,
             key_hold: None,
             pane_snap: HashMap::new(),
             agent_states: std::collections::BTreeMap::new(),
@@ -2644,6 +2649,23 @@ impl App {
         {
             return;
         }
+        // A committed double-click's local highlight goes as soon as tmux's
+        // own has landed. Deferred because the widget makes that selection
+        // after the intercepts run, so clearing it any earlier just clears
+        // nothing and leaves it to appear a moment later.
+        if let Some((pane_id, done)) = &self.word_clear {
+            if done.load(Ordering::Acquire) {
+                if let Some(pane) = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.panes.get(pane_id))
+                {
+                    pane.backend.clear_selection();
+                }
+                self.word_clear = None;
+            }
+        }
+
         let (pressed, released, pos, dbl, tri, mods) = ctx.input(|i| {
             (
                 i.pointer.primary_pressed(),
@@ -2865,7 +2887,7 @@ impl App {
             // A press that never became a drag. A double or triple click
             // selects a word or a line; a plain click dismisses whatever
             // selection was standing and gives the pane back.
-            self.finish_click(&drag, cursor, dbl, tri);
+            self.finish_click(&drag, dbl, tri);
             return;
         }
         self.drag = Some(drag);
@@ -2960,40 +2982,54 @@ impl App {
     }
 
     /// A press that never moved: word/line select, or dismiss the selection.
-    fn finish_click(
-        &mut self,
-        drag: &DragSelect,
-        cursor: (usize, usize),
-        dbl: bool,
-        tri: bool,
-    ) {
+    fn finish_click(&mut self, drag: &DragSelect, dbl: bool, tri: bool) {
         if dbl || tri {
-            let cell = self
+            // The word is worked out from the grid (egui_term P35), not by
+            // tmux's select-word: tmux decides word edges with its own
+            // separators and from coordinates a round trip old, so asking it
+            // meant the widget highlighted the right run and tmux then
+            // selected a different one. One chain, one answer - and it is
+            // P14's rule, the whole non-whitespace run.
+            let bounds = self
                 .tabs
                 .get(self.active)
-                .and_then(|t| t.panes.get(&drag.pane))
-                .and_then(|pn| {
-                    let tab = self.tabs.get(self.active)?;
-                    let rect = tab.last_term_rects.get(&drag.pane)?;
-                    Some(pn.backend.copy_target(
+                .and_then(|t| {
+                    let rect = t.last_term_rects.get(&drag.pane)?;
+                    let pane = t.panes.get(&drag.pane)?;
+                    pane.backend.word_bounds_at(
                         drag.pos.x - rect.min.x,
                         drag.pos.y - rect.min.y,
-                        false,
-                    ))
-                })
-                .unwrap_or(cursor);
+                        tri,
+                    )
+                });
+            let Some((anchor, cur)) = bounds else {
+                return;
+            };
             let finish = if self.copy_on_select {
-                tmux::Finish::Copy
+                tmux::Finish::CopyAndCancel
             } else {
                 tmux::Finish::Keep
             };
-            self.tmux.select_word(&drag.session, cell, tri, finish);
-            if let Some(pane) = self
-                .tabs
-                .get_mut(self.active)
-                .and_then(|t| t.panes.get_mut(&drag.pane))
-            {
-                pane.copy_sel = true;
+            let done = self.tmux.select_update(
+                &drag.session,
+                Some(anchor),
+                cur,
+                0,
+                finish,
+            );
+            // The widget selects the same click semantically (P14) and would
+            // otherwise paint that alongside tmux's - two highlights, and the
+            // widget's expands across wrapped rows, which is the multi-line
+            // band that appears while only the word actually copies.
+            self.word_clear = Some((drag.pane, done));
+            if finish != tmux::Finish::CopyAndCancel {
+                if let Some(pane) = self
+                    .tabs
+                    .get_mut(self.active)
+                    .and_then(|t| t.panes.get_mut(&drag.pane))
+                {
+                    pane.copy_sel = true;
+                }
             }
             return;
         }

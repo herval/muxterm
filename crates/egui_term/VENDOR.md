@@ -430,3 +430,19 @@ tmux-backed design. Local patches:
   key, since changing it recolors shapes already cached. Default 1.0, which
   disables the guard: the widget standalone still renders exactly what the
   application asked for, and muxterm sets it from config `min_contrast`.
+- **P35** (`src/backend/mod.rs`, `word_bounds_at`, `word_run`, `row_chars`):
+  the word under a double-click, decided from the grid. muxterm mirrors a
+  selection into tmux copy-mode (P33), and a double/triple click used to ask
+  tmux's own `select-word` for the range - which decides word edges with its
+  `word-separators` and from coordinates that are a round trip old, while the
+  widget had *already* made its own local semantic selection (P14) from the
+  same click. Two answers to one question: the correct run highlighted, then
+  a different one selected in its place, with the repaint between them
+  reading as a flash. `word_bounds_at` now expands over `row_chars` -
+  indexed the way `row_stops` counts `cursor-right` presses, so an index
+  means the same thing to both - and hands the app a single pair of copy-mode
+  targets to commit in one chain. `word_run` is P14's rule made explicit: the
+  whole run of non-whitespace, so `foo(bar)` and `a/b:c` come whole, and a
+  click on whitespace selects nothing rather than the neighbouring word.
+  Triple-click takes the row's content. The widget's local selection is
+  untouched and still paints instantly; it is simply no longer contradicted.

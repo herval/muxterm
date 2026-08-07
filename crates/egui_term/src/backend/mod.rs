@@ -493,6 +493,60 @@ impl TerminalBackend {
         ));
     }
 
+    /// muxterm patch P35: the characters of one *visible* row, indexed the
+    /// same way `row_stops` counts `cursor-right` presses (wide-char spacers
+    /// skipped, trailing blanks dropped) so an index means the same thing to
+    /// both.
+    fn row_chars(&self, row: usize) -> Vec<char> {
+        let content = self.last_content();
+        let grid = &content.grid;
+        let line = Line(row as i32 - grid.display_offset() as i32);
+        let mut out = Vec::new();
+        let mut last_glyph = 0usize;
+        for c in 0..content.terminal_size.columns() {
+            let cell = &grid[line][Column(c)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            out.push(cell.c);
+            if cell.c != ' ' {
+                last_glyph = out.len();
+            }
+        }
+        out.truncate(last_glyph);
+        out
+    }
+
+    /// muxterm patch P35: the word or line under a pane-relative point, as a
+    /// pair of tmux copy-mode targets (the far end exclusive, like the rest
+    /// of P33).
+    ///
+    /// A double-click selects the whole run of non-whitespace around the
+    /// click - P14's rule, which reduced alacritty's semantic boundaries to
+    /// whitespace so `foo(bar)` and `a/b:c` come whole. Computed here off the
+    /// grid rather than handed to tmux's `select-word`, because tmux decides
+    /// it with its own `word-separators` and from coordinates that are a
+    /// round trip old: two answers to one question is how a double-click
+    /// ended up highlighting the right word and then selecting a different
+    /// one.
+    pub fn word_bounds_at(
+        &self,
+        x: f32,
+        y: f32,
+        whole_line: bool,
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let (row, idx) = self.copy_target(x, y, false);
+        let chars = self.row_chars(row);
+        if chars.is_empty() {
+            return None;
+        }
+        if whole_line {
+            return Some(((row, 0), (row, chars.len())));
+        }
+        let (start, end) = word_run(&chars, idx)?;
+        Some(((row, start), (row, end)))
+    }
+
     /// muxterm patch P33: the live local selection as a pair of tmux
     /// copy-mode targets - (row, `cursor-right` count) for each end, the far
     /// end one character past the last selected cell because tmux's selection
@@ -958,6 +1012,26 @@ fn pr_regex() -> regex::Regex {
     regex::Regex::new(r"#\d+\b").unwrap()
 }
 
+/// muxterm patch P35: the run of non-whitespace around `idx`, as a half-open
+/// range of character indices - P14's rule, so brackets, slashes and colons
+/// stay inside the word and `foo(bar)` or `a/b:c` comes whole. None when the
+/// index is past the row's content or lands on whitespace, which is what
+/// makes a double-click on a gap select nothing rather than the next word.
+fn word_run(chars: &[char], idx: usize) -> Option<(usize, usize)> {
+    if idx >= chars.len() || chars[idx].is_whitespace() {
+        return None;
+    }
+    let mut start = idx;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = idx;
+    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+        end += 1;
+    }
+    Some((start, end + 1))
+}
+
 /// muxterm patch P33: the `cursor-right` stops of one grid row - the column
 /// each character starts at, in order, plus a final entry for the
 /// end-of-content boundary (a legal stop; one press further wraps onto the
@@ -1398,6 +1472,33 @@ mod tests {
         }
         out.truncate(width);
         out
+    }
+
+    /// P35 word expansion. The rule is P14's: a run of non-whitespace, so
+    /// brackets, slashes and colons stay inside the word.
+    #[test]
+    fn a_word_is_the_whole_non_whitespace_run() {
+        let row: Vec<char> = "cd src/app.rs && ls foo(bar) a/b:c".chars().collect();
+        let word = |i: usize| {
+            word_run(&row, i).map(|(a, b)| row[a..b].iter().collect::<String>())
+        };
+        // Punctuation must not end a word (P14).
+        assert_eq!(word(5).as_deref(), Some("src/app.rs"));
+        assert_eq!(word(21).as_deref(), Some("foo(bar)"));
+        assert_eq!(word(30).as_deref(), Some("a/b:c"));
+        // Every index inside a word gives the same word.
+        for i in 20..28 {
+            assert_eq!(word(i).as_deref(), Some("foo(bar)"), "index {i}");
+        }
+        // The first and last words reach the row's edges.
+        assert_eq!(word_run(&row, 0), Some((0, 2)));
+        assert_eq!(word_run(&row, row.len() - 1).unwrap().1, row.len());
+        // Whitespace selects nothing rather than the neighbouring word, and
+        // so does anything past the content.
+        assert_eq!(word_run(&row, 2), None);
+        assert_eq!(word_run(&row, 28), None);
+        assert_eq!(word_run(&row, 999), None);
+        assert_eq!(word_run(&[], 0), None);
     }
 
     /// P33: tmux's `cursor-right` counts characters, so a wide glyph is one
