@@ -34,6 +34,8 @@ pub enum SidebarAction {
     ToggleArchived,
     /// Collapse/expand the open-PRs section (its header click).
     TogglePrs,
+    /// Collapse/expand the live-workspace list (the panel header's click).
+    ToggleWorkspaces,
     /// Check this PR out as a worktree workspace (a PR row's body click).
     CheckoutPr(usize),
     /// Open this PR on github.com (a PR row's right-click).
@@ -101,6 +103,7 @@ pub struct PrRow {
 pub fn show(
     ctx: &egui::Context,
     rows: &[Row],
+    workspaces_collapsed: bool,
     prs: &[PrRow],
     pr_note: Option<&str>,
     prs_collapsed: bool,
@@ -124,12 +127,34 @@ pub fn show(
         )
         .show(ctx, |ui| {
             let head_font = FontId::new(font.size * 0.82, font.family.clone());
+            let live = rows.iter().filter(|r| !r.archived).count();
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("workspaces")
-                        .font(head_font.clone())
-                        .color(t.text_dim),
-                );
+                // The panel title doubles as the live list's section header,
+                // folding it the way "Pull requests" and "Archived" fold -
+                // one header, not two saying "Workspaces". Its click band
+                // stops short of the trailing ‹/+ buttons, which own their
+                // own clicks, so it can't swallow them.
+                let band = (ui.available_width() - HEAD_BUTTONS_W).max(1.0);
+                let head_h = ui.fonts(|f| f.row_height(&head_font));
+                let toggled = ui
+                    .allocate_ui_with_layout(
+                        Vec2::new(band, head_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            section_header(
+                                ui,
+                                "Workspaces",
+                                live,
+                                workspaces_collapsed,
+                                &head_font,
+                                t,
+                            )
+                        },
+                    )
+                    .inner;
+                if toggled {
+                    actions.push(SidebarAction::ToggleWorkspaces);
+                }
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
@@ -155,11 +180,15 @@ pub fn show(
                 // Whether the pointer still sits on an armed row this frame;
                 // an armed row that lost the pointer stands its delete down.
                 let mut armed_hovered = false;
-                // Active pile: the workspaces in the tab flow.
-                for row in rows.iter().filter(|r| !r.archived) {
-                    let r = workspace_row(ui, row, font, t);
-                    if let Some(a) = row_action(&r, row) {
-                        actions.push(a);
+                // Active pile: the workspaces in the tab flow, folded away by
+                // the panel header (cmd+1..9 still reach them while folded -
+                // this hides the list, it doesn't park the tabs).
+                if !workspaces_collapsed {
+                    for row in rows.iter().filter(|r| !r.archived) {
+                        let r = workspace_row(ui, row, font, t);
+                        if let Some(a) = row_action(&r, row) {
+                            actions.push(a);
+                        }
                     }
                 }
                 // Open PRs, above the archived pile: things you could pull
@@ -554,6 +583,13 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, t: &UiTheme) -> egui::Response {
 /// wraps before them instead of running underneath.
 const ICON_W: f32 = 16.0;
 
+/// Width the panel header keeps for its two `icon_button`s (‹ and +, 20pt
+/// each) plus the spacing around them - the slice the foldable title band
+/// must not claim. Rounded up from the 48pt the pair actually needs: the band
+/// losing a few points costs nothing, the buttons losing them squeezes a
+/// click target.
+const HEAD_BUTTONS_W: f32 = 64.0;
+
 /// What one rendered row reported back: the clicks `row_action` maps and the
 /// hover `show` needs to stand an armed delete down. Plain bools so the
 /// click-to-action mapping unit-tests without an egui pass.
@@ -819,7 +855,7 @@ mod tests {
             ..Default::default()
         };
         let mut frame = |ctx: &egui::Context| {
-            let _ = show(ctx, &rows, &[], None, false, false, &font, &th);
+            let _ = show(ctx, &rows, false, &[], None, false, false, &font, &th);
         };
         let _ = ctx.run(input.clone(), &mut frame);
         let output = ctx.run(input, &mut frame);
@@ -903,7 +939,7 @@ mod tests {
         };
         let texts = |collapsed: bool| {
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, &[], None, false, collapsed, &font, &th);
+                let _ = show(ctx, &rows, false, &[], None, false, collapsed, &font, &th);
             };
             let _ = ctx.run(input.clone(), &mut frame);
             let output = ctx.run(input.clone(), &mut frame);
@@ -937,6 +973,175 @@ mod tests {
         assert!(folded.contains("live-ws"), "collapse ate the active pile");
     }
 
+    /// The live list folds behind the panel header the same way, and the
+    /// header keeps its own "+"/"‹" buttons: folding the workspaces must not
+    /// take the archived pile (or the way to make a new workspace) with it.
+    #[test]
+    fn workspace_list_folds_behind_the_panel_header() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let rows = vec![
+            Row {
+                tab_index: 0,
+                title: "live-ws".into(),
+                subtitle: None,
+                active: true,
+                status: Status::Idle,
+                archived: false,
+                delete_armed: false,
+            },
+            Row {
+                tab_index: 1,
+                title: "other-ws".into(),
+                subtitle: None,
+                active: false,
+                status: Status::Idle,
+                archived: false,
+                delete_armed: false,
+            },
+            Row {
+                tab_index: 2,
+                title: "parked-ws".into(),
+                subtitle: None,
+                active: false,
+                status: Status::Idle,
+                archived: true,
+                delete_armed: false,
+            },
+        ];
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let texts = |collapsed: bool| {
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(
+                    ctx, &rows, collapsed, &[], None, false, false, &font, &th,
+                );
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let output = ctx.run(input.clone(), &mut frame);
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\u{1}")
+        };
+
+        let open = texts(false);
+        assert!(open.contains("live-ws"), "expanded list lost its rows");
+        assert!(open.contains("Workspaces"), "expanded list lost its header");
+
+        let folded = texts(true);
+        assert!(
+            !folded.contains("live-ws") && !folded.contains("other-ws"),
+            "collapsed list still renders rows: {folded:?}"
+        );
+        assert!(
+            folded.contains("Workspaces (2)"),
+            "collapsed header lost the fold count: {folded:?}"
+        );
+        assert!(
+            folded.contains("parked-ws") && folded.contains("Archived"),
+            "folding the live list ate the archived pile: {folded:?}"
+        );
+        assert!(folded.contains('+'), "the header's new-workspace + went away");
+    }
+
+    /// The panel header now carries a click of its own, so its two buttons
+    /// must still win theirs: a click on the label folds the list, a click on
+    /// the "+" opens the popup and folds nothing. Guards `HEAD_BUTTONS_W`
+    /// actually holding the band off them.
+    #[test]
+    fn panel_header_folds_without_swallowing_its_buttons() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let rows = vec![Row {
+            tab_index: 0,
+            title: "live-ws".into(),
+            subtitle: None,
+            active: true,
+            status: Status::Idle,
+            archived: false,
+            delete_armed: false,
+        }];
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(900.0, 700.0),
+        );
+        let click_at = |pos: egui::Pos2| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+                ..Default::default()
+            };
+            let mut got = Vec::new();
+            let mut frame = |ctx: &egui::Context| {
+                got = show(
+                    ctx, &rows, false, &[], None, false, false, &font, &th,
+                );
+            };
+            let warm = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let _ = ctx.run(warm, &mut frame);
+            let _ = ctx.run(input, &mut frame);
+            got
+        };
+
+        // The header sits on the first row: label on the left, ‹ hard right,
+        // + one button inward (the panel opens 210 wide, 12pt margins).
+        let label = click_at(egui::Pos2::new(40.0, 16.0));
+        assert!(
+            label
+                .iter()
+                .any(|a| matches!(a, SidebarAction::ToggleWorkspaces)),
+            "the header label no longer folds the list",
+        );
+        let plus = click_at(egui::Pos2::new(168.0, 16.0));
+        assert!(
+            plus.iter().any(|a| matches!(a, SidebarAction::NewWorkspace)),
+            "the fold band swallowed the header's + button",
+        );
+        assert!(
+            !plus
+                .iter()
+                .any(|a| matches!(a, SidebarAction::ToggleWorkspaces)),
+            "clicking + also folded the list",
+        );
+    }
+
+
     /// The breathing pulse (working and background alike) schedules its own
     /// repaints, but throttled (at PULSE_FRAME, never every frame) and only
     /// while the window is focused. Guards the battery contract: agents work
@@ -960,7 +1165,7 @@ mod tests {
                 delete_armed: false,
             }];
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, &[], None, false, false, &font, &th);
+                let _ = show(ctx, &rows, false, &[], None, false, false, &font, &th);
             };
             let input = |focused: bool| egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1039,7 +1244,7 @@ mod tests {
         };
         let painted = |collapsed: bool, note: Option<&str>, prs: &[PrRow]| {
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &[], prs, note, collapsed, false, &font, &th);
+                let _ = show(ctx, &[], false, prs, note, collapsed, false, &font, &th);
             };
             let _ = ctx.run(input.clone(), &mut frame);
             let output = ctx.run(input.clone(), &mut frame);
@@ -1121,7 +1326,7 @@ mod tests {
             };
             let mut got = Vec::new();
             let mut frame = |ctx: &egui::Context| {
-                got = show(ctx, &[], &prs, None, false, false, &font, &th);
+                got = show(ctx, &[], false, &prs, None, false, false, &font, &th);
             };
             // Two passes: egui needs a layout pass before a hit lands.
             let warm = egui::RawInput {
@@ -1197,7 +1402,7 @@ mod tests {
             let rows = vec![archived_row(armed)];
             let mut fired = false;
             let mut frame = |ctx: &egui::Context| {
-                for a in show(ctx, &rows, &[], None, false, false, &font, &th) {
+                for a in show(ctx, &rows, false, &[], None, false, false, &font, &th) {
                     if matches!(a, SidebarAction::DisarmDelete) {
                         fired = true;
                     }
@@ -1231,7 +1436,7 @@ mod tests {
         let icon_shapes = |armed: bool| {
             let rows = vec![archived_row(armed)];
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, &[], None, false, false, &font, &th);
+                let _ = show(ctx, &rows, false, &[], None, false, false, &font, &th);
             };
             // Settle the layout, then find the row title's on-screen spot
             // so the hover lands on the body regardless of exact geometry.

@@ -27,6 +27,9 @@ pub struct StateFile {
     /// Whether the sidebar's open-PRs section is folded away.
     #[serde(default)]
     pub prs_collapsed: bool,
+    /// Whether the sidebar's live-workspace list is folded to its header.
+    #[serde(default)]
+    pub workspaces_collapsed: bool,
     /// The saved project registry (Settings > Projects), the sources the
     /// cmd+shift+n popup offers. Additive with `#[serde(default)]` (empty).
     #[serde(default)]
@@ -391,6 +394,7 @@ mod tests {
             sidebar_open: true,
             archived_collapsed: false,
             prs_collapsed: false,
+            workspaces_collapsed: true,
             projects: vec![
                 ProjectState {
                     name: "muxterm".into(),
@@ -481,6 +485,9 @@ mod tests {
         assert_eq!(back.windows[0].active_tab, 1);
         assert_eq!(back.windows[0].tabs.len(), 2);
         assert_eq!(back.last_workspace_dir.as_deref(), Some("/tmp/proj"));
+        // Every sidebar fold survives the trip, the live list included.
+        assert!(back.workspaces_collapsed);
+        assert!(!back.prs_collapsed);
         let ws = back.windows[0].tabs[1].workspace.as_ref().unwrap();
         assert_eq!(ws.title, "wire up auth");
         assert_eq!(ws.worktree.as_ref().unwrap().branch, "wire-up-auth");
@@ -524,9 +531,10 @@ mod tests {
         assert_eq!(s.windows[0].tabs.len(), 1);
         assert!(s.windows[0].tabs[0].workspace.is_none());
         assert!(s.last_workspace_dir.is_none());
-        // Sidebar defaults on for discoverability, archived pile expanded.
+        // Sidebar defaults on for discoverability, every pile expanded.
         assert!(s.sidebar_open);
         assert!(!s.archived_collapsed);
+        assert!(!s.workspaces_collapsed);
         // No saved projects or templates in an older file.
         assert!(s.projects.is_empty());
         assert!(s.templates.is_empty());

@@ -195,6 +195,9 @@ pub struct App {
     /// Whether the sidebar's archived pile is folded to its header (its
     /// header click); persisted in state.json like the sidebar itself.
     archived_collapsed: bool,
+    /// Whether the sidebar's live-workspace list is folded to the panel
+    /// header; persisted like the other section folds.
+    workspaces_collapsed: bool,
     /// The archived workspace armed for deletion (its ✕ clicked once), by
     /// stable tab id - ephemeral, never persisted. Cleared by any other
     /// sidebar action, by the pointer leaving the row, and by the sidebar
@@ -429,6 +432,7 @@ impl App {
             notifications: style.notifications,
             sidebar_open: true,
             archived_collapsed: false,
+            workspaces_collapsed: false,
             delete_armed: None,
             confirm_worktree: Vec::new(),
             new_workspace: None,
@@ -472,6 +476,7 @@ impl App {
                 app.sidebar_open = saved.sidebar_open;
                 app.archived_collapsed = saved.archived_collapsed;
                 app.prs_collapsed = saved.prs_collapsed;
+                app.workspaces_collapsed = saved.workspaces_collapsed;
                 app.last_workspace_dir = saved.last_workspace_dir.clone();
                 app.projects = saved
                     .projects
@@ -2416,6 +2421,7 @@ impl App {
             sidebar_open: self.sidebar_open,
             archived_collapsed: self.archived_collapsed,
             prs_collapsed: self.prs_collapsed,
+            workspaces_collapsed: self.workspaces_collapsed,
             projects: self.projects.iter().map(|p| p.to_state()).collect(),
             templates: self.templates.iter().map(|t| t.to_state()).collect(),
             windows: vec![WindowState {
@@ -3963,6 +3969,7 @@ impl eframe::App for App {
             for action in sidebar::show(
                 ctx,
                 &rows,
+                self.workspaces_collapsed,
                 &prs,
                 self.pr_list.note.as_deref(),
                 self.prs_collapsed,
@@ -4002,6 +4009,10 @@ impl eframe::App for App {
                     },
                     SidebarAction::TogglePrs => {
                         self.prs_collapsed = !self.prs_collapsed;
+                        self.dirty = true;
+                    },
+                    SidebarAction::ToggleWorkspaces => {
+                        self.workspaces_collapsed = !self.workspaces_collapsed;
                         self.dirty = true;
                     },
                     SidebarAction::CheckoutPr(i) => {
