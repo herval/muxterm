@@ -56,6 +56,11 @@ pub struct Workspace {
     /// cd here - inside the worktree - before the setup script runs. Owned
     /// like `setup`. None for cmd+n/cmd+t.
     pub subdir: Option<String>,
+    /// The GitHub PR this workspace was checked out from (`owner/name`, number),
+    /// when it came from the sidebar's PR section. It is what marks that PR as
+    /// already open, so a second click goes to this tab instead of checking the
+    /// same branch out twice.
+    pub pr: Option<(String, u64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +85,7 @@ impl Workspace {
             archived_at: None,
             setup: None,
             subdir: None,
+            pr: None,
         }
     }
 
@@ -104,6 +110,7 @@ impl Workspace {
             archived_at: self.archived_at,
             setup: self.setup.clone(),
             subdir: self.subdir.clone(),
+            pr: self.pr.clone(),
         }
     }
 
@@ -125,6 +132,7 @@ impl Workspace {
             archived_at: s.archived_at,
             setup: s.setup,
             subdir: s.subdir,
+            pr: s.pr,
         }
     }
 }
@@ -1047,6 +1055,135 @@ pub fn spawn_clone_worktree(
     });
 }
 
+/// Check a GitHub PR out as a worktree: clone the repo if it isn't here yet,
+/// **fetch**, then check the PR's head branch out into the claimed directory.
+///
+/// The fetch is load-bearing, not hygiene. The branch list comes from local
+/// refs, so a PR branch pushed since this clone last fetched is invisible, and
+/// `resolve_branch` would classify it `New` - which forks a fresh branch off
+/// HEAD instead of checking out the PR. Fetching first is what turns it into a
+/// `Track`, so the worktree lands on the real branch and can push back to it.
+///
+/// Same channel protocol as `spawn_clone_worktree`, so the App's existing
+/// progress chip, failure walk-back and agent launch all apply unchanged.
+pub fn spawn_pr_worktree(
+    tab_id: String,
+    repo: String,
+    root: PathBuf,
+    worktree: Worktree,
+    branch: String,
+    tx: Sender<(String, WorktreeMsg)>,
+    ctx: egui::Context,
+) {
+    thread::spawn(move || {
+        let progress = |line: String| {
+            let _ = tx.send((tab_id.clone(), WorktreeMsg::Progress(line)));
+            ctx.request_repaint();
+        };
+        let res = pr_checkout(&repo, &root, worktree, &branch, &progress)
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send((tab_id, WorktreeMsg::Done(res)));
+        ctx.request_repaint();
+    });
+}
+
+/// Resolve a PR's head branch off the UI thread, then hand it back to the
+/// App to decide what to do with it - go to the workspace that already has
+/// it, open the worktree that already holds it, or check it out fresh.
+pub fn spawn_pr_head(
+    repo: String,
+    number: u64,
+    tx: Sender<(String, u64, Option<crate::pr_monitor::Head>)>,
+    ctx: egui::Context,
+) {
+    thread::spawn(move || {
+        let head = crate::pr_monitor::head_branch(&repo, number);
+        let _ = tx.send((repo, number, head));
+        ctx.request_repaint();
+    });
+}
+
+/// The worktree already holding `branch`, if any. `git worktree add` refuses
+/// a branch that is checked out somewhere else, which is the normal case for
+/// a PR muxterm itself opened: the workspace that raised it still has the
+/// branch. Knowing this up front turns a hard failure into "go to it".
+pub fn worktree_for_branch(root: &Path, branch: &str) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut path: Option<PathBuf> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(p.trim()));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            let name = b.trim().strip_prefix("refs/heads/").unwrap_or(b.trim());
+            if name == branch {
+                return path;
+            }
+        }
+    }
+    None
+}
+
+/// Where a GitHub repo's clone would live if muxterm made it.
+pub fn clone_root_for(repo: &str) -> PathBuf {
+    state::clones_dir().join(clone_dirname(&clone_url(repo)))
+}
+
+/// One spelling-independent key for a repo: `owner/repo`, the https URL and
+/// the scp-style `git@` remote all normalize to the same thing. The same
+/// comparison `inherited_setup` uses.
+pub fn repo_key(spelling: &str) -> String {
+    clone_dirname(&clone_url(spelling)).to_ascii_lowercase()
+}
+
+fn pr_checkout(
+    repo: &str,
+    root: &Path,
+    mut worktree: Worktree,
+    branch: &str,
+    progress: &impl Fn(String),
+) -> anyhow::Result<Worktree> {
+    if !root.exists() {
+        progress(format!("cloning {repo}…"));
+        if let Some(parent) = root.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let out = Command::new("git")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("clone")
+            .arg(clone_url(repo))
+            .arg(root)
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    progress("fetching…".into());
+    let branches = fetch_branches(root);
+    let choice = resolve_branch(branch, &branches);
+    if matches!(choice, BranchChoice::New(_)) {
+        // The fetch ran and the branch still isn't there: better to say so
+        // than to silently create a same-named branch off HEAD, which looks
+        // like the PR until you notice it has none of its commits.
+        anyhow::bail!("branch '{branch}' not found on the remote after fetch");
+    }
+    progress("checking out worktree…".into());
+    worktree.branch = branch.to_string();
+    populate_worktree(root, &worktree, &choice)?;
+    Ok(worktree)
+}
+
 /// The clone chain's body: `git clone` into the project's local root, then
 /// re-resolve the branch text and check out the worktree. Errors carry the
 /// claimed worktree back so callers can still name the directory. The
@@ -1571,6 +1708,7 @@ mod tests {
             archived_at: Some(9),
             setup: Some("direnv allow".into()),
             subdir: Some("apps/web".into()),
+            pr: None,
         };
         let back = Workspace::from_state(ws.to_state());
         assert_eq!(back.agent, Some("claude"));
@@ -2070,6 +2208,108 @@ ffeedd refs/heads/
                 name: "feat/pushed-later".into(),
                 remote: "origin".into(),
             },
+        );
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// Checking a PR out lands on a *tracking* branch, not a fresh one.
+    /// The distinction is the whole point: the PR branch is only in the
+    /// remote refs, so without the fetch `resolve_branch` says `New` and the
+    /// worktree gets an empty branch off HEAD that looks like the PR until
+    /// you notice it has none of its commits.
+    #[test]
+    fn pr_checkout_tracks_the_remote_branch() {
+        let (scratch, git) = scratch_git("prco");
+        let origin = scratch.join("origin.git");
+        fs::create_dir_all(&origin).unwrap();
+        git(&scratch, &["init", "--bare", "-b", "main", "origin.git"]);
+
+        let author = scratch.join("author");
+        seed_repo(&git, &author);
+        git(&author, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&author, &["push", "-u", "origin", "main"]);
+
+        let clone = scratch.join("clone");
+        git(
+            &scratch,
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        // The PR's branch is pushed after our clone existed, so it is not in
+        // the clone's refs - exactly the situation a real PR checkout meets.
+        git(&author, &["checkout", "-b", "feat/pr-branch"]);
+        git(
+            &author,
+            &[
+                "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "--allow-empty", "-m", "pr work",
+            ],
+        );
+        git(&author, &["push", "origin", "feat/pr-branch"]);
+
+        assert!(
+            !list_branches(&clone)
+                .iter()
+                .any(|b| b.name == "feat/pr-branch"),
+            "precondition: the clone has not fetched the PR branch",
+        );
+
+        let wt = Worktree {
+            path: scratch.join("wt-pr"),
+            branch: String::new(),
+        };
+        let done = pr_checkout(
+            "owner/repo",
+            &clone,
+            wt,
+            "feat/pr-branch",
+            &|_: String| {},
+        )
+        .expect("checkout succeeds");
+
+        assert_eq!(done.branch, "feat/pr-branch");
+        assert_eq!(
+            git(&done.path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feat/pr-branch",
+        );
+        // Tracking, so work can be pushed straight back to the PR.
+        assert_eq!(
+            git(&done.path, &["rev-parse", "--abbrev-ref", "@{u}"]),
+            "origin/feat/pr-branch",
+        );
+        // And it really is the PR's commit, not a fork of main.
+        assert_eq!(git(&done.path, &["log", "-1", "--format=%s"]), "pr work");
+
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// A branch that is not on the remote even after fetching must fail
+    /// loudly rather than silently creating a same-named empty branch.
+    #[test]
+    fn pr_checkout_refuses_a_branch_the_remote_does_not_have() {
+        let (scratch, git) = scratch_git("prmissing");
+        let origin = scratch.join("origin.git");
+        fs::create_dir_all(&origin).unwrap();
+        git(&scratch, &["init", "--bare", "-b", "main", "origin.git"]);
+        let author = scratch.join("author");
+        seed_repo(&git, &author);
+        git(&author, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&author, &["push", "-u", "origin", "main"]);
+        let clone = scratch.join("clone");
+        git(
+            &scratch,
+            &["clone", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+
+        let wt = Worktree {
+            path: scratch.join("wt-missing"),
+            branch: String::new(),
+        };
+        let err = pr_checkout("owner/repo", &clone, wt, "nope", &|_: String| {})
+            .expect_err("a missing branch must not silently succeed");
+        assert!(
+            err.to_string().contains("not found on the remote"),
+            "{err:#}",
         );
 
         fs::remove_dir_all(&scratch).unwrap();

@@ -23,10 +23,11 @@ use crate::config;
 use crate::theme::{self, UiTheme};
 use crate::workspace::{self, Project, Template, TemplatePane};
 
-/// Row width in character cells, borders included. Wide enough for the four
-/// tab labels in the selector row (`appearance preferences projects
-/// templates`), which is now the longest fixed line.
-const COLS: usize = 56;
+/// Row width in character cells, borders included. Wide enough for the five
+/// tab labels in the selector row (`appearance preferences projects templates
+/// extras`), which is the longest fixed line: two leading cells plus
+/// `"{marker}{label} "` per tab is 61.
+const COLS: usize = 64;
 
 /// Which settings tab is showing. Owned by the App (like `settings_open`)
 /// so cmd+shift+n can land straight on Projects.
@@ -37,6 +38,7 @@ pub enum Tab {
     Preferences,
     Projects,
     Templates,
+    Extras,
 }
 
 /// The Projects tab's add form text, owned by the App so typing survives
@@ -93,6 +95,7 @@ pub struct Outcome {
     pub pr_status: Option<bool>,
     pub pr_detector: Option<bool>,
     pub notifications: Option<bool>,
+    pub monitor_prs: Option<bool>,
     pub font_size: Option<f32>,
     /// A project to add - or to replace, when a saved project already has
     /// its name. The caller owns the list (state.json).
@@ -120,6 +123,7 @@ pub fn show(
     pr_status: bool,
     pr_detector: bool,
     notifications: bool,
+    monitor_prs: bool,
     tab: &mut Tab,
     projects: &[Project],
     draft: &mut ProjectDraft,
@@ -177,6 +181,9 @@ pub fn show(
                 Tab::Templates => show_templates(
                     ui, &grid, th, templates, tdraft, &mut out,
                 ),
+                Tab::Extras => {
+                    show_extras(ui, &grid, th, monitor_prs, &mut out)
+                },
             }
 
             grid.divider(ui, "esc closes", th.text_dim);
@@ -213,6 +220,32 @@ fn show_appearance(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Opt-in extras: features that reach outside muxterm (so far, GitHub).
+fn show_extras(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    th: &UiTheme,
+    monitor_prs: bool,
+    out: &mut Outcome,
+) {
+    grid.divider(ui, "GitHub", th.accent);
+    let mark = if monitor_prs { "[x]" } else { "[ ]" };
+    let row = grid.body(
+        ui,
+        vec![
+            (mark.to_string(), th.accent),
+            (" monitor open PRs".to_string(), th.text),
+        ],
+        true,
+        false,
+    );
+    if row.clicked() {
+        out.monitor_prs = Some(!monitor_prs);
+    }
+    grid.hint(ui, "your open PRs in the sidebar; click one to check it out");
+    grid.hint(ui, "needs gh, authenticated");
+}
+
 fn show_preferences(
     ui: &mut egui::Ui,
     grid: &Grid,
@@ -745,6 +778,7 @@ impl Grid<'_> {
                 (Tab::Preferences, "preferences"),
                 (Tab::Projects, "projects"),
                 (Tab::Templates, "templates"),
+                (Tab::Extras, "extras"),
             ] {
                 let selected = *tab == t;
                 let marker = if selected { "> " } else { "  " };
@@ -1103,6 +1137,7 @@ mod tests {
                 true,
                 true,
                 false,
+                true,
                 true,
                 true,
                 &mut tab,

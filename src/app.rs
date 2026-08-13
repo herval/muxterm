@@ -27,6 +27,8 @@ use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
 use muxterm::mesh;
 use crate::git_status;
 use crate::pane::Pane;
+use crate::pr_monitor::{self, PrItem};
+use crate::pr_view;
 use crate::pr_status;
 use crate::scrollback;
 use crate::search::{self, SearchBar, SearchOp};
@@ -115,6 +117,27 @@ pub struct App {
     copy_on_select: bool,
     /// Contrast floor for terminal text (config `min_contrast`); 1.0 off.
     min_contrast: f32,
+    /// List the user's own open GitHub PRs in the sidebar (config
+    /// `monitor_prs`). The poller idles rather than dying when this is off.
+    monitor_prs: bool,
+    /// The user's open PRs, streamed in by `pr_monitor`.
+    pr_list: pr_monitor::Snapshot,
+    pr_list_rx: Receiver<pr_monitor::Snapshot>,
+    pr_monitor_enabled: Arc<AtomicBool>,
+    /// Sidebar section fold, persisted like `archived_collapsed`.
+    prs_collapsed: bool,
+    /// PRs whose checkout is in flight, so a second click can't double-open.
+    pr_opening: HashSet<(String, u64)>,
+    /// (repo, number) -> head branch, once gh has told us. Also what lets a
+    /// row know it is already open in a workspace that was made some other
+    /// way (cmd+n on the branch, long before the PR existed).
+    pr_head: HashMap<(String, u64), String>,
+    pr_head_tx: Sender<(String, u64, Option<pr_monitor::Head>)>,
+    pr_head_rx: Receiver<(String, u64, Option<pr_monitor::Head>)>,
+    /// The PR being read in the overlay, if any.
+    pr_preview: Option<pr_view::Preview>,
+    pr_text_tx: Sender<(String, u64, Result<String, String>)>,
+    pr_text_rx: Receiver<(String, u64, Result<String, String>)>,
     settings_open: bool,
     /// Which settings tab shows; survives close so cmd+shift+n's "no
     /// projects yet" jump lands on Projects.
@@ -316,6 +339,16 @@ impl App {
             focused_flag.clone(),
             pr_dismissed.clone(),
         );
+        let (pr_head_tx, pr_head_rx) = mpsc::channel();
+        let (pr_text_tx, pr_text_rx) = mpsc::channel();
+        let (pr_list_tx, pr_list_rx) = mpsc::channel();
+        let pr_monitor_enabled = Arc::new(AtomicBool::new(style.monitor_prs));
+        pr_monitor::spawn(
+            cc.egui_ctx.clone(),
+            pr_list_tx,
+            pr_monitor_enabled.clone(),
+            focused_flag.clone(),
+        );
         let (git_tx, git_rx) = mpsc::channel();
         let git_enabled = Arc::new(AtomicBool::new(style.git_status));
         git_status::spawn(
@@ -356,6 +389,18 @@ impl App {
             pane_titles: style.pane_titles,
             copy_on_select: style.copy_on_select,
             min_contrast: style.min_contrast,
+            monitor_prs: style.monitor_prs,
+            pr_list: pr_monitor::Snapshot::default(),
+            pr_list_rx,
+            pr_monitor_enabled,
+            prs_collapsed: false,
+            pr_opening: HashSet::new(),
+            pr_head: HashMap::new(),
+            pr_head_tx,
+            pr_head_rx,
+            pr_preview: None,
+            pr_text_tx,
+            pr_text_rx,
             settings_open: false,
             settings_tab: settings::Tab::default(),
             project_draft: settings::ProjectDraft::default(),
@@ -426,6 +471,7 @@ impl App {
             LoadResult::Loaded(saved) => {
                 app.sidebar_open = saved.sidebar_open;
                 app.archived_collapsed = saved.archived_collapsed;
+                app.prs_collapsed = saved.prs_collapsed;
                 app.last_workspace_dir = saved.last_workspace_dir.clone();
                 app.projects = saved
                     .projects
@@ -978,6 +1024,7 @@ impl App {
             // reach it.
             setup,
             subdir: form.selected_project().and_then(|p| p.subdir.clone()),
+            pr: None,
         };
 
         self.tabs.push(Tab {
@@ -1238,6 +1285,17 @@ impl App {
             };
             self.worktree_progress.remove(&tab_id);
             self.pending_worktrees.remove(&tab_id);
+            // Whatever happened, the PR row stops saying "checking out…":
+            // on success the tab now claims it, on failure it is clickable
+            // again rather than stuck.
+            if let Some(pr) = self
+                .tabs
+                .iter()
+                .find(|t| t.tab_id == tab_id)
+                .and_then(|t| t.workspace.pr.clone())
+            {
+                self.pr_opening.remove(&pr);
+            }
             match result {
                 Ok(wt) => {
                     let mut side_cd = None;
@@ -1291,11 +1349,12 @@ impl App {
                             tab.workspace.root = fallback.clone();
                         }
                     }
-                    // One readable line of why; the full error is in the log.
-                    let notice = format!(
-                        "worktree failed: {}",
-                        e.lines().next().unwrap_or("unknown error")
-                    );
+                    // One readable line of why. git puts its progress on the
+                    // first line and the actual reason on a later one
+                    // ("Preparing worktree…" then "fatal: … already used by
+                    // worktree at …"), so take the line that explains rather
+                    // than the line that happens to be first.
+                    let notice = format!("worktree failed: {}", reason(&e));
                     self.launch_agent(
                         &tab_id,
                         fallback.as_deref(),
@@ -2356,6 +2415,7 @@ impl App {
             last_workspace_dir: self.last_workspace_dir.clone(),
             sidebar_open: self.sidebar_open,
             archived_collapsed: self.archived_collapsed,
+            prs_collapsed: self.prs_collapsed,
             projects: self.projects.iter().map(|p| p.to_state()).collect(),
             templates: self.templates.iter().map(|t| t.to_state()).collect(),
             windows: vec![WindowState {
@@ -2425,6 +2485,9 @@ impl App {
         }
         self.copy_on_select = style.copy_on_select;
         self.min_contrast = style.min_contrast;
+        self.monitor_prs = style.monitor_prs;
+        self.pr_monitor_enabled
+            .store(style.monitor_prs, Ordering::Relaxed);
         // The drag-end side of copy-on-select and the cmd+f search
         // highlight are tmux settings; rewrite the conf and re-source it
         // into the running server whenever its content actually changed
@@ -3171,6 +3234,233 @@ impl App {
         spawn_agent_probe(bins, self.probe_tx.clone(), ctx.clone());
     }
 
+    /// Check a PR out as a worktree workspace.
+    ///
+    /// Two phases, because the decision needs the PR's head branch and that
+    /// costs a network call: `gh search prs` cannot return it. The first
+    /// click resolves the branch off-thread; once it is known (and cached)
+    /// the second phase decides between three outcomes, only one of which
+    /// creates anything.
+    fn checkout_pr(&mut self, ctx: &egui::Context, item: PrItem) {
+        let key = (item.repo.clone(), item.number);
+        if let Some(branch) = self.pr_head.get(&key).cloned() {
+            self.open_pr_workspace(ctx, item, branch);
+            return;
+        }
+        if !self.pr_opening.insert(key) {
+            return; // a lookup is already out
+        }
+        workspace::spawn_pr_head(
+            item.repo,
+            item.number,
+            self.pr_head_tx.clone(),
+            ctx.clone(),
+        );
+    }
+
+    /// The head branch came back: cache it and carry on with the checkout the
+    /// user asked for.
+    fn drain_pr_heads(&mut self, ctx: &egui::Context) {
+        while let Ok((repo, number, head)) = self.pr_head_rx.try_recv() {
+            let key = (repo.clone(), number);
+            self.pr_opening.remove(&key);
+            let Some(head) = head else {
+                log::warn!("could not read {repo}#{number}'s branch from gh");
+                continue;
+            };
+            if head.cross_repo {
+                // A fork's branch is in another repo, out of `--track`'s
+                // reach. Say so rather than failing mid-checkout.
+                log::warn!(
+                    "{repo}#{number} is from a fork; check it out with gh pr checkout"
+                );
+                continue;
+            }
+            self.pr_head.insert(key, head.branch.clone());
+            if let Some(item) =
+                self.pr_list.items.iter().find(|i| {
+                    i.repo == repo && i.number == number
+                }).cloned()
+            {
+                self.open_pr_workspace(ctx, item, head.branch);
+            }
+        }
+    }
+
+    /// With the branch known: go to the workspace that already has it, open
+    /// the worktree that already holds it, or check it out fresh.
+    fn open_pr_workspace(
+        &mut self,
+        ctx: &egui::Context,
+        item: PrItem,
+        branch: String,
+    ) {
+        // Already a workspace on this branch - that is where the user wants
+        // to be, and git would refuse a second worktree on it anyway.
+        if let Some(i) = self.tabs.iter().position(|t| {
+            t.workspace
+                .worktree
+                .as_ref()
+                .is_some_and(|w| w.branch == branch)
+        }) {
+            if self.tabs[i].workspace.is_archived() {
+                self.unarchive_tab(i);
+            }
+            self.active = i;
+            self.dirty = true;
+            return;
+        }
+        let root = self.pr_repo_root(&item.repo);
+        // The branch is checked out somewhere muxterm has no tab for (a
+        // workspace that was deleted, or a worktree made by hand). Open that
+        // directory rather than failing on `git worktree add`.
+        let existing = workspace::worktree_for_branch(&root, &branch);
+        let key = (item.repo.clone(), item.number);
+        if !self.pr_opening.insert(key.clone()) {
+            return;
+        }
+        let claim = match &existing {
+            Some(path) => workspace::Worktree {
+                path: path.clone(),
+                branch: branch.clone(),
+            },
+            None => {
+                // The worktree directory is named for the PR, not the branch:
+                // `pr-9645` reads better in a path than a codename.
+                match workspace::claim_worktree(
+                    &root,
+                    &workspace::BranchChoice::New(format!(
+                        "pr-{}",
+                        item.number
+                    )),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::error!("no worktree claim for {}: {e:#}", item.repo);
+                        self.pr_opening.remove(&key);
+                        return;
+                    },
+                }
+            },
+        };
+        let start_dir = claim.path.to_string_lossy().to_string();
+        let pane = match self.create_pane(ctx, None, Some(start_dir)) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("failed to open PR pane: {e:#}");
+                self.pr_opening.remove(&key);
+                return;
+            },
+        };
+        let id = pane.id;
+        let tab_id = mesh::new_tab_id();
+        let mut workspace = Workspace::bare(Some(root.clone()));
+        workspace.title = format!("#{} {}", item.number, item.title);
+        workspace.agent = Some(self.agent.id);
+        // No model override: the agent's own default, as a bare cmd+n would.
+        workspace.pr = Some(key.clone());
+        if existing.is_some() {
+            workspace.worktree = Some(claim.clone());
+        }
+        let mut panes = HashMap::new();
+        panes.insert(id, pane);
+        self.tabs.push(Tab {
+            tab_id: tab_id.clone(),
+            tree: layout::Node::Leaf(id),
+            panes,
+            focused: id,
+            last_rects: HashMap::new(),
+            last_term_rects: HashMap::new(),
+            workspace,
+        });
+        self.active = self.tabs.len() - 1;
+        self.dirty = true;
+        match existing {
+            // Nothing to check out - the worktree is already there, so the
+            // agent can start immediately.
+            Some(_) => {
+                self.pr_opening.remove(&key);
+                self.launch_agent(&tab_id, None, None);
+            },
+            None => {
+                self.pending_worktrees.insert(tab_id.clone());
+                self.worktree_progress
+                    .insert(tab_id.clone(), "preparing worktree…".to_string());
+                workspace::spawn_pr_worktree(
+                    tab_id,
+                    item.repo,
+                    root,
+                    claim,
+                    branch,
+                    self.worktree_tx.clone(),
+                    ctx.clone(),
+                );
+            },
+        }
+    }
+
+    fn show_pr_preview(&mut self, ctx: &egui::Context) {
+        let Some(preview) = self.pr_preview.as_ref() else {
+            return;
+        };
+        let outcome =
+            pr_view::show(ctx, preview, &self.font, &self.ui_theme);
+        match outcome {
+            pr_view::Outcome::None => {},
+            pr_view::Outcome::Close => self.pr_preview = None,
+            pr_view::Outcome::OpenInBrowser => {
+                ctx.open_url(egui::OpenUrl::new_tab(&preview.item.url));
+            },
+            pr_view::Outcome::Checkout => {
+                // Reading it was enough to decide: turn the look into a
+                // workspace and get out of the way.
+                let item = preview.item.clone();
+                self.pr_preview = None;
+                self.checkout_pr(ctx, item);
+            },
+        }
+    }
+
+    /// Read a PR without checking it out. An overlay, not a pane: every pane
+    /// is a tmux session that outlives the app, and a glance should not leave
+    /// one behind. The text arrives off-thread.
+    fn preview_pr(&mut self, ctx: &egui::Context, item: PrItem) {
+        pr_monitor::spawn_text(
+            item.repo.clone(),
+            item.number,
+            self.pr_text_tx.clone(),
+            ctx.clone(),
+        );
+        self.pr_preview = Some(pr_view::Preview::loading(item));
+    }
+
+    /// Where a PR's repo lives locally:    /// Where a PR's repo lives locally: a saved project first, then any open
+    /// pane's checkout of it, and failing both the clone muxterm would make.
+    /// There is no remote-URL index in muxterm, so this is the whole search.
+    fn pr_repo_root(&self, repo: &str) -> PathBuf {
+        let key = workspace::repo_key(repo);
+        if let Some(p) = self.projects.iter().find(|p| {
+            p.repo.as_deref().is_some_and(|r| workspace::repo_key(r) == key)
+        }) {
+            return p.local_root();
+        }
+        // Any pane already sitting in that repo tells us where it is.
+        for snap in self.pane_snap.values() {
+            let Some(cwd) = snap.cwd.as_deref() else {
+                continue;
+            };
+            let Some(top) = workspace::repo_toplevel(Path::new(cwd)) else {
+                continue;
+            };
+            if workspace::origin_url(&top)
+                .is_some_and(|u| workspace::repo_key(&u) == key)
+            {
+                return top;
+            }
+        }
+        workspace::clone_root_for(repo)
+    }
+
     fn show_settings(&mut self, ctx: &egui::Context) {
         let out = settings::show(
             ctx,
@@ -3185,6 +3475,7 @@ impl App {
             self.pr_status,
             self.pr_detector,
             self.notifications,
+            self.monitor_prs,
             &mut self.settings_tab,
             &self.projects,
             &mut self.project_draft,
@@ -3251,6 +3542,10 @@ impl App {
         }
         if let Some(on) = out.notifications {
             config::set_notifications(on);
+            self.reload_config(ctx);
+        }
+        if let Some(on) = out.monitor_prs {
+            config::set_monitor_prs(on);
             self.reload_config(ctx);
         }
         if let Some(size) = out.font_size {
@@ -3427,6 +3722,19 @@ impl eframe::App for App {
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 for pane in tab.panes.values_mut() {
                     pane.attn.viewed();
+                }
+            }
+        }
+        while let Ok(snapshot) = self.pr_list_rx.try_recv() {
+            self.pr_list = snapshot;
+        }
+        self.drain_pr_heads(ctx);
+        while let Ok((repo, number, text)) = self.pr_text_rx.try_recv() {
+            // Only if it is still the PR on screen: a second click while the
+            // first was loading must not paint the wrong body.
+            if let Some(p) = self.pr_preview.as_mut() {
+                if p.item.repo == repo && p.item.number == number {
+                    p.set_text(text);
                 }
             }
         }
@@ -3628,9 +3936,36 @@ impl eframe::App for App {
                     bt.cmp(&at)
                 },
             });
+            // A PR is "checked out" when some tab's worktree sits on its
+            // head branch. The branch is only known once a checkout has
+            // happened, so this matches on the worktree we created.
+            let prs: Vec<sidebar::PrRow> = self
+                .pr_list
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, it)| sidebar::PrRow {
+                    index,
+                    number: it.number,
+                    repo: it.repo.clone(),
+                    title: it.title.clone(),
+                    draft: it.draft,
+                    busy: self
+                        .pr_opening
+                        .contains(&(it.repo.clone(), it.number)),
+                    checked_out: self.tabs.iter().position(|t| {
+                        t.workspace.pr.as_ref().is_some_and(|(r, n)| {
+                            r == &it.repo && *n == it.number
+                        })
+                    }),
+                })
+                .collect();
             for action in sidebar::show(
                 ctx,
                 &rows,
+                &prs,
+                self.pr_list.note.as_deref(),
+                self.prs_collapsed,
                 self.archived_collapsed,
                 &self.font,
                 &self.ui_theme,
@@ -3664,6 +3999,25 @@ impl eframe::App for App {
                     SidebarAction::ToggleArchived => {
                         self.archived_collapsed = !self.archived_collapsed;
                         self.dirty = true;
+                    },
+                    SidebarAction::TogglePrs => {
+                        self.prs_collapsed = !self.prs_collapsed;
+                        self.dirty = true;
+                    },
+                    SidebarAction::CheckoutPr(i) => {
+                        if let Some(item) = self.pr_list.items.get(i).cloned() {
+                            self.checkout_pr(ctx, item);
+                        }
+                    },
+                    SidebarAction::OpenPr(i) => {
+                        if let Some(item) = self.pr_list.items.get(i) {
+                            ctx.open_url(egui::OpenUrl::new_tab(&item.url));
+                        }
+                    },
+                    SidebarAction::PreviewPr(i) => {
+                        if let Some(item) = self.pr_list.items.get(i).cloned() {
+                            self.preview_pr(ctx, item);
+                        }
                     },
                     SidebarAction::NewWorkspace => {
                         actions.push(Action::NewWorkspace)
@@ -3714,6 +4068,7 @@ impl eframe::App for App {
                     // re-grabbing focus every frame.
                     let focused = if archived
                         || self.settings_open
+                        || self.pr_preview.is_some()
                         || self.new_workspace.is_some()
                         || !self.confirm_worktree.is_empty()
                         || self.search.active()
@@ -3844,6 +4199,9 @@ impl eframe::App for App {
                 }
             });
 
+        if self.pr_preview.is_some() {
+            self.show_pr_preview(ctx);
+        }
         if self.settings_open {
             self.show_settings(ctx);
         }
@@ -4656,6 +5014,20 @@ fn is_typing(e: &egui::Event) -> bool {
         },
         _ => false,
     }
+}
+
+/// The line of a multi-line command error worth showing the user: the one
+/// git actually explains itself on. `git worktree add` opens with a progress
+/// line and only then says why it refused, so first-line-wins would report
+/// "Preparing worktree (checking out 'x')" as the failure.
+fn reason(err: &str) -> &str {
+    let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    lines
+        .iter()
+        .find(|l| l.starts_with("fatal:") || l.starts_with("error:"))
+        .or_else(|| lines.last())
+        .copied()
+        .unwrap_or("unknown error")
 }
 
 /// Tab label: registered agents show as `● name · role`, everything else

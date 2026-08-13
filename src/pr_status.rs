@@ -501,7 +501,7 @@ fn save_memory(path: &Path, memory: &Memory) {
 
 /// PATH is bare under Finder launches; probe like `mesh::find_tmux`, but
 /// PATH (`which`) first so shells and tests can interpose their own gh.
-fn find_gh() -> Option<PathBuf> {
+pub(crate) fn find_gh() -> Option<PathBuf> {
     if let Ok(out) = Command::new("which").arg("gh").output() {
         if out.status.success() {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();

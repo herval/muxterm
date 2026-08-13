@@ -24,6 +24,9 @@ pub struct StateFile {
     /// with `#[serde(default)]` (expanded), so older state files load as-is.
     #[serde(default)]
     pub archived_collapsed: bool,
+    /// Whether the sidebar's open-PRs section is folded away.
+    #[serde(default)]
+    pub prs_collapsed: bool,
     /// The saved project registry (Settings > Projects), the sources the
     /// cmd+shift+n popup offers. Additive with `#[serde(default)]` (empty).
     #[serde(default)]
@@ -93,6 +96,9 @@ pub struct WorkspaceState {
     /// workspace's panes cd here (inside the worktree) before setup runs.
     #[serde(default)]
     pub subdir: Option<String>,
+    /// The GitHub PR this workspace came from (`owner/name`, number).
+    #[serde(default)]
+    pub pr: Option<(String, u64)>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -384,6 +390,7 @@ mod tests {
             last_workspace_dir: Some("/tmp/proj".into()),
             sidebar_open: true,
             archived_collapsed: false,
+            prs_collapsed: false,
             projects: vec![
                 ProjectState {
                     name: "muxterm".into(),
@@ -461,6 +468,7 @@ mod tests {
                             archived_at: None,
                             setup: Some("direnv allow".into()),
                             subdir: Some("apps/web".into()),
+                            pr: None,
                         }),
                     },
                 ],

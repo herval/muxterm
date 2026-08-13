@@ -32,6 +32,14 @@ pub enum SidebarAction {
     DisarmDelete,
     /// Collapse/expand the archived pile (its header click).
     ToggleArchived,
+    /// Collapse/expand the open-PRs section (its header click).
+    TogglePrs,
+    /// Check this PR out as a worktree workspace (a PR row's body click).
+    CheckoutPr(usize),
+    /// Open this PR on github.com (a PR row's right-click).
+    OpenPr(usize),
+    /// Read this PR in a pane without checking it out (a PR row's body click).
+    PreviewPr(usize),
     /// Open the creation popup (the header "+").
     NewWorkspace,
     /// Collapse the sidebar (the header "‹").
@@ -74,9 +82,28 @@ pub struct Row {
     pub delete_armed: bool,
 }
 
+/// One of the user's open PRs. Deliberately not a `Row`: that is indexed by
+/// tab, and a PR has no tab until it is checked out.
+pub struct PrRow {
+    /// Index into the caller's PR list - the same role `tab_index` plays.
+    pub index: usize,
+    pub number: u64,
+    /// `owner/name`, shown as the row's subtitle.
+    pub repo: String,
+    pub title: String,
+    pub draft: bool,
+    /// A checkout already in flight: the row is inert until it lands.
+    pub busy: bool,
+    /// Already checked out in some tab - clicking selects that tab instead.
+    pub checked_out: Option<usize>,
+}
+
 pub fn show(
     ctx: &egui::Context,
     rows: &[Row],
+    prs: &[PrRow],
+    pr_note: Option<&str>,
+    prs_collapsed: bool,
     archived_collapsed: bool,
     font: &FontId,
     t: &UiTheme,
@@ -135,14 +162,43 @@ pub fn show(
                         actions.push(a);
                     }
                 }
+                // Open PRs, above the archived pile: things you could pull
+                // into the workspace list, under things already in it.
+                if !prs.is_empty() || pr_note.is_some() {
+                    ui.add_space(12.0);
+                    if section_header(
+                        ui,
+                        "Pull requests",
+                        prs.len(),
+                        prs_collapsed,
+                        &head_font,
+                        t,
+                    ) {
+                        actions.push(SidebarAction::TogglePrs);
+                    }
+                    if !prs_collapsed {
+                        ui.add_space(4.0);
+                        // An enabled section that renders empty reads as
+                        // broken, so it says why instead.
+                        if let Some(note) = pr_note {
+                            note_row(ui, note, &head_font, t);
+                        }
+                        for pr in prs {
+                            if let Some(a) = pr_row(ui, pr, font, t) {
+                                actions.push(a);
+                            }
+                        }
+                    }
+                }
                 // Archived pile at the bottom, under a dim header that
                 // clicks to collapse the pile (the App persists the fold).
                 // Rows arrive already ordered newest-first by the caller.
                 let archived = rows.iter().filter(|r| r.archived).count();
                 if archived > 0 {
                     ui.add_space(12.0);
-                    if archived_header(
+                    if section_header(
                         ui,
+                        "Archived",
                         archived,
                         archived_collapsed,
                         &head_font,
@@ -287,8 +343,155 @@ fn status_icon(
 /// open, right when folded) before the dim "Archived" label, with the hidden
 /// row count while folded. Painter-drawn triangle like `status_icon` - no
 /// font-glyph gambles across terminal fonts. Returns true on click.
-fn archived_header(
+/// A dim one-liner where rows would be - why the section is empty.
+fn note_row(ui: &mut egui::Ui, note: &str, font: &FontId, t: &UiTheme) {
+    let row_h = ui.fonts(|f| f.row_height(font));
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), row_h),
+        egui::Sense::hover(),
+    );
+    ui.painter().text(
+        Pos2::new(rect.min.x + font.size * 0.95, rect.center().y),
+        Align2::LEFT_CENTER,
+        note,
+        font.clone(),
+        t.text_dim,
+    );
+}
+
+/// One open PR. The body click *reads* it - a pane with the PR and its diff,
+/// nothing cloned or checked out - and the ↓ button beside it is the one that
+/// makes a worktree, the way the archive/restore icons work on a workspace
+/// row. Right-click opens it on github.com, matching the pane HUD's PR chips.
+fn pr_row(
     ui: &mut egui::Ui,
+    pr: &PrRow,
+    font: &FontId,
+    t: &UiTheme,
+) -> Option<SidebarAction> {
+    let pad = Vec2::new(8.0, 5.0);
+    let status_w = font.size * 1.1;
+    let dim = pr.busy || pr.checked_out.is_some();
+    let wrap =
+        (ui.available_width() - pad.x * 2.0 - status_w - ICON_W).max(1.0);
+
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap;
+    job.append(
+        &format!("#{} {}", pr.number, pr.title),
+        0.0,
+        TextFormat {
+            font_id: font.clone(),
+            color: if dim { t.text_dim } else { t.text },
+            ..Default::default()
+        },
+    );
+    let sub = if pr.busy {
+        format!("{} · checking out…", pr.repo)
+    } else if pr.checked_out.is_some() {
+        format!("{} · open", pr.repo)
+    } else {
+        pr.repo.clone()
+    };
+    job.append(
+        &format!("\n  {sub}"),
+        0.0,
+        TextFormat {
+            font_id: FontId::new(font.size * 0.8, font.family.clone()),
+            color: t.text_dim,
+            ..Default::default()
+        },
+    );
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let row_h = galley.size().y + pad.y * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), row_h),
+        egui::Sense::click(),
+    );
+    let resp = resp
+        .on_hover_text("click to read it here\nright-click opens it on github")
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    // Registered after the body so it wins the click, like the workspace
+    // row's archive/delete icons.
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.max.x - pad.x - ICON_W / 2.0, rect.center().y),
+        Vec2::splat(ICON_W),
+    );
+    let icon_resp = (!pr.busy && pr.checked_out.is_none()).then(|| {
+        ui.interact(
+            icon_rect,
+            ui.id().with(("pr_row_checkout", pr.number)),
+            egui::Sense::click(),
+        )
+        .on_hover_text("check out as a worktree")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
+
+    let hovered = resp.hovered()
+        || icon_resp.as_ref().is_some_and(|r| r.hovered());
+    if hovered {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(4),
+            theme::blend(t.bg, t.accent, 0.06),
+        );
+    }
+    // The same painter-drawn PR state icons the pane HUD chips use.
+    let hud = theme::hud_colors(t);
+    let kind = if pr.draft {
+        crate::pr_status::Kind::Draft
+    } else {
+        crate::pr_status::Kind::Ok
+    };
+    kind.draw_icon(
+        ui.painter(),
+        Pos2::new(
+            rect.min.x + pad.x + status_w * 0.38,
+            rect.min.y + pad.y + row_h * 0.16,
+        ),
+        font.size,
+        &hud,
+    );
+    ui.painter().galley(
+        Pos2::new(rect.min.x + pad.x + status_w, rect.min.y + pad.y),
+        galley,
+        t.text,
+    );
+    if hovered {
+        if let Some(r) = &icon_resp {
+            ui.painter().text(
+                icon_rect.center(),
+                Align2::CENTER_CENTER,
+                "↓",
+                FontId::new(font.size * 0.95, font.family.clone()),
+                if r.hovered() { t.text } else { t.text_dim },
+            );
+        }
+    }
+
+    if pr.busy {
+        return None;
+    }
+    if resp.secondary_clicked() {
+        return Some(SidebarAction::OpenPr(pr.index));
+    }
+    if icon_resp.is_some_and(|r| r.clicked()) {
+        return Some(SidebarAction::CheckoutPr(pr.index));
+    }
+    if resp.clicked() {
+        return Some(match pr.checked_out {
+            // Already a workspace for it: go there rather than re-reading it.
+            Some(tab) => SidebarAction::Select(tab),
+            None => SidebarAction::PreviewPr(pr.index),
+        });
+    }
+    None
+}
+
+fn section_header(
+    ui: &mut egui::Ui,
+    name: &str,
     count: usize,
     collapsed: bool,
     font: &FontId,
@@ -321,9 +524,9 @@ fn archived_header(
         .add(egui::Shape::convex_polygon(triangle, color, Stroke::NONE));
 
     let label = if collapsed {
-        format!("Archived ({count})")
+        format!("{name} ({count})")
     } else {
-        "Archived".to_string()
+        name.to_string()
     };
     ui.painter().text(
         Pos2::new(rect.min.x + font.size * 0.95, rect.center().y),
@@ -616,7 +819,7 @@ mod tests {
             ..Default::default()
         };
         let mut frame = |ctx: &egui::Context| {
-            let _ = show(ctx, &rows, false, &font, &th);
+            let _ = show(ctx, &rows, &[], None, false, false, &font, &th);
         };
         let _ = ctx.run(input.clone(), &mut frame);
         let output = ctx.run(input, &mut frame);
@@ -700,7 +903,7 @@ mod tests {
         };
         let texts = |collapsed: bool| {
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, collapsed, &font, &th);
+                let _ = show(ctx, &rows, &[], None, false, collapsed, &font, &th);
             };
             let _ = ctx.run(input.clone(), &mut frame);
             let output = ctx.run(input.clone(), &mut frame);
@@ -757,7 +960,7 @@ mod tests {
                 delete_armed: false,
             }];
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, false, &font, &th);
+                let _ = show(ctx, &rows, &[], None, false, false, &font, &th);
             };
             let input = |focused: bool| egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -806,6 +1009,143 @@ mod tests {
     /// The click-to-action mapping: an unarmed ✕ arms, an armed one deletes,
     /// and the delete flag is inert on a non-archived row (which has no ✕ -
     /// the body/icon mapping decides instead).
+    fn pr(index: usize, checked_out: Option<usize>, busy: bool) -> PrRow {
+        PrRow {
+            index,
+            number: 9645,
+            repo: "Telepatia-AI/monobloco".into(),
+            title: "institution-ramp canary rollback".into(),
+            draft: false,
+            busy,
+            checked_out,
+        }
+    }
+
+    /// The PR section paints its own header and one row per PR, and folds
+    /// away behind the header like the archived pile does.
+    #[test]
+    fn pr_section_folds_behind_its_header() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let prs = vec![pr(0, None, false)];
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let painted = |collapsed: bool, note: Option<&str>, prs: &[PrRow]| {
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(ctx, &[], prs, note, collapsed, false, &font, &th);
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let output = ctx.run(input.clone(), &mut frame);
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let open = painted(false, None, &prs);
+        assert!(
+            open.iter().any(|t| t.contains("Pull requests")),
+            "header missing: {open:?}",
+        );
+        assert!(
+            open.iter().any(|t| t.contains("9645")),
+            "the PR row should paint when open: {open:?}",
+        );
+        let folded = painted(true, None, &prs);
+        assert!(
+            folded.iter().any(|t| t.contains("Pull requests (1)")),
+            "a folded header carries the count: {folded:?}",
+        );
+        assert!(
+            !folded.iter().any(|t| t.contains("9645")),
+            "the row must be hidden when folded: {folded:?}",
+        );
+
+        // An enabled section that can't list anything says why, rather than
+        // rendering blank and looking broken.
+        let noted = painted(false, Some("gh is not authenticated"), &[]);
+        assert!(
+            noted.iter().any(|t| t.contains("not authenticated")),
+            "the reason should be on screen: {noted:?}",
+        );
+    }
+
+    /// The body reads, the button checks out. Two different jobs on one row,
+    /// so the click that means "have a look" can't cost a worktree.
+    #[test]
+    fn body_reads_and_the_button_checks_out() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let prs = vec![pr(0, None, false)];
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(900.0, 700.0),
+        );
+        // Where the row and its icon landed, so the clicks are aimed rather
+        // than guessed.
+        let click_at = |pos: egui::Pos2| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    },
+                ],
+                ..Default::default()
+            };
+            let mut got = Vec::new();
+            let mut frame = |ctx: &egui::Context| {
+                got = show(ctx, &[], &prs, None, false, false, &font, &th);
+            };
+            // Two passes: egui needs a layout pass before a hit lands.
+            let warm = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let _ = ctx.run(warm, &mut frame);
+            let _ = ctx.run(input, &mut frame);
+            got
+        };
+
+        // The row sits under the "Pull requests" header near the top left.
+        let body = click_at(egui::Pos2::new(80.0, 70.0));
+        assert!(
+            body.iter().any(|a| matches!(a, SidebarAction::PreviewPr(0))),
+            "a body click should read the PR, not check it out: {:?}",
+            body.len(),
+        );
+        assert!(
+            !body.iter().any(|a| matches!(a, SidebarAction::CheckoutPr(_))),
+            "a body click must never make a worktree",
+        );
+    }
+
     #[test]
     fn row_action_delete_arms_then_fires() {
         let click = |body, icon, delete| RowResponse {
@@ -857,7 +1197,7 @@ mod tests {
             let rows = vec![archived_row(armed)];
             let mut fired = false;
             let mut frame = |ctx: &egui::Context| {
-                for a in show(ctx, &rows, false, &font, &th) {
+                for a in show(ctx, &rows, &[], None, false, false, &font, &th) {
                     if matches!(a, SidebarAction::DisarmDelete) {
                         fired = true;
                     }
@@ -891,7 +1231,7 @@ mod tests {
         let icon_shapes = |armed: bool| {
             let rows = vec![archived_row(armed)];
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, false, &font, &th);
+                let _ = show(ctx, &rows, &[], None, false, false, &font, &th);
             };
             // Settle the layout, then find the row title's on-screen spot
             // so the hover lands on the body regardless of exact geometry.

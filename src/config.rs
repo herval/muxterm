@@ -63,6 +63,10 @@ agent = "{default}"
 # select"). Off by default: select, then copy explicitly with cmd+c.
 copy_on_select = false
 
+# List your own open GitHub PRs in a sidebar section, and check one out as a
+# worktree by clicking it. Off by default; needs gh, authenticated.
+# monitor_prs = false
+
 # Show the pane's git branch beside the tab title with dirty/ahead-behind
 # markers (● branch *changed ↑ahead ↓behind). Local git only, no network.
 # git_status = true
@@ -138,6 +142,8 @@ pub struct ConfigFile {
     pub pane_titles: bool,
     /// Mouse selections copy to the clipboard as soon as they finish.
     pub copy_on_select: bool,
+    /// List the user's own open GitHub PRs in the sidebar (needs gh).
+    pub monitor_prs: bool,
     /// Badge each pane's git branch + dirty/ahead-behind state on the tab.
     pub git_status: bool,
     /// Poll `gh` for the current branch's PR and badge it on the tab.
@@ -182,6 +188,7 @@ impl Default for ConfigFile {
             min_contrast: 3.0,
             pane_titles: true,
             copy_on_select: false,
+            monitor_prs: false,
             git_status: true,
             pr_status: true,
             pr_detector: true,
@@ -215,6 +222,7 @@ pub struct Style {
     pub agent: &'static Agent,
     pub pane_titles: bool,
     pub copy_on_select: bool,
+    pub monitor_prs: bool,
     pub min_contrast: f32,
     pub git_status: bool,
     pub pr_status: bool,
@@ -351,6 +359,7 @@ pub fn resolve(
             agent,
             pane_titles: cfg.pane_titles,
             copy_on_select: cfg.copy_on_select,
+            monitor_prs: cfg.monitor_prs,
             min_contrast: cfg.min_contrast,
             git_status: cfg.git_status,
             pr_status: cfg.pr_status,
@@ -486,6 +495,18 @@ pub fn set_pr_status(on: bool) {
         replace_top_level_line(&text, "pr_status", &line),
     ) {
         log::warn!("could not save pr_status: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's PR-monitor checkbox.
+pub fn set_monitor_prs(on: bool) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("monitor_prs = {on}");
+    if let Err(e) = fs::write(
+        path(),
+        replace_top_level_line(&text, "monitor_prs", &line),
+    ) {
+        log::warn!("could not save monitor_prs: {e:#}");
     }
 }
 
