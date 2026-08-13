@@ -20,7 +20,9 @@ use muxterm::agent::{self, Agent};
 
 use crate::ai_prompt::{self, LineTracker, Verdict};
 use crate::attention;
+use crate::automation_view;
 use crate::bg_jobs;
+use muxterm::automation;
 use crate::config;
 use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
@@ -60,6 +62,12 @@ const STALE_ATTENTION_GRACE: u64 = 30;
 /// lands on the first poll tick; without this grace, that settling window
 /// could be misread as "every pane left the worktree" and drop the link.
 const WORKSPACE_SYNC_GRACE: Duration = Duration::from_secs(5);
+
+/// How long after firing an automation a second attempt is ignored. Covers
+/// the gap between typing `mux automations exec` and the run record landing
+/// in the cache that answers "is it already running" - long enough to absorb
+/// a double-clicked ▶, short enough that a deliberate re-run still works.
+const AUTOMATION_REFIRE_GRACE: Duration = Duration::from_secs(3);
 
 pub struct Tab {
     /// Stable id (`mux-tab-<8hex>`) scoping the agent mesh to this tab.
@@ -138,10 +146,33 @@ pub struct App {
     pr_preview: Option<pr_view::Preview>,
     pr_text_tx: Sender<(String, u64, Result<String, String>)>,
     pr_text_rx: Receiver<(String, u64, Result<String, String>)>,
+    /// Fire saved automations on their schedules (config `automations`).
+    /// Off leaves the list saved but inert, and hides the sidebar section.
+    automations_on: bool,
+    /// The saved scheduled tasks, persisted in state.json.
+    automations: Vec<automation::Automation>,
+    /// Sidebar section fold, persisted like `prs_collapsed`.
+    automations_collapsed: bool,
+    /// id -> the unix second it next fires. Runtime only: recomputed at
+    /// startup and after every run, which is what makes a schedule missed
+    /// while muxterm was closed *skipped* rather than backfired.
+    automation_due: HashMap<String, u64>,
+    /// id -> (run-dir mtime, runs). Re-read only when the directory changes,
+    /// so a tab full of automations costs one `stat` per tick.
+    automation_runs: HashMap<String, (Option<SystemTime>, Vec<automation::Run>)>,
+    /// id -> when it was last set going. "Already running" is otherwise
+    /// answered by the run-record cache, which cannot know about a run until
+    /// the runner has written its record and the next tick has re-read it -
+    /// a window a double-clicked ▶ fits inside twice.
+    automation_fired: HashMap<String, Instant>,
+    /// The automation whose run history is open in the overlay, if any.
+    automation_preview: Option<automation_view::Preview>,
     settings_open: bool,
     /// Which settings tab shows; survives close so cmd+shift+n's "no
     /// projects yet" jump lands on Projects.
     settings_tab: settings::Tab,
+    /// The Automations tab's add/edit form, typed across frames.
+    automation_draft: settings::AutomationDraft,
     /// The Projects tab's add form, typed across frames.
     project_draft: settings::ProjectDraft,
     /// The Templates tab's edit form, typed across frames.
@@ -404,10 +435,18 @@ impl App {
             pr_preview: None,
             pr_text_tx,
             pr_text_rx,
+            automations_on: style.automations,
+            automations: Vec::new(),
+            automations_collapsed: false,
+            automation_due: HashMap::new(),
+            automation_runs: HashMap::new(),
+            automation_fired: HashMap::new(),
+            automation_preview: None,
             settings_open: false,
             settings_tab: settings::Tab::default(),
             project_draft: settings::ProjectDraft::default(),
             template_draft: settings::TemplateDraft::default(),
+            automation_draft: settings::AutomationDraft::default(),
             dirty: false,
             config_mtime: config::mtime(),
             last_config_check: Instant::now(),
@@ -476,7 +515,14 @@ impl App {
                 app.sidebar_open = saved.sidebar_open;
                 app.archived_collapsed = saved.archived_collapsed;
                 app.prs_collapsed = saved.prs_collapsed;
+                app.automations_collapsed = saved.automations_collapsed;
                 app.workspaces_collapsed = saved.workspaces_collapsed;
+                app.automations = saved
+                    .automations
+                    .iter()
+                    .cloned()
+                    .map(automation::Automation::from_state)
+                    .collect();
                 app.last_workspace_dir = saved.last_workspace_dir.clone();
                 app.projects = saved
                     .projects
@@ -551,6 +597,22 @@ impl App {
         mesh::clear_notify_requests();
         mesh::clear_rename_requests();
         mesh::clear_newtab_requests();
+        mesh::clear_automation_requests();
+        // A run recorded as still running cannot be: its process died with
+        // the tmux server or the app. Settle the record before anything
+        // reads it, then schedule forward from now - a schedule that came
+        // round while muxterm was closed is skipped, not backfired.
+        for a in &app.automations {
+            for run in automation::read_runs(&a.id) {
+                if run.is_running() {
+                    let mut settled = run;
+                    settled.status = automation::INTERRUPTED.to_string();
+                    settled.finished_at = Some(mesh::now());
+                    let _ = automation::write_run(&a.id, &settled);
+                }
+            }
+        }
+        app.reschedule_automations();
 
         // Reclaim empty claim dirs that failed checkouts left behind
         // (deleting them at failure time would yank a booting shell's cwd).
@@ -725,7 +787,7 @@ impl App {
         self.tabs
             .iter()
             .enumerate()
-            .filter(|(_, t)| !t.workspace.is_archived())
+            .filter(|(_, t)| in_tab_flow(&t.workspace))
             .map(|(i, _)| i)
             .collect()
     }
@@ -1030,6 +1092,7 @@ impl App {
             setup,
             subdir: form.selected_project().and_then(|p| p.subdir.clone()),
             pr: None,
+            automation: None,
         };
 
         self.tabs.push(Tab {
@@ -1934,6 +1997,450 @@ impl App {
         Ok(())
     }
 
+    // ---------------------------------------------------------- automations
+
+    /// Recompute when every automation next fires, from *now*. Called at
+    /// startup and whenever the list changes, which is what makes a schedule
+    /// that came round while muxterm was closed skipped rather than
+    /// backfired: nothing remembers that it was ever due.
+    fn reschedule_automations(&mut self) {
+        let now = chrono::Local::now();
+        self.automation_due.clear();
+        for a in &self.automations {
+            if let Some(at) = Self::next_due(a, now) {
+                self.automation_due.insert(a.id.clone(), at);
+            }
+        }
+    }
+
+    fn next_due(
+        a: &automation::Automation,
+        from: chrono::DateTime<chrono::Local>,
+    ) -> Option<u64> {
+        a.parsed()
+            .ok()?
+            .next_after(from)
+            .map(|dt| dt.timestamp().max(0) as u64)
+    }
+
+    /// Apply the changes `mux automations <verb>` spooled. The GUI owns
+    /// state.json, so this is the only path by which the CLI can change the
+    /// list - and every field is re-validated here, since the spool is
+    /// deliberately unauthenticated.
+    fn drain_automation_requests(&mut self, ctx: &egui::Context) {
+        let reqs = mesh::take_automation_requests();
+        if reqs.is_empty() {
+            return;
+        }
+        for req in reqs {
+            if req.v != 1 {
+                log::warn!("unsupported automation request v{}", req.v);
+                continue;
+            }
+            match req.op {
+                mesh::AutomationOp::Create => {
+                    let (Some(name), Some(schedule)) =
+                        (req.name.clone(), req.schedule.clone())
+                    else {
+                        log::warn!("automation create without name/schedule");
+                        continue;
+                    };
+                    if automation::parse(&schedule).is_err() {
+                        log::warn!("automation create with bad schedule");
+                        continue;
+                    }
+                    let mut a = automation::Automation::new(name, schedule);
+                    a.id = req.id.clone();
+                    apply_automation_fields(&mut a, &req);
+                    self.automations.push(a);
+                },
+                mesh::AutomationOp::Edit => {
+                    if let Some(a) =
+                        self.automations.iter_mut().find(|a| a.id == req.id)
+                    {
+                        apply_automation_fields(a, &req);
+                    }
+                },
+                mesh::AutomationOp::Remove => {
+                    self.remove_automation(ctx, &req.id)
+                },
+                mesh::AutomationOp::Enable | mesh::AutomationOp::Disable => {
+                    let on = req.op == mesh::AutomationOp::Enable;
+                    if let Some(a) =
+                        self.automations.iter_mut().find(|a| a.id == req.id)
+                    {
+                        a.enabled = on;
+                    }
+                },
+                mesh::AutomationOp::Run => self.run_automation(ctx, &req.id),
+            }
+        }
+        self.reschedule_automations();
+        self.dirty = true;
+    }
+
+    /// Drop an automation and everything that belongs to it: its run history
+    /// and its dedicated tab (which exists only to hold that history).
+    fn remove_automation(&mut self, ctx: &egui::Context, id: &str) {
+        self.automations.retain(|a| a.id != id);
+        self.automation_due.remove(id);
+        self.automation_runs.remove(id);
+        automation::remove_runs(id);
+        if self.automation_preview.as_ref().is_some_and(|p| p.id == id) {
+            self.automation_preview = None;
+        }
+        // The tab exists only to hold this automation's runs, so it goes too.
+        // Same teardown as an archived workspace's delete (it has no worktree,
+        // so that half is a no-op).
+        if let Some(i) = self.automation_tab_index(id) {
+            self.remove_tab_and_worktree(ctx, i);
+        }
+        self.dirty = true;
+    }
+
+    fn automation_tab_index(&self, id: &str) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|t| t.workspace.automation.as_deref() == Some(id))
+    }
+
+    /// The tick's scheduler: fire everything that has come due. Cheap enough
+    /// to sit on the existing one-second tick - it is a map lookup per
+    /// automation until something is actually due.
+    fn tick_automations(&mut self, ctx: &egui::Context) {
+        if !self.automations_on {
+            return;
+        }
+        let now = mesh::now();
+        let due: Vec<String> = self
+            .automations
+            .iter()
+            .filter(|a| a.enabled)
+            .filter(|a| {
+                self.automation_due.get(&a.id).is_some_and(|at| *at <= now)
+            })
+            .map(|a| a.id.clone())
+            .collect();
+        for id in due {
+            // Reschedule first, so a run that cannot start (busy pane) does
+            // not re-fire every tick until it can.
+            self.bump_due(&id);
+            self.fire_automation(ctx, &id, automation::TRIGGER_SCHEDULE);
+        }
+    }
+
+    fn bump_due(&mut self, id: &str) {
+        let now = chrono::Local::now();
+        let next = self
+            .automations
+            .iter()
+            .find(|a| a.id == id)
+            .and_then(|a| Self::next_due(a, now));
+        match next {
+            Some(at) => {
+                self.automation_due.insert(id.to_string(), at);
+            },
+            // A schedule with no next occurrence stops rather than spinning.
+            None => {
+                self.automation_due.remove(id);
+            },
+        }
+    }
+
+    /// "Run it now" (the sidebar ▶, the overlay button, `mux automations
+    /// run`). Same path as the scheduler's, only the trigger differs.
+    fn run_automation(&mut self, ctx: &egui::Context, id: &str) {
+        self.fire_automation(ctx, id, automation::TRIGGER_MANUAL);
+    }
+
+    /// Start one run, in the automation's own tab.
+    ///
+    /// The work is typed into that tab's pane rather than run in-process, so
+    /// it behaves like anything else in muxterm: visible live, scrolled back
+    /// through tmux, interruptible with ctrl+c, and surviving an app quit.
+    fn fire_automation(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+        trigger: &str,
+    ) {
+        if self.automation_running(id) {
+            log::info!("automation {id} is already running; skipping");
+            return;
+        }
+        // The record-cache check above cannot see a run that started moments
+        // ago, so a double-clicked ▶ would type the command twice and the
+        // shell would queue the second behind the first. One gesture, one
+        // run.
+        let fresh = self
+            .automation_fired
+            .get(id)
+            .is_some_and(|at| at.elapsed() < AUTOMATION_REFIRE_GRACE);
+        if fresh {
+            return;
+        }
+        let Some(tab_index) = self.ensure_automation_tab(ctx, id) else {
+            return;
+        };
+        let tab = &self.tabs[tab_index];
+        let pane_id = tab.tree.first_leaf();
+        let Some(pane) = tab.panes.get(&pane_id) else {
+            return;
+        };
+        // Only type at an idle shell. A pane still busy with the last run (or
+        // with something the user started) would just get the command queued
+        // behind it - better to skip this occurrence and say so.
+        let idle = self
+            .pane_snap
+            .get(&pane.session)
+            .is_none_or(|snap| tmux::is_shell(&snap.cmd));
+        if !idle {
+            log::info!("automation {id}: pane busy, skipping this run");
+            return;
+        }
+        let mut bytes =
+            format!("mux automations exec {id} --trigger {trigger}")
+                .into_bytes();
+        bytes.push(b'\r');
+        if let Some(pane) = self.tabs[tab_index].panes.get_mut(&pane_id) {
+            pane.backend.process_command(BackendCommand::Write(bytes));
+            self.automation_fired.insert(id.to_string(), Instant::now());
+        }
+    }
+
+    fn automation_running(&self, id: &str) -> bool {
+        self.automation_runs
+            .get(id)
+            .and_then(|(_, runs)| runs.first())
+            .is_some_and(|r| r.is_running())
+    }
+
+    /// Find the automation's dedicated tab, making one if it has none.
+    ///
+    /// Lazy and self-healing on purpose: cmd+w on an automation's tab is a
+    /// perfectly reasonable thing to do, and should cost nothing more than a
+    /// fresh tab at the next run.
+    fn ensure_automation_tab(
+        &mut self,
+        ctx: &egui::Context,
+        id: &str,
+    ) -> Option<usize> {
+        if let Some(i) = self.automation_tab_index(id) {
+            return Some(i);
+        }
+        let a = self.automations.iter().find(|a| a.id == id)?;
+        let name = a.name.clone();
+        let root = a.root.clone();
+        let start_dir = root
+            .as_ref()
+            .filter(|r| r.is_dir())
+            .map(|r| r.display().to_string());
+        let pane = match self.create_pane(ctx, None, start_dir) {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("automation {id}: could not open its tab: {e:#}");
+                return None;
+            },
+        };
+        let pane_id = pane.id;
+        let mut workspace = Workspace::bare(root);
+        workspace.title = name;
+        workspace.automation = Some(id.to_string());
+        let mut panes = HashMap::new();
+        panes.insert(pane_id, pane);
+        // Lands in the background: a scheduled run must never yank the user
+        // out of what they were doing (same rule as `apply_newtab_request`).
+        self.tabs.push(Tab {
+            tab_id: mesh::new_tab_id(),
+            tree: Node::Leaf(pane_id),
+            panes,
+            focused: pane_id,
+            last_rects: HashMap::new(),
+            last_term_rects: HashMap::new(),
+            workspace,
+        });
+        self.dirty = true;
+        Some(self.tabs.len() - 1)
+    }
+
+    /// Refresh the cached run history, and settle any record left saying
+    /// "running" by a run whose process is gone (ctrl+c, a killed pane, a
+    /// crash). Keyed on the run directory's mtime, which a record write
+    /// bumps, so a quiet automation costs one `stat` per tick.
+    fn refresh_automation_runs(&mut self) {
+        let ids: Vec<String> =
+            self.automations.iter().map(|a| a.id.clone()).collect();
+        self.automation_runs.retain(|id, _| ids.contains(id));
+        for id in ids {
+            let mtime = automation::runs_mtime(&id);
+            let stale = self
+                .automation_runs
+                .get(&id)
+                .is_none_or(|(seen, _)| *seen != mtime);
+            if stale {
+                self.automation_runs
+                    .insert(id.clone(), (mtime, automation::read_runs(&id)));
+            }
+            self.settle_stale_run(&id);
+        }
+    }
+
+    /// A record still saying "running" whose pane is back at a shell means
+    /// the process died without finishing. Only after `STALE_AFTER`, so the
+    /// gap between typing the command and the shell picking it up is not
+    /// mistaken for a dead run.
+    fn settle_stale_run(&mut self, id: &str) {
+        let Some((_, runs)) = self.automation_runs.get(id) else {
+            return;
+        };
+        let Some(run) = runs.first().filter(|r| r.is_running()) else {
+            return;
+        };
+        if mesh::now().saturating_sub(run.started_at) < automation::STALE_AFTER
+        {
+            return;
+        }
+        let busy = self
+            .automation_tab_index(id)
+            .map(|i| &self.tabs[i])
+            .and_then(|t| t.panes.get(&t.tree.first_leaf()))
+            .and_then(|p| self.pane_snap.get(&p.session))
+            .is_some_and(|snap| !tmux::is_shell(&snap.cmd));
+        if busy {
+            return;
+        }
+        let mut settled = run.clone();
+        settled.status = automation::INTERRUPTED.to_string();
+        settled.finished_at = Some(mesh::now());
+        let _ = automation::write_run(id, &settled);
+        // Force a re-read next tick rather than patching the cache by hand.
+        self.automation_runs.remove(id);
+    }
+
+    /// The sidebar's automation rows, built from the live list plus the
+    /// cached run history.
+    fn automation_rows(&self) -> Vec<sidebar::AutomationRow> {
+        let now = mesh::now();
+        self.automations
+            .iter()
+            .enumerate()
+            .map(|(index, a)| {
+                let last = self
+                    .automation_runs
+                    .get(&a.id)
+                    .and_then(|(_, runs)| runs.first());
+                let running = last.is_some_and(|r| r.is_running());
+                sidebar::AutomationRow {
+                    index,
+                    name: a.name.clone(),
+                    subtitle: self.automation_subtitle(a, last, now),
+                    status: automation_view::status_of(last),
+                    enabled: a.enabled,
+                    running,
+                }
+            })
+            .collect()
+    }
+
+    /// `<schedule> · <last run>` - or, when the schedule cannot be honoured,
+    /// the reason instead. A row that will never fire has to say so; silence
+    /// would read as "waiting".
+    fn automation_subtitle(
+        &self,
+        a: &automation::Automation,
+        last: Option<&automation::Run>,
+        now: u64,
+    ) -> String {
+        if let Err(e) = a.parsed() {
+            return e;
+        }
+        if !a.enabled {
+            return format!("{} · disabled", a.schedule);
+        }
+        if !self.automations_on {
+            return format!("{} · automations are off", a.schedule);
+        }
+        let when = match self.automation_due.get(&a.id) {
+            Some(at) => automation::relative(*at, now),
+            None => "never again".to_string(),
+        };
+        match last {
+            Some(r) if r.is_running() => {
+                format!("{} · running", a.schedule)
+            },
+            Some(r) => format!(
+                "{} · {} {}",
+                a.schedule,
+                r.status,
+                automation::relative(r.started_at, now)
+            ),
+            None => format!("{} · next {when}", a.schedule),
+        }
+    }
+
+    /// Open the run-history overlay for one automation.
+    fn preview_automation(&mut self, index: usize) {
+        let Some(a) = self.automations.get(index) else {
+            return;
+        };
+        self.automation_preview = Some(automation_view::Preview {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            schedule: a.schedule.clone(),
+            next: self.next_label(a),
+            enabled: a.enabled,
+            runs: automation::read_runs(&a.id),
+            selected: None,
+            lines: None,
+        });
+        self.refresh_preview_log();
+    }
+
+    fn next_label(&self, a: &automation::Automation) -> String {
+        match a.parsed() {
+            Err(e) => e,
+            Ok(_) if !a.enabled => "disabled".to_string(),
+            Ok(_) if !self.automations_on => {
+                "automations are off".to_string()
+            },
+            Ok(_) => match self.automation_due.get(&a.id) {
+                Some(at) => automation::stamp(*at),
+                None => "never".to_string(),
+            },
+        }
+    }
+
+    /// Reload the overlay's selected run log. Cheap and idempotent, so the
+    /// tick can call it and a run finishing under the overlay updates it.
+    fn refresh_preview_log(&mut self) {
+        let Some(p) = self.automation_preview.as_mut() else {
+            return;
+        };
+        let run = p.current().map(|r| r.id.clone());
+        p.lines = run
+            .and_then(|run| automation::read_log(&p.id, &run))
+            .map(|text| text.lines().map(str::to_string).collect());
+    }
+
+    /// Keep the open overlay in step with the run history behind it.
+    fn refresh_automation_preview(&mut self) {
+        let Some(p) = self.automation_preview.as_ref() else {
+            return;
+        };
+        let id = p.id.clone();
+        let Some((_, runs)) = self.automation_runs.get(&id) else {
+            return;
+        };
+        if runs == &p.runs {
+            return;
+        }
+        let runs = runs.clone();
+        if let Some(p) = self.automation_preview.as_mut() {
+            p.runs = runs;
+        }
+        self.refresh_preview_log();
+    }
+
     /// The single close path. `kill` distinguishes an explicit close (cmd+w:
     /// kill the tmux session) from a reactive one (the shell exited, so the
     /// session is already gone). App quit goes through neither - backends
@@ -2424,6 +2931,12 @@ impl App {
             workspaces_collapsed: self.workspaces_collapsed,
             projects: self.projects.iter().map(|p| p.to_state()).collect(),
             templates: self.templates.iter().map(|t| t.to_state()).collect(),
+            automations: self
+                .automations
+                .iter()
+                .map(|a| a.to_state())
+                .collect(),
+            automations_collapsed: self.automations_collapsed,
             windows: vec![WindowState {
                 active_tab: self.active,
                 tabs: self
@@ -2494,6 +3007,12 @@ impl App {
         self.monitor_prs = style.monitor_prs;
         self.pr_monitor_enabled
             .store(style.monitor_prs, Ordering::Relaxed);
+        // Turning automations back on schedules forward from now, so a
+        // stretch spent switched off never owes a burst of catch-up runs.
+        if style.automations != self.automations_on {
+            self.automations_on = style.automations;
+            self.reschedule_automations();
+        }
         // The drag-end side of copy-on-select and the cmd+f search
         // highlight are tmux settings; rewrite the conf and re-source it
         // into the running server whenever its content actually changed
@@ -3427,6 +3946,60 @@ impl App {
         }
     }
 
+    /// The automation run-history overlay.
+    fn show_automation_preview(&mut self, ctx: &egui::Context) {
+        let Some(preview) = self.automation_preview.as_ref() else {
+            return;
+        };
+        let outcome =
+            automation_view::show(ctx, preview, &self.font, &self.ui_theme);
+        let id = preview.id.clone();
+        match outcome {
+            automation_view::Outcome::None => {},
+            automation_view::Outcome::Close => self.automation_preview = None,
+            automation_view::Outcome::Select(run) => {
+                if let Some(p) = self.automation_preview.as_mut() {
+                    p.selected = Some(run);
+                }
+                self.refresh_preview_log();
+            },
+            automation_view::Outcome::RunNow => {
+                self.run_automation(ctx, &id);
+            },
+            automation_view::Outcome::OpenTab => {
+                // The tab is the live view; the overlay is the archive. Make
+                // the tab if this automation has never run.
+                self.automation_preview = None;
+                if let Some(i) = self.ensure_automation_tab(ctx, &id) {
+                    self.active = i;
+                    self.dirty = true;
+                }
+            },
+            automation_view::Outcome::ToggleEnabled => {
+                let mut now_on = false;
+                if let Some(a) =
+                    self.automations.iter_mut().find(|a| a.id == id)
+                {
+                    a.enabled = !a.enabled;
+                    now_on = a.enabled;
+                }
+                if let Some(p) = self.automation_preview.as_mut() {
+                    p.enabled = now_on;
+                }
+                self.reschedule_automations();
+                if let Some(a) =
+                    self.automations.iter().find(|a| a.id == id).cloned()
+                {
+                    let label = self.next_label(&a);
+                    if let Some(p) = self.automation_preview.as_mut() {
+                        p.next = label;
+                    }
+                }
+                self.dirty = true;
+            },
+        }
+    }
+
     /// Read a PR without checking it out. An overlay, not a pane: every pane
     /// is a tmux session that outlives the app, and a glance should not leave
     /// one behind. The text arrives off-thread.
@@ -3482,11 +4055,14 @@ impl App {
             self.pr_detector,
             self.notifications,
             self.monitor_prs,
+            self.automations_on,
             &mut self.settings_tab,
             &self.projects,
             &mut self.project_draft,
             &self.templates,
             &mut self.template_draft,
+            &self.automations,
+            &mut self.automation_draft,
         );
         if let Some(p) = out.add_project {
             // Upsert by name: `[ add ]` with a saved project's name is the
@@ -3516,6 +4092,30 @@ impl App {
                 self.templates.remove(i);
                 self.dirty = true;
             }
+        }
+        if let Some(mut a) = out.add_automation {
+            // Upsert by name, same edit path as projects/templates - but
+            // carry the saved id across, so editing an automation keeps its
+            // run history and its tab instead of orphaning both.
+            match self.automations.iter_mut().find(|q| q.name == a.name) {
+                Some(q) => {
+                    a.id = q.id.clone();
+                    a.created_at = q.created_at;
+                    *q = a;
+                },
+                None => self.automations.push(a),
+            }
+            self.reschedule_automations();
+            self.dirty = true;
+        }
+        if let Some(i) = out.remove_automation {
+            if let Some(id) = self.automations.get(i).map(|a| a.id.clone()) {
+                self.remove_automation(ctx, &id);
+            }
+        }
+        if let Some(on) = out.automations {
+            config::set_automations(on);
+            self.reload_config(ctx);
         }
         if let Some(name) = out.theme {
             config::set_theme(name);
@@ -3585,6 +4185,7 @@ impl eframe::App for App {
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
             self.drain_newtab_requests(ctx);
+            self.drain_automation_requests(ctx);
             let new_snap = self.tmux.pane_snapshot();
             // A pane changed directory since the last tick: mark state dirty
             // so the saved layout's per-leaf cwd (reboot recovery) tracks it.
@@ -3658,6 +4259,11 @@ impl eframe::App for App {
                 bg_jobs::spawn_scan(roots, self.bg_tx.clone(), ctx.clone());
             }
             self.sync_workspace_roots();
+            // Run history first: the scheduler reads it to know whether a
+            // run is already in flight, and the overlay follows it.
+            self.refresh_automation_runs();
+            self.tick_automations(ctx);
+            self.refresh_automation_preview();
         }
 
         if log::log_enabled!(log::Level::Debug) {
@@ -3966,6 +4572,15 @@ impl eframe::App for App {
                     }),
                 })
                 .collect();
+            // The section is present whenever the extra is on - empty
+            // included, so its "+" is there to make the first one with. Off
+            // reads as "the feature isn't here" rather than "it's broken",
+            // the way the PR section vanishes with its own extra.
+            let automations: Vec<sidebar::AutomationRow> =
+                match self.automations_on {
+                    true => self.automation_rows(),
+                    false => Vec::new(),
+                };
             for action in sidebar::show(
                 ctx,
                 &rows,
@@ -3973,6 +4588,8 @@ impl eframe::App for App {
                 &prs,
                 self.pr_list.note.as_deref(),
                 self.prs_collapsed,
+                self.automations_on.then_some(automations.as_slice()),
+                self.automations_collapsed,
                 self.archived_collapsed,
                 &self.font,
                 &self.ui_theme,
@@ -4030,6 +4647,25 @@ impl eframe::App for App {
                             self.preview_pr(ctx, item);
                         }
                     },
+                    SidebarAction::ToggleAutomations => {
+                        self.automations_collapsed =
+                            !self.automations_collapsed;
+                        self.dirty = true;
+                    },
+                    SidebarAction::PreviewAutomation(i) => {
+                        self.preview_automation(i)
+                    },
+                    SidebarAction::RunAutomation(i) => {
+                        if let Some(id) =
+                            self.automations.get(i).map(|a| a.id.clone())
+                        {
+                            self.run_automation(ctx, &id);
+                        }
+                    },
+                    SidebarAction::NewAutomation => {
+                        self.settings_tab = settings::Tab::Automations;
+                        self.settings_open = true;
+                    },
                     SidebarAction::NewWorkspace => {
                         actions.push(Action::NewWorkspace)
                     },
@@ -4080,6 +4716,7 @@ impl eframe::App for App {
                     let focused = if archived
                         || self.settings_open
                         || self.pr_preview.is_some()
+                        || self.automation_preview.is_some()
                         || self.new_workspace.is_some()
                         || !self.confirm_worktree.is_empty()
                         || self.search.active()
@@ -4212,6 +4849,9 @@ impl eframe::App for App {
 
         if self.pr_preview.is_some() {
             self.show_pr_preview(ctx);
+        }
+        if self.automation_preview.is_some() {
+            self.show_automation_preview(ctx);
         }
         if self.settings_open {
             self.show_settings(ctx);
@@ -5059,6 +5699,60 @@ fn running_command(
     agent_state.is_none() && snap.is_some_and(|s| !tmux::is_shell(&s.cmd))
 }
 
+/// Apply a spooled automation request's fields to an automation. Absent
+/// means "leave it alone", which is what lets `mux automations edit` change
+/// one thing; an empty `--prompt`/`--command`/`--folder` clears the field, so
+/// there is still a way to unset one. Setting a payload clears the other:
+/// an automation runs an agent *or* a command, never both.
+fn apply_automation_fields(
+    a: &mut automation::Automation,
+    req: &mesh::AutomationRequest,
+) {
+    if let Some(name) = req.name.clone().filter(|n| !n.trim().is_empty()) {
+        a.name = name;
+    }
+    if let Some(s) = &req.schedule {
+        if automation::parse(s).is_ok() {
+            a.schedule = s.clone();
+        }
+    }
+    if let Some(root) = &req.root {
+        a.root = (!root.trim().is_empty()).then(|| PathBuf::from(root));
+    }
+    if let Some(id) = &req.agent {
+        a.agent = agent::by_id(id).map(|x| x.id);
+        if a.agent.is_some() {
+            a.command = None;
+        }
+    }
+    if let Some(m) = &req.model {
+        a.model = (!m.is_empty()).then(|| m.clone());
+    }
+    if let Some(p) = &req.prompt {
+        a.prompt = p.clone();
+    }
+    if let Some(c) = &req.command {
+        a.command = (!c.trim().is_empty()).then(|| c.clone());
+        if a.command.is_some() {
+            a.agent = None;
+        }
+    }
+}
+
+/// Does this workspace belong in the tab bar and the cmd+1..9 / next-prev
+/// flow? Archived ones do not (they are parked), and neither do automation
+/// log tabs - one tab per scheduled task would crowd out the tabs the user
+/// actually opened, and they have their own sidebar section to be reached
+/// from.
+///
+/// The two exclusions are *not* interchangeable. Archiving also makes a tab
+/// a read-only peek (the `is_archived` guards on typing, dragging and
+/// terminal focus); an automation's tab must stay fully interactive, since
+/// looking at a run usually means wanting to poke at it.
+fn in_tab_flow(ws: &Workspace) -> bool {
+    !ws.is_archived() && !ws.is_automation()
+}
+
 fn nearest_visible(visible: &[usize], removed: usize) -> Option<usize> {
     visible
         .iter()
@@ -5332,6 +6026,33 @@ mod tests {
         assert_eq!(step_visible_target(&visible, 1, -1), Some(3));
         // Nothing visible.
         assert_eq!(step_visible_target(&[], 0, 1), None);
+    }
+
+    /// Automation log tabs stay out of the tab bar and the cmd+1..9 flow, the
+    /// way archived ones do - but they must NOT be archived to achieve it,
+    /// because `is_archived` is also what makes a tab a read-only peek, and
+    /// an automation's tab has to stay typeable.
+    #[test]
+    fn automation_tabs_leave_the_tab_flow_without_going_read_only() {
+        let plain = Workspace::bare(None);
+        assert!(in_tab_flow(&plain));
+
+        let mut archived = Workspace::bare(None);
+        archived.archived_at = Some(1);
+        assert!(!in_tab_flow(&archived));
+
+        let mut auto = Workspace::bare(None);
+        auto.automation = Some("auto-12345678".into());
+        assert!(!in_tab_flow(&auto));
+        // The read-only guards key off this, and it must stay false.
+        assert!(!auto.is_archived());
+        assert!(auto.is_automation());
+
+        // And the peek logic still lands somewhere sane when the active tab
+        // is one of the hidden ones (tab 1 here).
+        let visible = [0, 2];
+        assert_eq!(step_visible_target(&visible, 1, 1), Some(0));
+        assert_eq!(step_visible_target(&visible, 1, -1), Some(2));
     }
 
     #[test]

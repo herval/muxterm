@@ -44,6 +44,14 @@ pub enum SidebarAction {
     PreviewPr(usize),
     /// Open the creation popup (the header "+").
     NewWorkspace,
+    /// Collapse/expand the automations section (its header click).
+    ToggleAutomations,
+    /// Open this automation's run history (an automation row's body click).
+    PreviewAutomation(usize),
+    /// Run this automation now (an automation row's ▶ button).
+    RunAutomation(usize),
+    /// Open Settings on the automations tab (the section header's "+").
+    NewAutomation,
     /// Collapse the sidebar (the header "‹").
     ToggleSidebar,
 }
@@ -100,6 +108,24 @@ pub struct PrRow {
     pub checked_out: Option<usize>,
 }
 
+/// One saved automation. Like `PrRow` this is indexed by position in the
+/// caller's list, not by tab: an automation's tab is made lazily and may not
+/// exist yet.
+pub struct AutomationRow {
+    pub index: usize,
+    pub name: String,
+    /// `<schedule> · <last run>` or the reason it will never fire.
+    pub subtitle: String,
+    /// Drives the leading icon: `Working` while a run is in flight, `Blocked`
+    /// when the last one failed, `Idle` otherwise.
+    pub status: Status,
+    /// A disabled automation dims and loses its ▶.
+    pub enabled: bool,
+    /// A run is in flight: the row is inert, as `PrRow.busy` is.
+    pub running: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &egui::Context,
     rows: &[Row],
@@ -107,6 +133,8 @@ pub fn show(
     prs: &[PrRow],
     pr_note: Option<&str>,
     prs_collapsed: bool,
+    automations: Option<&[AutomationRow]>,
+    automations_collapsed: bool,
     archived_collapsed: bool,
     font: &FontId,
     t: &UiTheme,
@@ -215,6 +243,47 @@ pub fn show(
                         for pr in prs {
                             if let Some(a) = pr_row(ui, pr, font, t) {
                                 actions.push(a);
+                            }
+                        }
+                    }
+                }
+                // Automations, under the PRs: also not-quite-workspaces, but
+                // ones that already exist and run on their own.
+                // Present whenever the feature is on, empty included: the
+                // section *is* how you find automations, so hiding it until
+                // one exists hides its own "+". Off (None) removes it
+                // entirely, the way the PR section vanishes with its extra.
+                if let Some(autos) = automations {
+                    ui.add_space(12.0);
+                    let head = section_header_with_add(
+                        ui,
+                        "Automations",
+                        autos.len(),
+                        automations_collapsed,
+                        &head_font,
+                        t,
+                    );
+                    if head.toggled {
+                        actions.push(SidebarAction::ToggleAutomations);
+                    }
+                    if head.add {
+                        actions.push(SidebarAction::NewAutomation);
+                    }
+                    if !automations_collapsed {
+                        ui.add_space(4.0);
+                        // An on-but-empty section says what it is for,
+                        // rather than sitting there as a bare header.
+                        if autos.is_empty() {
+                            note_row(
+                                ui,
+                                "none yet - + adds one",
+                                &head_font,
+                                t,
+                            );
+                        }
+                        for a in autos {
+                            if let Some(act) = automation_row(ui, a, font, t) {
+                                actions.push(act);
                             }
                         }
                     }
@@ -518,6 +587,153 @@ fn pr_row(
     None
 }
 
+/// One saved automation. The body click opens its run history; the ▶ beside
+/// it fires a run now - the same body-reads / icon-acts split the PR rows
+/// use. A row stays clickable while running: mid-run is exactly when you
+/// want to look at it.
+fn automation_row(
+    ui: &mut egui::Ui,
+    row: &AutomationRow,
+    font: &FontId,
+    t: &UiTheme,
+) -> Option<SidebarAction> {
+    let pad = Vec2::new(8.0, 5.0);
+    let status_w = font.size * 1.1;
+    let wrap =
+        (ui.available_width() - pad.x * 2.0 - status_w - ICON_W).max(1.0);
+    // Same battery contract as `workspace_row`: breathe only while focused,
+    // and only at PULSE_FRAME.
+    let animate = row.status == Status::Working && ui.input(|i| i.focused);
+    if animate {
+        ui.ctx().request_repaint_after(PULSE_FRAME);
+    }
+
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap;
+    job.append(
+        &row.name,
+        0.0,
+        TextFormat {
+            font_id: font.clone(),
+            color: if row.enabled { t.text } else { t.text_dim },
+            ..Default::default()
+        },
+    );
+    job.append(
+        &format!("\n  {}", row.subtitle),
+        0.0,
+        TextFormat {
+            font_id: FontId::new(font.size * 0.8, font.family.clone()),
+            color: t.text_dim,
+            ..Default::default()
+        },
+    );
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let row_h = galley.size().y + pad.y * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), row_h),
+        egui::Sense::click(),
+    );
+    let resp = resp
+        .on_hover_text("click to see its runs")
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    // Registered after the body so it wins the click.
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.max.x - pad.x - ICON_W / 2.0, rect.center().y),
+        Vec2::splat(ICON_W),
+    );
+    let icon_resp = (row.enabled && !row.running).then(|| {
+        ui.interact(
+            icon_rect,
+            ui.id().with(("automation_run", row.index)),
+            egui::Sense::click(),
+        )
+        .on_hover_text("run it now")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
+
+    let hovered =
+        resp.hovered() || icon_resp.as_ref().is_some_and(|r| r.hovered());
+    if hovered {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(4),
+            theme::blend(t.bg, t.accent, 0.06),
+        );
+    }
+    status_icon(
+        ui.painter(),
+        Pos2::new(
+            rect.min.x + pad.x + status_w * 0.38,
+            rect.min.y + pad.y + ui.fonts(|f| f.row_height(font)) * 0.52,
+        ),
+        font.size,
+        row.status,
+        t,
+        animate.then(|| ui.input(|i| i.time)),
+    );
+    ui.painter().galley(
+        Pos2::new(rect.min.x + pad.x + status_w, rect.min.y + pad.y),
+        galley,
+        t.text,
+    );
+    if hovered {
+        if let Some(r) = &icon_resp {
+            ui.painter().text(
+                icon_rect.center(),
+                Align2::CENTER_CENTER,
+                "▶",
+                FontId::new(font.size * 0.8, font.family.clone()),
+                if r.hovered() { t.text } else { t.text_dim },
+            );
+        }
+    }
+
+    automation_action(
+        icon_resp.is_some_and(|r| r.clicked()),
+        resp.clicked(),
+        row,
+    )
+}
+
+/// Map an automation row's clicks into the action they mean. Pure, like
+/// `row_action`, so the split that matters - the body only ever *reads*, the
+/// ▶ is the only thing that starts work - is testable without an egui pass.
+///
+/// It has to be pure, because this icon is *overlaid*: an `interact` rect
+/// painted on top of an already-registered full-width body loses a
+/// synthesized same-frame click to that body, so every x across the row
+/// resolves to the body in a headless render pass. The PR row's ↓ has the
+/// same property, which is why its test only asserts the body half. Note the
+/// distinction - a click target that *allocates* its own region instead of
+/// overlaying one stays reachable (the panel header's "+", which
+/// `HEAD_BUTTONS_W` holds a band back for, is render-tested). Allocating
+/// would buy coverage here too; it is not done because these rows
+/// deliberately mirror `pr_row`'s shape, and the pure fn covers the split.
+fn automation_action(
+    icon_clicked: bool,
+    body_clicked: bool,
+    row: &AutomationRow,
+) -> Option<SidebarAction> {
+    // The icon overlaps the body and is registered after it, so it wins.
+    if icon_clicked && row.enabled && !row.running {
+        return Some(SidebarAction::RunAutomation(row.index));
+    }
+    if body_clicked {
+        return Some(SidebarAction::PreviewAutomation(row.index));
+    }
+    None
+}
+
+/// What a section header reported this frame.
+struct HeadResponse {
+    /// The header itself was clicked: fold/unfold the section.
+    toggled: bool,
+    /// The trailing "+" was clicked.
+    add: bool,
+}
+
 fn section_header(
     ui: &mut egui::Ui,
     name: &str,
@@ -526,12 +742,62 @@ fn section_header(
     font: &FontId,
     t: &UiTheme,
 ) -> bool {
+    head_row(ui, name, count, collapsed, font, t, false).toggled
+}
+
+/// A section header carrying a trailing "+", for a section whose items the
+/// user creates (automations) rather than discovers (PRs).
+fn section_header_with_add(
+    ui: &mut egui::Ui,
+    name: &str,
+    count: usize,
+    collapsed: bool,
+    font: &FontId,
+    t: &UiTheme,
+) -> HeadResponse {
+    head_row(ui, name, count, collapsed, font, t, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn head_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    count: usize,
+    collapsed: bool,
+    font: &FontId,
+    t: &UiTheme,
+    with_add: bool,
+) -> HeadResponse {
     let row_h = ui.fonts(|f| f.row_height(font));
     let (rect, resp) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), row_h),
         egui::Sense::click(),
     );
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    // Registered after the header body so it wins the click, like the rows'
+    // trailing icons.
+    let add_rect = Rect::from_center_size(
+        Pos2::new(rect.max.x - ICON_W / 2.0, rect.center().y),
+        Vec2::splat(ICON_W),
+    );
+    let add_resp = with_add.then(|| {
+        ui.interact(
+            add_rect,
+            ui.id().with(("section_add", name)),
+            egui::Sense::click(),
+        )
+        .on_hover_text("New automation")
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
+    if let Some(r) = &add_resp {
+        ui.painter().text(
+            add_rect.center(),
+            Align2::CENTER_CENTER,
+            "+",
+            font.clone(),
+            if r.hovered() { t.text } else { t.text_dim },
+        );
+    }
     let color = if resp.hovered() { t.text } else { t.text_dim };
 
     let r = font.size * 0.26;
@@ -564,7 +830,10 @@ fn section_header(
         font.clone(),
         color,
     );
-    resp.clicked()
+    HeadResponse {
+        toggled: resp.clicked(),
+        add: add_resp.is_some_and(|r| r.clicked()),
+    }
 }
 
 fn icon_button(ui: &mut egui::Ui, glyph: &str, t: &UiTheme) -> egui::Response {
@@ -855,7 +1124,7 @@ mod tests {
             ..Default::default()
         };
         let mut frame = |ctx: &egui::Context| {
-            let _ = show(ctx, &rows, false, &[], None, false, false, &font, &th);
+            let _ = show(ctx, &rows, false, &[], None, false, None, false, false, &font, &th);
         };
         let _ = ctx.run(input.clone(), &mut frame);
         let output = ctx.run(input, &mut frame);
@@ -939,7 +1208,7 @@ mod tests {
         };
         let texts = |collapsed: bool| {
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, false, &[], None, false, collapsed, &font, &th);
+                let _ = show(ctx, &rows, false, &[], None, false, None, false, collapsed, &font, &th);
             };
             let _ = ctx.run(input.clone(), &mut frame);
             let output = ctx.run(input.clone(), &mut frame);
@@ -1022,7 +1291,8 @@ mod tests {
         let texts = |collapsed: bool| {
             let mut frame = |ctx: &egui::Context| {
                 let _ = show(
-                    ctx, &rows, collapsed, &[], None, false, false, &font, &th,
+                    ctx, &rows, collapsed, &[], None, false, None, false, false,
+                    &font, &th,
                 );
             };
             let _ = ctx.run(input.clone(), &mut frame);
@@ -1107,7 +1377,8 @@ mod tests {
             let mut got = Vec::new();
             let mut frame = |ctx: &egui::Context| {
                 got = show(
-                    ctx, &rows, false, &[], None, false, false, &font, &th,
+                    ctx, &rows, false, &[], None, false, None, false, false,
+                    &font, &th,
                 );
             };
             let warm = egui::RawInput {
@@ -1141,7 +1412,6 @@ mod tests {
         );
     }
 
-
     /// The breathing pulse (working and background alike) schedules its own
     /// repaints, but throttled (at PULSE_FRAME, never every frame) and only
     /// while the window is focused. Guards the battery contract: agents work
@@ -1165,7 +1435,7 @@ mod tests {
                 delete_armed: false,
             }];
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, false, &[], None, false, false, &font, &th);
+                let _ = show(ctx, &rows, false, &[], None, false, None, false, false, &font, &th);
             };
             let input = |focused: bool| egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -1244,7 +1514,7 @@ mod tests {
         };
         let painted = |collapsed: bool, note: Option<&str>, prs: &[PrRow]| {
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &[], false, prs, note, collapsed, false, &font, &th);
+                let _ = show(ctx, &[], false, prs, note, collapsed, None, false, false, &font, &th);
             };
             let _ = ctx.run(input.clone(), &mut frame);
             let output = ctx.run(input.clone(), &mut frame);
@@ -1289,6 +1559,192 @@ mod tests {
         );
     }
 
+    fn automation(index: usize, name: &str, running: bool) -> AutomationRow {
+        AutomationRow {
+            index,
+            name: name.to_string(),
+            subtitle: "every 30m · ok 2m ago".into(),
+            status: if running { Status::Working } else { Status::Idle },
+            enabled: true,
+            running,
+        }
+    }
+
+    /// The automations section paints its header, rows and fold count, and
+    /// folds away cleanly - without eating the sections either side of it.
+    #[test]
+    fn automation_section_folds_behind_its_header() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let autos = vec![automation(0, "nightly", false)];
+        let rows = vec![Row {
+            tab_index: 0,
+            title: "live-ws".into(),
+            subtitle: None,
+            active: true,
+            status: Status::Idle,
+            archived: false,
+            delete_armed: false,
+        }];
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let painted = |collapsed: bool| {
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(
+                    ctx, &rows, false, &[], None, false, Some(&autos), collapsed,
+                    false, &font, &th,
+                );
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let output = ctx.run(input.clone(), &mut frame);
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let open = painted(false);
+        assert!(
+            open.iter().any(|t| t.contains("Automations")),
+            "header missing: {open:?}",
+        );
+        assert!(
+            open.iter().any(|t| t.contains("nightly")),
+            "the automation row should paint when open: {open:?}",
+        );
+        assert!(
+            open.iter().any(|t| t.contains("every 30m")),
+            "the schedule subtitle should paint: {open:?}",
+        );
+        // The workspace list above it is untouched by this section.
+        assert!(
+            open.iter().any(|t| t.contains("live-ws")),
+            "the automations section ate the workspace rows: {open:?}",
+        );
+
+        let folded = painted(true);
+        assert!(
+            folded.iter().any(|t| t.contains("Automations (1)")),
+            "a folded header carries the count: {folded:?}",
+        );
+        assert!(
+            !folded.iter().any(|t| t.contains("nightly")),
+            "the row must be hidden when folded: {folded:?}",
+        );
+    }
+
+    /// The section is how automations are *found*, so it must be on screen
+    /// whenever the feature is on - including before the first one exists,
+    /// or its own "+" would be unreachable. Switched off it vanishes whole.
+    #[test]
+    fn the_automations_section_appears_with_the_feature_not_the_data() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let painted = |autos: Option<&[AutomationRow]>| {
+            let mut frame = |ctx: &egui::Context| {
+                let _ = show(
+                    ctx, &[], false, &[], None, false, autos, false, false,
+                    &font, &th,
+                );
+            };
+            let _ = ctx.run(input.clone(), &mut frame);
+            let output = ctx.run(input.clone(), &mut frame);
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // On with nothing saved: header + the hint that says what to do.
+        let empty = painted(Some(&[]));
+        assert!(
+            empty.iter().any(|t| t.contains("Automations")),
+            "an empty-but-on section still needs its header: {empty:?}",
+        );
+        assert!(
+            empty.iter().any(|t| t.contains("none yet")),
+            "an empty section should say so, not sit blank: {empty:?}",
+        );
+
+        // Off: gone entirely, header and all.
+        let off = painted(None);
+        assert!(
+            !off.iter().any(|t| t.contains("Automations")),
+            "the section must vanish with the feature off: {off:?}",
+        );
+        assert!(
+            !off.iter().any(|t| t.contains("none yet")),
+            "no empty-state hint when the feature is off: {off:?}",
+        );
+    }
+
+    /// The body opens the run history, the ▶ runs it - the same
+    /// body-reads/icon-acts split the PR rows use, so a click meaning "how
+    /// did it go?" can never start a run. Pure over the two click flags,
+    /// because the overlapping icon rect is not reachable from a headless
+    /// render pass (see `automation_action`).
+    #[test]
+    fn automation_body_previews_and_the_button_runs() {
+        let idle = automation(3, "nightly", false);
+        assert!(matches!(
+            automation_action(false, true, &idle),
+            Some(SidebarAction::PreviewAutomation(3))
+        ));
+        assert!(matches!(
+            automation_action(true, true, &idle),
+            Some(SidebarAction::RunAutomation(3))
+        ));
+        assert!(automation_action(false, false, &idle).is_none());
+
+        // A run already in flight: the ▶ is not drawn, and even if the click
+        // arrived it must not stack a second run on the first.
+        let busy = automation(3, "nightly", true);
+        assert!(matches!(
+            automation_action(true, false, &busy),
+            None
+        ));
+        // ...but its history is still readable mid-run, which is when you
+        // most want it.
+        assert!(matches!(
+            automation_action(false, true, &busy),
+            Some(SidebarAction::PreviewAutomation(3))
+        ));
+
+        // A disabled automation cannot be started from its row either.
+        let off = AutomationRow { enabled: false, ..automation(3, "n", false) };
+        assert!(automation_action(true, false, &off).is_none());
+    }
+
     /// The body reads, the button checks out. Two different jobs on one row,
     /// so the click that means "have a look" can't cost a worktree.
     #[test]
@@ -1326,7 +1782,7 @@ mod tests {
             };
             let mut got = Vec::new();
             let mut frame = |ctx: &egui::Context| {
-                got = show(ctx, &[], false, &prs, None, false, false, &font, &th);
+                got = show(ctx, &[], false, &prs, None, false, None, false, false, &font, &th);
             };
             // Two passes: egui needs a layout pass before a hit lands.
             let warm = egui::RawInput {
@@ -1402,7 +1858,7 @@ mod tests {
             let rows = vec![archived_row(armed)];
             let mut fired = false;
             let mut frame = |ctx: &egui::Context| {
-                for a in show(ctx, &rows, false, &[], None, false, false, &font, &th) {
+                for a in show(ctx, &rows, false, &[], None, false, None, false, false, &font, &th) {
                     if matches!(a, SidebarAction::DisarmDelete) {
                         fired = true;
                     }
@@ -1436,7 +1892,7 @@ mod tests {
         let icon_shapes = |armed: bool| {
             let rows = vec![archived_row(armed)];
             let mut frame = |ctx: &egui::Context| {
-                let _ = show(ctx, &rows, false, &[], None, false, false, &font, &th);
+                let _ = show(ctx, &rows, false, &[], None, false, None, false, false, &font, &th);
             };
             // Settle the layout, then find the row title's on-screen spot
             // so the hover lands on the body regardless of exact geometry.

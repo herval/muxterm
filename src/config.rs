@@ -67,6 +67,11 @@ copy_on_select = false
 # worktree by clicking it. Off by default; needs gh, authenticated.
 # monitor_prs = false
 
+# Run scheduled tasks ("automations", Settings > Automations) - each in its
+# own tab, which keeps its logs. Off by default: a scheduled agent run is
+# unattended, so it auto-approves its own tool calls.
+# automations = false
+
 # Show the pane's git branch beside the tab title with dirty/ahead-behind
 # markers (● branch *changed ↑ahead ↓behind). Local git only, no network.
 # git_status = true
@@ -144,6 +149,9 @@ pub struct ConfigFile {
     pub copy_on_select: bool,
     /// List the user's own open GitHub PRs in the sidebar (needs gh).
     pub monitor_prs: bool,
+    /// Fire saved automations on their schedules, and show the sidebar's
+    /// automations section. Off means the saved list is inert.
+    pub automations: bool,
     /// Badge each pane's git branch + dirty/ahead-behind state on the tab.
     pub git_status: bool,
     /// Poll `gh` for the current branch's PR and badge it on the tab.
@@ -189,6 +197,7 @@ impl Default for ConfigFile {
             pane_titles: true,
             copy_on_select: false,
             monitor_prs: false,
+            automations: false,
             git_status: true,
             pr_status: true,
             pr_detector: true,
@@ -223,6 +232,7 @@ pub struct Style {
     pub pane_titles: bool,
     pub copy_on_select: bool,
     pub monitor_prs: bool,
+    pub automations: bool,
     pub min_contrast: f32,
     pub git_status: bool,
     pub pr_status: bool,
@@ -360,6 +370,7 @@ pub fn resolve(
             pane_titles: cfg.pane_titles,
             copy_on_select: cfg.copy_on_select,
             monitor_prs: cfg.monitor_prs,
+            automations: cfg.automations,
             min_contrast: cfg.min_contrast,
             git_status: cfg.git_status,
             pr_status: cfg.pr_status,
@@ -507,6 +518,18 @@ pub fn set_monitor_prs(on: bool) {
         replace_top_level_line(&text, "monitor_prs", &line),
     ) {
         log::warn!("could not save monitor_prs: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's automations checkbox.
+pub fn set_automations(on: bool) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("automations = {on}");
+    if let Err(e) = fs::write(
+        path(),
+        replace_top_level_line(&text, "automations", &line),
+    ) {
+        log::warn!("could not save automations: {e:#}");
     }
 }
 

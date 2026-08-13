@@ -16,21 +16,23 @@ use egui::{
     Response, Sense, Shadow, Stroke, StrokeKind, TextFormat, Vec2,
 };
 
-use muxterm::agent::Agent;
+use muxterm::agent::{self, Agent};
+use muxterm::automation::{self, Automation};
 use muxterm::layout::SplitAxis;
 
 use crate::config;
 use crate::theme::{self, UiTheme};
 use crate::workspace::{self, Project, Template, TemplatePane};
 
-/// Row width in character cells, borders included. Wide enough for the five
+/// Row width in character cells, borders included. Wide enough for the six
 /// tab labels in the selector row (`appearance preferences projects templates
-/// extras`), which is the longest fixed line: two leading cells plus
-/// `"{marker}{label} "` per tab is 61.
-const COLS: usize = 64;
+/// automations extras`), which is the longest fixed line: two leading cells
+/// plus `"{marker}{label} "` per tab is 75.
+const COLS: usize = 78;
 
 /// Which settings tab is showing. Owned by the App (like `settings_open`)
-/// so cmd+shift+n can land straight on Projects.
+/// so cmd+shift+n can land straight on Projects, and the sidebar's
+/// automations "+" straight on Automations.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum Tab {
     #[default]
@@ -38,6 +40,7 @@ pub enum Tab {
     Preferences,
     Projects,
     Templates,
+    Automations,
     Extras,
 }
 
@@ -84,6 +87,21 @@ impl Default for TemplateDraft {
     }
 }
 
+/// The Automations tab's edit form, owned by the App so typing survives the
+/// stateless per-frame `show`. Clicking a saved automation row loads it here;
+/// `[ add ]` upserts by name (the edit path, like Projects and Templates).
+#[derive(Default)]
+pub struct AutomationDraft {
+    pub name: String,
+    pub schedule: String,
+    pub folder: String,
+    /// None means the plain shell-command payload.
+    pub agent: Option<&'static str>,
+    pub model: String,
+    pub prompt: String,
+    pub command: String,
+}
+
 /// What the user changed this frame; the caller persists and reloads.
 #[derive(Default)]
 pub struct Outcome {
@@ -107,6 +125,14 @@ pub struct Outcome {
     pub add_template: Option<Template>,
     /// Index into the caller's template list to remove.
     pub remove_template: Option<usize>,
+    /// Fire saved automations on their schedules (the extras checkbox).
+    pub automations: Option<bool>,
+    /// An automation to add - or to replace, when a saved one already has
+    /// its name. The caller owns the list (state.json) and keeps the
+    /// existing id on a replace, so its run history survives an edit.
+    pub add_automation: Option<Automation>,
+    /// Index into the caller's automation list to remove.
+    pub remove_automation: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -124,11 +150,14 @@ pub fn show(
     pr_detector: bool,
     notifications: bool,
     monitor_prs: bool,
+    automations_on: bool,
     tab: &mut Tab,
     projects: &[Project],
     draft: &mut ProjectDraft,
     templates: &[Template],
     tdraft: &mut TemplateDraft,
+    automations: &[Automation],
+    adraft: &mut AutomationDraft,
 ) -> Outcome {
     let mut out = Outcome::default();
     let grid = Grid {
@@ -181,9 +210,24 @@ pub fn show(
                 Tab::Templates => show_templates(
                     ui, &grid, th, templates, tdraft, &mut out,
                 ),
-                Tab::Extras => {
-                    show_extras(ui, &grid, th, monitor_prs, &mut out)
-                },
+                Tab::Automations => show_automations(
+                    ui,
+                    &grid,
+                    th,
+                    agents,
+                    automations,
+                    adraft,
+                    automations_on,
+                    &mut out,
+                ),
+                Tab::Extras => show_extras(
+                    ui,
+                    &grid,
+                    th,
+                    monitor_prs,
+                    automations_on,
+                    &mut out,
+                ),
             }
 
             grid.divider(ui, "esc closes", th.text_dim);
@@ -226,6 +270,7 @@ fn show_extras(
     grid: &Grid,
     th: &UiTheme,
     monitor_prs: bool,
+    automations_on: bool,
     out: &mut Outcome,
 ) {
     grid.divider(ui, "GitHub", th.accent);
@@ -244,6 +289,230 @@ fn show_extras(
     }
     grid.hint(ui, "your open PRs in the sidebar; click one to check it out");
     grid.hint(ui, "needs gh, authenticated");
+
+    grid.divider(ui, "Automations", th.accent);
+    let mark = if automations_on { "[x]" } else { "[ ]" };
+    let row = grid.body(
+        ui,
+        vec![
+            (mark.to_string(), th.accent),
+            (" run scheduled automations".to_string(), th.text),
+        ],
+        true,
+        false,
+    );
+    if row.clicked() {
+        out.automations = Some(!automations_on);
+    }
+    grid.hint(ui, "saved tasks fire on their schedules, each in its own tab");
+    // The honest version of "unattended": nobody is there to approve a tool
+    // call at 3am, so a scheduled agent run does not ask.
+    grid.hint(ui, "scheduled agent runs approve their own tool calls");
+}
+
+/// Saved scheduled tasks: a row per automation, then the add/edit form.
+/// Same shape as Projects - clicking a row loads it into the draft, `[ add ]`
+/// upserts by name, `[x]` removes.
+#[allow(clippy::too_many_arguments)]
+fn show_automations(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    th: &UiTheme,
+    agents: &[&'static Agent],
+    automations: &[Automation],
+    draft: &mut AutomationDraft,
+    automations_on: bool,
+    out: &mut Outcome,
+) {
+    grid.divider(ui, "Automations", th.accent);
+    if !automations_on {
+        // Editable but inert: say so here rather than let the user wonder
+        // why a saved automation never fires.
+        grid.hint(ui, "off - switch \"run scheduled automations\" on in extras");
+    }
+    if automations.is_empty() {
+        grid.hint(ui, "none yet - they run on a schedule, each in its own tab");
+    }
+    for (i, a) in automations.iter().enumerate() {
+        let loaded = draft.name.trim() == a.name;
+        let row = ui.horizontal(|ui| {
+            let marker = if loaded { "> " } else { "  " };
+            let name = grid.seg(
+                ui,
+                &format!("  {marker}{:<18}", clip(&a.name, 17)),
+                if loaded { th.accent } else { th.text },
+                true,
+            );
+            let name = name.union(grid.seg(
+                ui,
+                &format!(" {:<20}", clip(&a.schedule, 19)),
+                th.text_dim,
+                true,
+            ));
+            let name = name.union(grid.seg(
+                ui,
+                &format!(" {:<22}", clip(&a.payload_label(), 21)),
+                th.text_dim,
+                true,
+            ));
+            let x = grid.seg(ui, "[x]", th.accent, true);
+            (name, x)
+        });
+        let (name, x) = row.inner;
+        if x.clicked() {
+            out.remove_automation = Some(i);
+        } else if name.clicked() {
+            draft.name = a.name.clone();
+            draft.schedule = a.schedule.clone();
+            draft.folder = a
+                .root
+                .as_ref()
+                .map(|r| r.display().to_string())
+                .unwrap_or_default();
+            draft.agent = a.agent;
+            draft.model = a.model.clone().unwrap_or_default();
+            draft.prompt = a.prompt.clone();
+            draft.command = a.command.clone().unwrap_or_default();
+        }
+    }
+
+    grid.divider(ui, "Add automation", th.accent);
+    grid.input_row(ui, &mut draft.name, "name", 1);
+    grid.input_row(
+        ui,
+        &mut draft.schedule,
+        "every 30m | daily at 09:00 | weekly on mon at 09:00 | cron 0 9 * * 1-5",
+        1,
+    );
+    grid.input_row(ui, &mut draft.folder, "folder to run in", 1);
+
+    // Payload: an agent (with a prompt) or a plain command. The row of
+    // agents doubles as the switch - picking "command" clears the agent.
+    ui.horizontal(|ui| {
+        grid.seg(ui, "  runs ", th.text_dim, false);
+        if grid
+            .seg(
+                ui,
+                " command ",
+                if draft.agent.is_none() { th.accent } else { th.text_dim },
+                draft.agent.is_some(),
+            )
+            .clicked()
+        {
+            draft.agent = None;
+        }
+        for a in agents {
+            let on = draft.agent == Some(a.id);
+            if grid
+                .seg(
+                    ui,
+                    &format!(" {} ", a.label),
+                    if on { th.accent } else { th.text_dim },
+                    !on,
+                )
+                .clicked()
+            {
+                draft.agent = Some(a.id);
+                draft.model.clear();
+            }
+        }
+    });
+
+    match draft.agent.and_then(agent::by_id) {
+        Some(a) => {
+            // One cycling seg rather than a dropdown: the grid has no popup
+            // primitive, and the curated model list is short.
+            ui.horizontal(|ui| {
+                grid.seg(ui, "  model ", th.text_dim, false);
+                let label = match draft.model.is_empty() {
+                    true => "default".to_string(),
+                    false => agent::model_label(&draft.model).to_string(),
+                };
+                if grid
+                    .seg(ui, &format!("< {label} >"), th.accent, true)
+                    .clicked()
+                {
+                    draft.model = next_model(a, &draft.model);
+                }
+            });
+            grid.input_row(ui, &mut draft.prompt, "the task, in full", 3);
+        },
+        None => {
+            grid.input_row(ui, &mut draft.command, "shell command to run", 2);
+        },
+    }
+
+    // Validation up front: an automation that cannot be scheduled or has
+    // nothing to run must not be saveable (the errors are the same ones
+    // `mux automations create` reports).
+    let blocker = automation_blocker(draft);
+    if let Some(reason) = &blocker {
+        grid.hint(ui, reason);
+    } else if draft.agent.is_some() {
+        grid.hint(ui, "unattended: it approves its own tool calls");
+    }
+    ui.horizontal(|ui| {
+        grid.seg(ui, "  ", th.text_dim, false);
+        let ready = blocker.is_none();
+        let color = if ready { th.accent } else { th.text_dim };
+        let btn = grid.seg(ui, "[ add ]", color, ready);
+        let exists =
+            automations.iter().any(|a| a.name == draft.name.trim());
+        let note = if exists { " replaces the saved one" } else { "" };
+        grid.seg(ui, note, th.text_dim, false);
+        if ready && btn.clicked() {
+            out.add_automation = Some(draft_automation(draft));
+            *draft = AutomationDraft::default();
+        }
+    });
+}
+
+/// Step to the next model in the agent's curated list, wrapping.
+fn next_model(a: &'static Agent, current: &str) -> String {
+    if a.models.is_empty() {
+        return String::new();
+    }
+    let at = a.models.iter().position(|m| *m == current).unwrap_or(0);
+    a.models[(at + 1) % a.models.len()].to_string()
+}
+
+/// Why this draft cannot be saved yet, or None when it can. Pure, so the
+/// rules are testable and read the same as the CLI's.
+fn automation_blocker(d: &AutomationDraft) -> Option<String> {
+    if d.name.trim().is_empty() {
+        return Some("needs a name".to_string());
+    }
+    if d.schedule.trim().is_empty() {
+        return Some("needs a schedule".to_string());
+    }
+    if let Err(e) = automation::parse(&d.schedule) {
+        return Some(e);
+    }
+    match d.agent {
+        Some(_) if d.prompt.trim().is_empty() => {
+            Some("needs a prompt".to_string())
+        },
+        None if d.command.trim().is_empty() => {
+            Some("needs a command".to_string())
+        },
+        _ => None,
+    }
+}
+
+fn draft_automation(d: &AutomationDraft) -> Automation {
+    let mut a = Automation::new(
+        d.name.trim().to_string(),
+        d.schedule.trim().to_string(),
+    );
+    a.root = workspace::expand_dir(&d.folder);
+    a.agent = d.agent;
+    a.model = (!d.model.is_empty()).then(|| d.model.clone());
+    if d.agent.is_some() {
+        a.prompt = d.prompt.trim().to_string();
+    } else {
+        a.command = Some(d.command.trim().to_string());
+    }
+    a
 }
 
 fn show_preferences(
@@ -778,6 +1047,7 @@ impl Grid<'_> {
                 (Tab::Preferences, "preferences"),
                 (Tab::Projects, "projects"),
                 (Tab::Templates, "templates"),
+                (Tab::Automations, "automations"),
                 (Tab::Extras, "extras"),
             ] {
                 let selected = *tab == t;
@@ -1096,6 +1366,89 @@ mod tests {
         }]
     }
 
+    /// `[ add ]` must refuse anything the automation could not actually run:
+    /// the same rules `mux automations create` enforces, so the two surfaces
+    /// cannot disagree about what a valid automation is.
+    #[test]
+    fn an_unrunnable_automation_cannot_be_saved() {
+        let mut d = AutomationDraft::default();
+        assert_eq!(automation_blocker(&d).as_deref(), Some("needs a name"));
+        d.name = "nightly".into();
+        assert_eq!(automation_blocker(&d).as_deref(), Some("needs a schedule"));
+        d.schedule = "evry 5m".into();
+        // The schedule parser's own words, not a generic "invalid".
+        assert!(automation_blocker(&d).is_some_and(|e| e.contains("evry")));
+        d.schedule = "daily at 09:00".into();
+        assert_eq!(automation_blocker(&d).as_deref(), Some("needs a command"));
+        d.command = "git fetch".into();
+        assert!(automation_blocker(&d).is_none());
+
+        // Switching to an agent moves the requirement to the prompt.
+        d.agent = Some(agent::default_agent().id);
+        assert_eq!(automation_blocker(&d).as_deref(), Some("needs a prompt"));
+        d.prompt = "  ".into();
+        assert_eq!(automation_blocker(&d).as_deref(), Some("needs a prompt"));
+        d.prompt = "summarize the commits".into();
+        assert!(automation_blocker(&d).is_none());
+    }
+
+    /// The two payloads are exclusive: whichever the form is showing is the
+    /// one that gets saved, so a leftover command cannot ride along with an
+    /// agent prompt (or vice versa) and confuse the runner.
+    #[test]
+    fn a_draft_saves_exactly_one_payload() {
+        let d = AutomationDraft {
+            name: " nightly ".into(),
+            schedule: " every 30m ".into(),
+            folder: "/tmp/proj".into(),
+            agent: Some(agent::default_agent().id),
+            model: "sonnet".into(),
+            prompt: "do the thing".into(),
+            command: "rm -rf /".into(),
+        };
+        let a = draft_automation(&d);
+        assert_eq!(a.name, "nightly");
+        assert_eq!(a.schedule, "every 30m");
+        assert_eq!(a.prompt, "do the thing");
+        assert_eq!(a.command, None);
+        assert_eq!(a.model.as_deref(), Some("sonnet"));
+
+        let d = AutomationDraft { agent: None, ..d };
+        let a = draft_automation(&d);
+        assert_eq!(a.command.as_deref(), Some("rm -rf /"));
+        assert!(a.prompt.is_empty());
+        assert_eq!(a.agent, None);
+    }
+
+    /// The model stepper wraps rather than sticking at the end of the list.
+    #[test]
+    fn model_stepper_cycles() {
+        let claude = agent::by_id("claude").unwrap();
+        let mut seen = vec![String::new()];
+        let mut m = next_model(claude, "");
+        for _ in 0..claude.models.len() {
+            seen.push(m.clone());
+            m = next_model(claude, &m);
+        }
+        // Every curated model shows up, and it comes back round.
+        for want in claude.models {
+            assert!(seen.iter().any(|s| s == want), "{want} never offered");
+        }
+    }
+
+    fn fixture_automations() -> Vec<Automation> {
+        let mut a = Automation::new(
+            "nightly review".into(),
+            "weekly on mon at 09:00".into(),
+        );
+        a.agent = Some(agent::default_agent().id);
+        a.prompt = "summarize yesterday's commits".into();
+        let mut b =
+            Automation::new("fetch".into(), "every 30m".into());
+        b.command = Some("git fetch --all --prune".into());
+        vec![a, b]
+    }
+
     /// Render one tab headless; the panel's second frame paints for real
     /// (a window's first frame is an invisible sizing pass).
     fn render_tab(tab: Tab) -> (egui::Context, FontId, egui::FullOutput) {
@@ -1114,9 +1467,22 @@ mod tests {
         let agents: Vec<_> = agent::AGENTS.iter().collect();
         let projects = fixture_projects();
         let templates = fixture_templates();
+        let automations = fixture_automations();
         let frame = |ctx: &egui::Context| {
             let mut tab = tab;
             let mut draft = ProjectDraft::default();
+            // An agent draft, so the Automations tab paints its widest
+            // rows (the agent picker, the model stepper, the prompt field)
+            // for the frame-width check.
+            let mut adraft = AutomationDraft {
+                name: "nightly review".into(),
+                schedule: "weekly on mon at 09:00".into(),
+                folder: "/Users/someone/dev/muxterm".into(),
+                agent: Some(agent::default_agent().id),
+                model: String::new(),
+                prompt: "summarize yesterday's commits".into(),
+                command: String::new(),
+            };
             // A draft with an extra pane so the Templates tab actually paints
             // its control line + command field for the frame-width check.
             let mut tdraft = TemplateDraft::default();
@@ -1140,11 +1506,14 @@ mod tests {
                 true,
                 true,
                 true,
+                true,
                 &mut tab,
                 &projects,
                 &mut draft,
                 &templates,
                 &mut tdraft,
+                &automations,
+                &mut adraft,
             );
         };
         let _ = ctx.run(input.clone(), frame);
@@ -1159,7 +1528,14 @@ mod tests {
     #[test]
     fn text_stays_inside_the_frame() {
         for tab in
-            [Tab::Appearance, Tab::Preferences, Tab::Projects, Tab::Templates]
+            [
+                Tab::Appearance,
+                Tab::Preferences,
+                Tab::Projects,
+                Tab::Templates,
+                Tab::Automations,
+                Tab::Extras,
+            ]
         {
             let (ctx, font, output) = render_tab(tab);
 
@@ -1358,7 +1734,14 @@ mod tests {
     #[ignore]
     fn print_panel() {
         for tab in
-            [Tab::Appearance, Tab::Preferences, Tab::Projects, Tab::Templates]
+            [
+                Tab::Appearance,
+                Tab::Preferences,
+                Tab::Projects,
+                Tab::Templates,
+                Tab::Automations,
+                Tab::Extras,
+            ]
         {
             let (_, _, output) = render_tab(tab);
             let mut texts: Vec<(f32, f32, f32, String)> = Vec::new();

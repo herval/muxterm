@@ -69,6 +69,15 @@ pub fn newtab_dir() -> PathBuf {
     config_dir().join("newtab")
 }
 
+/// `mux automations create|edit|rm|enable|disable|run`: the GUI owns
+/// state.json, so the CLI never writes an automation itself - it spools the
+/// change here. Its own directory for the same reason as the spools above;
+/// fire-and-forget like rename (the CLI validates the schedule itself, so
+/// there is no verdict worth waiting for).
+pub fn automation_req_dir() -> PathBuf {
+    config_dir().join("automation-req")
+}
+
 /// One file per session (`<session>.json`), written by `mux agent-event`
 /// (agent lifecycle hooks) and read by the GUI's poll tick to drive the
 /// sidebar status dot. Unlike the spools above these are *state*, not a
@@ -88,6 +97,7 @@ pub fn ensure_dirs() {
     let _ = fs::create_dir_all(notify_dir());
     let _ = fs::create_dir_all(rename_dir());
     let _ = fs::create_dir_all(newtab_dir());
+    let _ = fs::create_dir_all(automation_req_dir());
     let _ = fs::create_dir_all(agent_state_dir());
 }
 
@@ -537,6 +547,101 @@ pub fn clear_newtab_requests() {
     }
 }
 
+/// What a spooled automation request asks the GUI to do. `Run` is the
+/// user-facing "run it now"; the execution itself happens in the
+/// automation's own tab (`mux automations exec`), never in the caller's.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutomationOp {
+    Create,
+    Edit,
+    Remove,
+    Enable,
+    Disable,
+    Run,
+}
+
+/// `mux automations <verb>`: a change to the saved automation list. The GUI
+/// owns state.json - the CLI writing it directly would be overwritten by the
+/// next save - so every mutation rides through this spool.
+///
+/// Every field but `op`/`id` is optional and means "leave it alone", which is
+/// what makes `edit` able to change one thing. `Create` carries an id the CLI
+/// picked itself (the `mux split` handshake idea) so it can print it before
+/// the GUI has seen the request.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AutomationRequest {
+    pub v: u32,
+    pub op: AutomationOp,
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub schedule: Option<String>,
+    #[serde(default)]
+    pub root: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    pub ts: u64,
+}
+
+pub fn write_automation_request(req: &AutomationRequest) -> anyhow::Result<()> {
+    fs::create_dir_all(automation_req_dir())?;
+    // Collision-proof naming (id + ts + pid), as with notify/rename: two
+    // requests for the same automation must both survive to be applied in
+    // order.
+    let path = automation_req_dir().join(format!(
+        "{}-{}-{}.json",
+        req.id,
+        req.ts,
+        std::process::id()
+    ));
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(req)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Drain pending automation requests, oldest first - order matters here in a
+/// way it does not for notifies: a create followed by an enable must not
+/// arrive backwards.
+pub fn take_automation_requests() -> Vec<AutomationRequest> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(automation_req_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let _ = fs::remove_file(&path);
+        if let Ok(req) = serde_json::from_str::<AutomationRequest>(&text) {
+            out.push(req);
+        }
+    }
+    out.sort_by_key(|req| req.ts);
+    out
+}
+
+/// An automation request spooled while the GUI was closed is stale by the
+/// next launch - the user has had a whole app lifetime to change their mind.
+pub fn clear_automation_requests() {
+    if let Ok(entries) = fs::read_dir(automation_req_dir()) {
+        for entry in entries.flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Deregister a session and drop its inbox artifacts (pane closed).
 pub fn remove_session(session: &str) {
     let mut reg = load_registry();
@@ -706,6 +811,8 @@ mod tests {
             workspaces_collapsed: false,
             projects: Vec::new(),
             templates: Vec::new(),
+            automations: Vec::new(),
+            automations_collapsed: false,
             windows: vec![WindowState {
                 active_tab: 0,
                 tabs: vec![

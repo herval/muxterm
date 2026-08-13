@@ -61,6 +61,11 @@ pub struct Workspace {
     /// already open, so a second click goes to this tab instead of checking the
     /// same branch out twice.
     pub pr: Option<(String, u64)>,
+    /// The automation whose executions run in this tab. Set means this is an
+    /// automation's dedicated log tab: it stays out of the tab bar and the
+    /// cmd+1..9 flow (see `App::visible_tab_indices`) but - unlike an
+    /// archived workspace - remains fully interactive when activated.
+    pub automation: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,12 +91,18 @@ impl Workspace {
             setup: None,
             subdir: None,
             pr: None,
+            automation: None,
         }
     }
 
     /// Is this workspace parked in the sidebar's archived pile?
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
+    }
+
+    /// Is this an automation's dedicated log tab?
+    pub fn is_automation(&self) -> bool {
+        self.automation.is_some()
     }
 
     pub fn to_state(&self) -> WorkspaceState {
@@ -111,6 +122,7 @@ impl Workspace {
             setup: self.setup.clone(),
             subdir: self.subdir.clone(),
             pr: self.pr.clone(),
+            automation: self.automation.clone(),
         }
     }
 
@@ -133,6 +145,7 @@ impl Workspace {
             setup: s.setup,
             subdir: s.subdir,
             pr: s.pr,
+            automation: s.automation,
         }
     }
 }
@@ -1694,6 +1707,7 @@ mod tests {
     #[test]
     fn state_round_trip_resolves_agent() {
         let ws = Workspace {
+            automation: None,
             root: Some(PathBuf::from("/p")),
             title: "t".into(),
             description: Some("d".into()),

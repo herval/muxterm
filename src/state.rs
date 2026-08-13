@@ -39,6 +39,15 @@ pub struct StateFile {
     /// `#[serde(default)]` (empty), so older state files load unchanged.
     #[serde(default)]
     pub templates: Vec<TemplateState>,
+    /// The saved scheduled tasks (Settings > Automations). Additive with
+    /// `#[serde(default)]` (empty). Each one's dedicated tab is found through
+    /// `WorkspaceState.automation`, not stored here, so killing the tab
+    /// leaves the automation intact.
+    #[serde(default)]
+    pub automations: Vec<AutomationState>,
+    /// Whether the sidebar's automations section is folded away.
+    #[serde(default)]
+    pub automations_collapsed: bool,
 }
 
 fn default_true() -> bool {
@@ -102,6 +111,12 @@ pub struct WorkspaceState {
     /// The GitHub PR this workspace came from (`owner/name`, number).
     #[serde(default)]
     pub pr: Option<(String, u64)>,
+    /// The automation whose executions run in this tab (`automation::
+    /// Automation::id`). Set means the tab is an automation's log tab: it
+    /// stays out of the tab bar and the cmd+1..9 flow, reachable from the
+    /// sidebar's automations section. Additive with `#[serde(default)]`.
+    #[serde(default)]
+    pub automation: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -137,6 +152,31 @@ pub struct TemplateState {
     pub name: String,
     #[serde(default)]
     pub panes: Vec<TemplatePaneState>,
+}
+
+/// Serde mirror of `automation::Automation`: a scheduled task. `schedule` is
+/// stored as the user wrote it and re-parsed on use, so a round trip never
+/// rewrites their wording; an unparseable one is surfaced, not dropped.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AutomationState {
+    pub id: String,
+    pub name: String,
+    pub schedule: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    /// `agent::Agent::id`; absent means the plain-`command` payload.
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub created_at: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -426,6 +466,19 @@ mod tests {
                     },
                 ],
             }],
+            automations: vec![AutomationState {
+                id: "auto-12345678".into(),
+                name: "nightly review".into(),
+                schedule: "daily at 09:00".into(),
+                enabled: true,
+                root: Some("/tmp/proj".into()),
+                agent: Some("claude".into()),
+                model: Some("sonnet".into()),
+                prompt: "summarize yesterday's commits".into(),
+                command: None,
+                created_at: 456,
+            }],
+            automations_collapsed: false,
             windows: vec![WindowState {
                 active_tab: 1,
                 tabs: vec![
@@ -473,6 +526,7 @@ mod tests {
                             setup: Some("direnv allow".into()),
                             subdir: Some("apps/web".into()),
                             pr: None,
+                            automation: None,
                         }),
                     },
                 ],

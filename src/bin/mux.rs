@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use muxterm::agent;
 use muxterm::ask;
+use muxterm::automation;
 use muxterm::layout::SplitAxis;
 use muxterm::mesh::{self, AgentInfo};
 use muxterm::state;
@@ -89,6 +90,17 @@ usage: mux [--as <session>] [--json] <command> [args]
   inbox [--consume]            read your queued messages
   ctx set <k> <v...> | get [k] | del <k>
                                shared per-tab key-value scratchpad
+  automations list | show <a> | logs <a> [-n <lines>] [--run <id>]
+             create --name <n> --schedule <s> [--folder <dir>]
+                    (--agent <a> --prompt <text> | --command <cmd>)
+             edit <a> [same flags] | rm <a> | enable <a> | disable <a>
+             run <a>
+                               scheduled tasks. Schedules are \"every 30m\",
+                               \"daily at 09:00\", \"weekly on mon at 09:00\"
+                               or \"cron 0 9 * * 1-5\". Each automation runs
+                               in its own tab, which keeps its logs; `run`
+                               fires one now. Needs the automations extra
+                               switched on in muxterm's settings
   brief                        paste-ready team briefing for a system prompt
   prune                        clean up entries for dead sessions/tabs
 ";
@@ -153,6 +165,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "retitle" => cmd_retitle(as_session, rest),
         "inbox" => cmd_inbox(as_session, rest, json),
         "ctx" => cmd_ctx(as_session, rest, json),
+        "automations" | "automation" => cmd_automations(rest, json),
         "brief" => cmd_brief(as_session),
         "prune" => cmd_prune(),
         other => {
@@ -1913,6 +1926,374 @@ fn cmd_ctx(
     }
 }
 
+// ------------------------------------------------------------ automations
+
+/// `mux automations <verb>`: the scheduled-task surface.
+///
+/// Reads (`list`/`show`/`logs`) go straight to state.json and the run
+/// directories. Writes never touch state.json - the GUI owns it - so they
+/// spool an `AutomationRequest` instead. `exec` is the odd one out: it is the
+/// runner itself, typed into an automation's own tab by the GUI.
+///
+/// Deliberately unauthorized (no `scope()`, unlike `split`/`new-tab`): this
+/// creates no pane, and `mux automations create` should work from any shell,
+/// not only from inside a muxterm pane. Being able to write under
+/// `~/.muxterm/` is the trust boundary, as it is for `mux agent-event`; the
+/// GUI re-validates every field when it applies the request.
+fn cmd_automations(mut args: Vec<String>, json: bool) -> CmdResult {
+    let usage = || {
+        (
+            EXIT_USAGE,
+            "usage: mux automations <list|show|create|edit|rm|enable|disable|run|logs> [args]"
+                .to_string(),
+        )
+    };
+    if args.is_empty() {
+        return Err(usage());
+    }
+    let verb = args.remove(0);
+    match verb.as_str() {
+        "list" | "ls" => automations_list(json),
+        "show" => automations_show(args, json),
+        "logs" | "log" => automations_logs(args),
+        "create" | "add" => automations_create(args),
+        "edit" => automations_edit(args),
+        "rm" | "remove" | "delete" => {
+            automations_simple(args, mesh::AutomationOp::Remove, "removed")
+        },
+        "enable" => {
+            automations_simple(args, mesh::AutomationOp::Enable, "enabled")
+        },
+        "disable" => {
+            automations_simple(args, mesh::AutomationOp::Disable, "disabled")
+        },
+        "run" => automations_simple(args, mesh::AutomationOp::Run, "queued"),
+        "exec" => automations_exec(args),
+        _ => Err(usage()),
+    }
+}
+
+/// Resolve a user-typed reference against the saved list, or fail with the
+/// names that *do* exist - a typo should not need a second command to debug.
+fn automation_target(
+    args: &[String],
+) -> Result<(Vec<automation::Automation>, automation::Automation), Fail> {
+    let key = args
+        .first()
+        .ok_or((EXIT_USAGE, "which automation? (mux automations list)".to_string()))?;
+    let list = automation::load_all();
+    let found = automation::find(&list, key).cloned().ok_or_else(|| {
+        let names: Vec<&str> = list.iter().map(|a| a.name.as_str()).collect();
+        (
+            EXIT_NOT_FOUND,
+            match names.is_empty() {
+                true => format!("no automation {key:?} (none are saved)"),
+                false => {
+                    format!("no automation {key:?}; saved: {}", names.join(", "))
+                },
+            },
+        )
+    })?;
+    Ok((list, found))
+}
+
+fn next_due_label(a: &automation::Automation) -> String {
+    match a.parsed() {
+        Err(e) => format!("bad schedule: {e}"),
+        Ok(_) if !a.enabled => "disabled".to_string(),
+        Ok(s) => match s.next_after(chrono::Local::now()) {
+            Some(dt) => dt.format("%b %d %H:%M").to_string(),
+            None => "never".to_string(),
+        },
+    }
+}
+
+fn last_run_label(a: &automation::Automation) -> String {
+    match automation::read_runs(&a.id).first() {
+        None => "-".to_string(),
+        Some(r) => format!(
+            "{} {}",
+            r.status,
+            automation::relative(r.started_at, mesh::now())
+        ),
+    }
+}
+
+fn automations_list(json: bool) -> CmdResult {
+    let list = automation::load_all();
+    if json {
+        let states: Vec<_> = list.iter().map(|a| a.to_state()).collect();
+        println!("{}", serde_json::to_string_pretty(&states).unwrap());
+        return Ok(());
+    }
+    if list.is_empty() {
+        println!("no automations yet (mux automations create --help)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<22} {:<14} {:<16} {}",
+        "NAME", "SCHEDULE", "NEXT", "LAST", "RUNS"
+    );
+    for a in &list {
+        println!(
+            "{:<20} {:<22} {:<14} {:<16} {}",
+            clip(&a.name, 20),
+            clip(&a.schedule, 22),
+            clip(&next_due_label(a), 14),
+            clip(&last_run_label(a), 16),
+            a.payload_label()
+        );
+    }
+    Ok(())
+}
+
+fn clip(s: &str, n: usize) -> String {
+    match s.chars().count() > n {
+        true => format!("{}…", s.chars().take(n - 1).collect::<String>()),
+        false => s.to_string(),
+    }
+}
+
+fn automations_show(args: Vec<String>, json: bool) -> CmdResult {
+    let (_, a) = automation_target(&args)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&a.to_state()).unwrap());
+        return Ok(());
+    }
+    println!("{}  ({})", a.name, a.id);
+    println!("  schedule  {}   next: {}", a.schedule, next_due_label(&a));
+    println!("  enabled   {}", a.enabled);
+    println!("  folder    {}", automation::root_label(a.root.as_deref()));
+    match (a.agent, &a.command) {
+        (Some(agent), _) => {
+            println!(
+                "  agent     {agent}{}",
+                a.model
+                    .as_deref()
+                    .filter(|m| !m.is_empty())
+                    .map(|m| format!(" ({m})"))
+                    .unwrap_or_default()
+            );
+            println!("  prompt    {}", a.prompt);
+        },
+        (None, Some(c)) => println!("  command   {c}"),
+        (None, None) => println!("  (nothing to run)"),
+    }
+    let runs = automation::read_runs(&a.id);
+    println!("  runs      {}", runs.len());
+    for r in runs.iter().take(10) {
+        println!(
+            "    {}  {:<12} {:>5}  {}",
+            automation::stamp(r.started_at),
+            r.status,
+            r.duration().map(|d| format!("{d}s")).unwrap_or_default(),
+            r.trigger
+        );
+    }
+    Ok(())
+}
+
+fn automations_logs(mut args: Vec<String>) -> CmdResult {
+    let run_flag = take_opt(&mut args, "--run")?;
+    let tail = take_opt(&mut args, "-n")?
+        .map(|n| n.parse::<usize>())
+        .transpose()
+        .map_err(|_| (EXIT_USAGE, "-n needs a number".to_string()))?;
+    let (_, a) = automation_target(&args)?;
+    let runs = automation::read_runs(&a.id);
+    let run = match &run_flag {
+        Some(id) => runs.iter().find(|r| &r.id == id),
+        None => runs.first(),
+    }
+    .ok_or((EXIT_NOT_FOUND, "no such run".to_string()))?;
+    let text = automation::read_log(&a.id, &run.id)
+        .ok_or((EXIT_NOT_FOUND, format!("no log for run {}", run.id)))?;
+    match tail {
+        Some(n) => {
+            let lines: Vec<&str> = text.lines().collect();
+            for line in lines.iter().skip(lines.len().saturating_sub(n)) {
+                println!("{line}");
+            }
+        },
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+/// Shared flag surface for `create` and `edit`. Returns only what was passed,
+/// so `edit` leaves everything else alone.
+struct AutoFlags {
+    name: Option<String>,
+    schedule: Option<String>,
+    folder: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    prompt: Option<String>,
+    command: Option<String>,
+}
+
+fn take_auto_flags(args: &mut Vec<String>) -> Result<AutoFlags, Fail> {
+    let flags = AutoFlags {
+        name: take_opt(args, "--name")?,
+        schedule: take_opt(args, "--schedule")?,
+        folder: take_opt(args, "--folder")?,
+        agent: take_opt(args, "--agent")?,
+        model: take_opt(args, "--model")?,
+        prompt: take_opt(args, "--prompt")?,
+        command: take_opt(args, "--command")?,
+    };
+    // A schedule typo must fail here, at the prompt, rather than vanish into
+    // the spool and turn up as a broken row later.
+    if let Some(s) = &flags.schedule {
+        automation::parse(s).map_err(|e| (EXIT_USAGE, e))?;
+    }
+    if let Some(id) = &flags.agent {
+        if agent::by_id(id).is_none() {
+            return Err((
+                EXIT_USAGE,
+                format!(
+                    "unknown agent {id:?}; try one of: {}",
+                    agent::ids().join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(flags)
+}
+
+fn automations_create(mut args: Vec<String>) -> CmdResult {
+    let flags = take_auto_flags(&mut args)?;
+    // Bare words become the name, so `mux automations create nightly ...`
+    // reads the way `mux rename` does.
+    let name = flags
+        .name
+        .or_else(|| (!args.is_empty()).then(|| args.join(" ")))
+        .filter(|n| !n.trim().is_empty())
+        .ok_or((EXIT_USAGE, "--name is required".to_string()))?;
+    let schedule = flags.schedule.ok_or((
+        EXIT_USAGE,
+        "--schedule is required, e.g. --schedule 'daily at 09:00'".to_string(),
+    ))?;
+    let has_agent = flags.agent.is_some();
+    let has_command =
+        flags.command.as_ref().is_some_and(|c| !c.trim().is_empty());
+    if has_agent == has_command {
+        return Err((
+            EXIT_USAGE,
+            "give either --agent with --prompt, or --command".to_string(),
+        ));
+    }
+    if has_agent && flags.prompt.as_ref().is_none_or(|p| p.trim().is_empty()) {
+        return Err((EXIT_USAGE, "--agent needs a --prompt".to_string()));
+    }
+    if automation::load_all().iter().any(|a| a.name.eq_ignore_ascii_case(&name))
+    {
+        return Err((
+            EXIT_CONFLICT,
+            format!("an automation named {name:?} already exists"),
+        ));
+    }
+
+    // The id is picked here so it can be printed before the GUI has even
+    // seen the request (the `mux split` handshake idea).
+    let id = automation::new_id();
+    let folder = flags.folder.or_else(|| {
+        env::current_dir().ok().map(|p| p.display().to_string())
+    });
+    mesh::write_automation_request(&mesh::AutomationRequest {
+        v: 1,
+        op: mesh::AutomationOp::Create,
+        id: id.clone(),
+        name: Some(name),
+        schedule: Some(schedule),
+        root: folder,
+        agent: flags.agent,
+        model: flags.model,
+        prompt: flags.prompt,
+        command: flags.command,
+        ts: mesh::now(),
+    })
+    .map_err(|e| (EXIT_TMUX, format!("spooling automation: {e}")))?;
+    println!("{id}");
+    Ok(())
+}
+
+fn automations_edit(mut args: Vec<String>) -> CmdResult {
+    let flags = take_auto_flags(&mut args)?;
+    let (_, target) = automation_target(&args)?;
+    let touched = [
+        &flags.name,
+        &flags.schedule,
+        &flags.folder,
+        &flags.agent,
+        &flags.model,
+        &flags.prompt,
+        &flags.command,
+    ]
+    .iter()
+    .any(|f| f.is_some());
+    if !touched {
+        return Err((EXIT_USAGE, "nothing to change".to_string()));
+    }
+    mesh::write_automation_request(&mesh::AutomationRequest {
+        v: 1,
+        op: mesh::AutomationOp::Edit,
+        id: target.id,
+        name: flags.name,
+        schedule: flags.schedule,
+        root: flags.folder,
+        agent: flags.agent,
+        model: flags.model,
+        prompt: flags.prompt,
+        command: flags.command,
+        ts: mesh::now(),
+    })
+    .map_err(|e| (EXIT_TMUX, format!("spooling automation: {e}")))?;
+    println!("edited");
+    Ok(())
+}
+
+/// rm / enable / disable / run: one target, no fields.
+fn automations_simple(
+    args: Vec<String>,
+    op: mesh::AutomationOp,
+    said: &str,
+) -> CmdResult {
+    let (_, target) = automation_target(&args)?;
+    mesh::write_automation_request(&mesh::AutomationRequest {
+        v: 1,
+        op,
+        id: target.id,
+        name: None,
+        schedule: None,
+        root: None,
+        agent: None,
+        model: None,
+        prompt: None,
+        command: None,
+        ts: mesh::now(),
+    })
+    .map_err(|e| (EXIT_TMUX, format!("spooling automation: {e}")))?;
+    println!("{said}");
+    Ok(())
+}
+
+/// The runner. Internal: the GUI types this into the automation's own tab
+/// when the schedule comes round, so the work happens where its logs live.
+fn automations_exec(mut args: Vec<String>) -> CmdResult {
+    let trigger = take_opt(&mut args, "--trigger")?
+        .unwrap_or_else(|| automation::TRIGGER_MANUAL.to_string());
+    let (_, target) = automation_target(&args)?;
+    let code = automation::exec(&target, &trigger)
+        .map_err(|e| (EXIT_TMUX, e))?;
+    // The run's own exit code is the command's exit code: a failing
+    // automation should read as a failing command in its pane.
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
 fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     use std::fmt::Write as _;
     let live = tmux.live_sessions();
@@ -1983,6 +2364,7 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux new-tab [--cwd <dir>] [--run <cmd>] [--title <t>]` - open a NEW background tab running a command in a folder. **Only use this when the user explicitly asks you to open a tab/window** - never on your own initiative.");
     let _ = writeln!(out, "- `mux rename [--desc <text>] <title...>` - relabel this workspace with a short descriptive title (2-5 words, spaces ok; updates the sidebar/tab, never the git branch)");
     let _ = writeln!(out, "- `mux retitle` - regenerate the workspace's title/description from what its panes are doing (returns immediately; applies in the background)");
+    let _ = writeln!(out, "- `mux automations list|create|run|...` - scheduled tasks (`--schedule 'daily at 09:00'`, `'every 30m'`, `'cron 0 9 * * 1-5'`), each running in its own tab. **Only use this when the user explicitly asks for something recurring/scheduled** - never on your own initiative.");
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", rename_guidance(sc.workspace_title.as_deref()));
     let _ = writeln!(out);

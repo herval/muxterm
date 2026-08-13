@@ -233,6 +233,42 @@ pub fn oneshot_command(agent: &Agent, prompt: &str) -> String {
     format!("{} {}", fixed.join(" "), shell_quote(prompt))
 }
 
+/// The argv behind a scheduled automation run (`mux automations exec`):
+/// headless, self-terminating, and - since nobody is at the keyboard at 3am -
+/// carrying the registry's existing *unattended* posture rather than a new
+/// one. That posture is exactly what `mux ask` already uses for its
+/// non-interactive path: claude's print mode with `--dangerously-skip-
+/// permissions` (headless `-p` auto-denies every mutating tool otherwise),
+/// and each Exec agent's own leading args (codex's `--sandbox
+/// workspace-write`, pi's `-p`, opencode's `run --auto`).
+///
+/// Unlike `oneshot_argv` there is no `--max-turns 1` and no `fast_model`: an
+/// automation is a real task on the user's chosen model. Unlike
+/// `launch_command` it never starts an interactive session - a scheduled run
+/// has to end on its own. Output stays plain text (not claude's stream-json),
+/// because it lands in the automation's pane and log for a human to read.
+pub fn scheduled_argv(
+    agent: &Agent,
+    model: Option<&str>,
+    prompt: &str,
+) -> Vec<String> {
+    let mut argv = vec![agent.bin.to_string()];
+    match agent.ask {
+        AskInvocation::ClaudeStream => argv.extend([
+            "-p".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+        ]),
+        AskInvocation::Exec { args } => {
+            argv.extend(args.iter().map(|s| s.to_string()))
+        },
+    }
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        argv.extend(["--model".to_string(), m.to_string()]);
+    }
+    argv.push(prompt.to_string());
+    argv
+}
+
 /// Compact label for the workspace model picker. The stored/passed value
 /// remains provider-qualified; only OpenCode Zen's redundant provider prefix
 /// is elided in the already-labelled OpenCode row.
@@ -395,6 +431,60 @@ mod tests {
             oneshot_command(opencode, "name this"),
             "opencode run 'name this'"
         );
+    }
+
+    /// A scheduled run is unattended, so every agent must carry the posture
+    /// that lets it act without a human: claude's skip-permissions, and each
+    /// Exec agent's own leading args. It must also *not* carry `oneshot`'s
+    /// `--max-turns 1` (an automation is a real task) or its fast_model.
+    #[test]
+    fn scheduled_argv_is_unattended_and_unlimited() {
+        let claude = by_id("claude").unwrap();
+        assert_eq!(
+            scheduled_argv(claude, None, "check the build"),
+            [
+                "claude",
+                "-p",
+                "--dangerously-skip-permissions",
+                "check the build"
+            ]
+        );
+        // A user-picked model rides along; the fast model never does.
+        assert_eq!(
+            scheduled_argv(claude, Some("opus"), "check the build"),
+            [
+                "claude",
+                "-p",
+                "--dangerously-skip-permissions",
+                "--model",
+                "opus",
+                "check the build"
+            ]
+        );
+        assert_eq!(
+            scheduled_argv(by_id("codex").unwrap(), None, "go"),
+            ["codex", "exec", "--sandbox", "workspace-write", "go"]
+        );
+        assert_eq!(scheduled_argv(by_id("pi").unwrap(), None, "go"), [
+            "pi", "-p", "go"
+        ]);
+        assert_eq!(scheduled_argv(by_id("opencode").unwrap(), None, "go"), [
+            "opencode", "run", "--auto", "go"
+        ]);
+        // An empty model means "the CLI's own default", not `--model ""`.
+        assert_eq!(
+            scheduled_argv(by_id("opencode").unwrap(), Some(""), "go"),
+            ["opencode", "run", "--auto", "go"]
+        );
+        for a in AGENTS {
+            let argv = scheduled_argv(a, None, "go");
+            assert!(
+                !argv.iter().any(|x| x == "--max-turns"),
+                "{} caps its turns on a scheduled run",
+                a.id
+            );
+            assert_eq!(argv.last().unwrap(), "go");
+        }
     }
 
     #[test]

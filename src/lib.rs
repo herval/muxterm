@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod ask;
+pub mod automation;
 pub mod layout;
 pub mod mesh;
 pub mod state;
