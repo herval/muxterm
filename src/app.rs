@@ -792,6 +792,54 @@ impl App {
             .collect()
     }
 
+    /// Move a tab so it sits before `before`, or last in the workspace list
+    /// when that is None. Both are tab ids: the sidebar's drop resolves to
+    /// identities, not positions, so the move survives whatever else in the
+    /// same frame's action batch has already shifted indices.
+    ///
+    /// `self.tabs` order *is* the order - the tab bar, cmd+1..9, cmd+shift+[/]
+    /// and state.json all read it - so this one `Vec` mutation is the whole
+    /// feature, and persistence needs nothing but the dirty flag.
+    fn move_tab(&mut self, moved: &str, before: Option<&str>) {
+        let Some(from) = self.tabs.iter().position(|t| t.tab_id == moved)
+        else {
+            return;
+        };
+        let to = match before {
+            Some(id) => match self.tabs.iter().position(|t| t.tab_id == id) {
+                Some(i) => i,
+                // The row it was dropped before is gone (closed in the same
+                // frame): leave the order alone rather than guess.
+                None => return,
+            },
+            None => {
+                let listed: Vec<bool> = self
+                    .tabs
+                    .iter()
+                    .map(|t| in_workspace_list(&t.workspace))
+                    .collect();
+                list_end(&listed)
+            },
+        };
+        let target = move_target(from, to);
+        if target == from {
+            return;
+        }
+        // Re-find the active tab by id afterwards rather than doing index
+        // arithmetic: `self.active` is a raw index, and re-finding is
+        // obviously right where a three-case shift is only probably right.
+        let active_id =
+            self.tabs.get(self.active).map(|t| t.tab_id.clone());
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(target, tab);
+        if let Some(id) = active_id {
+            if let Some(i) = self.tabs.iter().position(|t| t.tab_id == id) {
+                self.active = i;
+            }
+        }
+        self.dirty = true;
+    }
+
     /// Step the active tab through the visible list by `delta` with wraparound
     /// (cmd+shift+[ / ]). When the active tab is archived (a peek, so it isn't
     /// in the list), Next lands on the first visible tab and Prev on the last.
@@ -4454,6 +4502,9 @@ impl eframe::App for App {
                 .tabs
                 .iter()
                 .enumerate()
+                // Filtering after `enumerate` keeps `tab_index` a real index
+                // into `self.tabs`, which is what every row action carries.
+                .filter(|(_, tab)| in_workspace_list(&tab.workspace))
                 .map(|(i, tab)| {
                     let ws = &tab.workspace;
                     let subtitle = ws
@@ -4521,6 +4572,7 @@ impl eframe::App for App {
                     }
                     sidebar::Row {
                         tab_index: i,
+                        tab_id: tab.tab_id.clone(),
                         title,
                         subtitle,
                         active: i == self.active,
@@ -4646,6 +4698,9 @@ impl eframe::App for App {
                         if let Some(item) = self.pr_list.items.get(i).cloned() {
                             self.preview_pr(ctx, item);
                         }
+                    },
+                    SidebarAction::ReorderWorkspace { moved, before } => {
+                        self.move_tab(&moved, before.as_deref());
                     },
                     SidebarAction::ToggleAutomations => {
                         self.automations_collapsed =
@@ -5753,6 +5808,45 @@ fn in_tab_flow(ws: &Workspace) -> bool {
     !ws.is_archived() && !ws.is_automation()
 }
 
+/// Does this workspace get a row in the sidebar's workspace list?
+///
+/// Everything except an automation's log tab, which has its own section and
+/// would otherwise be listed twice. Archived workspaces *do* belong here -
+/// they render in the pile at the bottom - which is why this is deliberately
+/// not `in_tab_flow`: the two answer different questions, and the sidebar
+/// showing a slightly different set from cmd+1..9 is worth stating in code
+/// rather than leaving as an unwritten rule.
+fn in_workspace_list(ws: &Workspace) -> bool {
+    !ws.is_automation()
+}
+
+/// Index one past the last tab the sidebar's workspace list shows, given
+/// which tabs it shows at all - where a row dropped below every other row
+/// belongs.
+///
+/// Deliberately not `tabs.len()`: automation log tabs live in `self.tabs`
+/// but not in this list, so a trailing one would be jumped over and the
+/// dropped row would land visually last but behind it in tab order.
+fn list_end(listed: &[bool]) -> usize {
+    listed.iter().rposition(|shown| *shown).map_or(listed.len(), |i| i + 1)
+}
+
+/// Index to re-insert at after removing `from`, for a move whose target was
+/// computed against the *un*-mutated list.
+///
+/// The whole of it is the `from < to` case: taking the element out first
+/// shifts everything after it down one, so a target below the source is
+/// already one too high. Getting this backwards is the classic reorder bug -
+/// items drift one slot every time you drag them downward - which is why it
+/// is a named function with a test rather than an inline `- 1`.
+fn move_target(from: usize, to: usize) -> usize {
+    if from < to {
+        to - 1
+    } else {
+        to
+    }
+}
+
 fn nearest_visible(visible: &[usize], removed: usize) -> Option<usize> {
     visible
         .iter()
@@ -6028,6 +6122,45 @@ mod tests {
         assert_eq!(step_visible_target(&[], 0, 1), None);
     }
 
+    /// The `from < to` fixup, which is the whole of `move_target`: a target
+    /// computed against the un-mutated list is one too high once the moved
+    /// element has been taken out from above it. Getting it wrong makes rows
+    /// drift a slot every time they are dragged downward.
+    #[test]
+    fn move_target_accounts_for_the_hole_left_behind() {
+        // Downward: [a b c d], move a (0) to sit before d (3) -> [b c a d],
+        // i.e. re-inserted at 2, not 3.
+        assert_eq!(move_target(0, 3), 2);
+        // Upward needs no adjustment - the hole is below the target.
+        assert_eq!(move_target(3, 0), 0);
+        assert_eq!(move_target(3, 1), 1);
+        // To the very end (`to` == len).
+        assert_eq!(move_target(0, 4), 3);
+        // Dropping either side of where it already sits stays put, so
+        // `move_tab` can recognise a no-op and skip the write.
+        assert_eq!(move_target(2, 2), 2);
+        assert_eq!(move_target(2, 3), 2);
+    }
+
+    /// Dropping a row below every other row lands it after the last row the
+    /// list *shows*, which is not the end of `self.tabs`: an automation log
+    /// tab sitting at the end is not in the list, and a row dropped past it
+    /// would read as last while sorting behind it everywhere else.
+    #[test]
+    fn list_end_stops_at_the_last_listed_tab() {
+        assert_eq!(list_end(&[true, true, true]), 3);
+        // A trailing automation tab is not jumped over.
+        assert_eq!(list_end(&[true, true, false]), 2);
+        assert_eq!(list_end(&[true, false, false]), 1);
+        // Interleaved: only the last *listed* one counts.
+        assert_eq!(list_end(&[true, false, true, false]), 3);
+        // Nothing listed cannot happen in practice - the row being dragged
+        // is itself listed - so the fallback only has to be inert. The end
+        // is; the front would fling the tab to position zero.
+        assert_eq!(list_end(&[false, false]), 2);
+        assert_eq!(list_end(&[]), 0);
+    }
+
     /// Automation log tabs stay out of the tab bar and the cmd+1..9 flow, the
     /// way archived ones do - but they must NOT be archived to achieve it,
     /// because `is_archived` is also what makes a tab a read-only peek, and
@@ -6047,6 +6180,15 @@ mod tests {
         // The read-only guards key off this, and it must stay false.
         assert!(!auto.is_archived());
         assert!(auto.is_automation());
+
+        // The sidebar's list is a *different* filtered view of the same
+        // tabs, and the difference is the point: an archived workspace is
+        // out of the tab flow but still listed (in the pile at the bottom),
+        // while an automation's log tab is out of both - it has its own
+        // section, and listing it twice is what this pins down.
+        assert!(in_workspace_list(&plain));
+        assert!(in_workspace_list(&archived));
+        assert!(!in_workspace_list(&auto));
 
         // And the peek logic still lands somewhere sane when the active tab
         // is one of the hidden ones (tab 1 here).

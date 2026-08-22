@@ -44,6 +44,11 @@ pub enum SidebarAction {
     PreviewPr(usize),
     /// Open the creation popup (the header "+").
     NewWorkspace,
+    /// A row was dragged to a new position: move `moved` so it sits before
+    /// `before`, or last when that is None. Both are tab ids, not indices -
+    /// the App applies queued actions in a batch, and an index computed
+    /// while rendering goes stale the moment any earlier action moves a tab.
+    ReorderWorkspace { moved: String, before: Option<String> },
     /// Collapse/expand the automations section (its header click).
     ToggleAutomations,
     /// Open this automation's run history (an automation row's body click).
@@ -54,6 +59,20 @@ pub enum SidebarAction {
     NewAutomation,
     /// Collapse the sidebar (the header "‹").
     ToggleSidebar,
+}
+
+/// What a drag is carrying: the dragged row's tab id. A newtype rather than
+/// a bare String because egui's drag payload is keyed by type alone - a
+/// `String` payload would be picked up by any other `String` drop target.
+#[derive(Clone, Debug)]
+pub struct DraggedRow(pub String);
+
+/// Which half of a row the pointer is over, and so which side of it the
+/// dragged row would land on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropSide {
+    Above,
+    Below,
 }
 
 /// The status-light state of a workspace's leading dot.
@@ -78,6 +97,10 @@ pub enum Status {
 /// is independent of display order.
 pub struct Row {
     pub tab_index: usize,
+    /// The tab's stable id. Keys the drag payload and this row's egui id, so
+    /// neither follows a display slot: an index-keyed id would latch a
+    /// half-finished drag onto whichever row later occupies that position.
+    pub tab_id: String,
     pub title: String,
     pub subtitle: Option<String>,
     pub active: bool,
@@ -212,9 +235,17 @@ pub fn show(
                 // the panel header (cmd+1..9 still reach them while folded -
                 // this hides the list, it doesn't park the tabs).
                 if !workspaces_collapsed {
-                    for row in rows.iter().filter(|r| !r.archived) {
+                    // Collected first so a drop can look one row ahead:
+                    // "below row i" means "before row i+1", and the last row
+                    // has no successor to name.
+                    let live: Vec<&Row> =
+                        rows.iter().filter(|r| !r.archived).collect();
+                    for (i, row) in live.iter().enumerate() {
                         let r = workspace_row(ui, row, font, t);
-                        if let Some(a) = row_action(&r, row) {
+                        let next = live.get(i + 1).map(|n| n.tab_id.as_str());
+                        if let Some(a) = drop_action(&r, row, next) {
+                            actions.push(a);
+                        } else if let Some(a) = row_action(&r, row) {
                             actions.push(a);
                         }
                     }
@@ -348,6 +379,42 @@ fn row_action(r: &RowResponse, row: &Row) -> Option<SidebarAction> {
     } else {
         None
     }
+}
+
+/// Turn a drag released over `row` into the move it means. `next` is the tab
+/// id of the row below this one, or None when this is the last live row.
+///
+/// Pure, like `row_action`: a drag is awkward to synthesize headlessly (it
+/// spans frames and egui only calls it a drag once the pointer has moved far
+/// enough), so the arithmetic that decides *where a row lands* is kept where
+/// it can be tested directly.
+///
+/// A drop that resolves to where the row already sits reports `Select`
+/// rather than nothing. That is not a nicety: egui reclassifies a press held
+/// longer than ~0.8s as a drag even if the pointer never moved, so without
+/// this a slow click on a workspace would silently fail to select it.
+fn drop_action(
+    r: &RowResponse,
+    row: &Row,
+    next: Option<&str>,
+) -> Option<SidebarAction> {
+    let moved = r.released.clone()?;
+    let before = match r.drop? {
+        DropSide::Above => Some(row.tab_id.clone()),
+        DropSide::Below => next.map(str::to_string),
+    };
+    // Released over its own row: nothing to move, and this is the shape a
+    // hesitant click takes, so report the select it was meant to be.
+    //
+    // Other drops that happen to resolve to the row's current position (just
+    // above its successor, say) are left as a Reorder - the App recognises a
+    // move to where it already is and does nothing. Catching every such case
+    // here would mean duplicating that arithmetic against the display list
+    // instead of the tab list, which is exactly how the two drift apart.
+    if moved == row.tab_id {
+        return Some(SidebarAction::Select(row.tab_index));
+    }
+    Some(SidebarAction::ReorderWorkspace { moved, before })
 }
 
 /// Repaint cadence while a working pulse is on screen. A 1.4s sine is
@@ -871,6 +938,10 @@ struct RowResponse {
     delete: bool,
     /// Pointer anywhere on the row - body or either icon (the disarm gate).
     hovered: bool,
+    /// A drag is hovering this row, and would land on this side of it.
+    drop: Option<DropSide>,
+    /// A drag was *released* over this row this frame, carrying this tab id.
+    released: Option<String>,
 }
 
 /// Renders one row. The icons are separate interact rects overlaid on the
@@ -927,7 +998,50 @@ fn workspace_row(
     let galley = ui.fonts(|f| f.layout_job(job));
 
     let size = Vec2::new(ui.available_width(), galley.size().y + pad.y * 2.0);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    // Allocated with an explicit, tab-id-keyed id rather than
+    // `allocate_exact_size`'s positional one: a slot-keyed id would hand a
+    // half-finished drag to whichever row later sits in that slot.
+    //
+    // Live rows sense drags (they reorder the tab flow); archived ones do
+    // not, because the archived pile is ordered by `archived_at`, so moving
+    // a row within it would be undone on the next frame.
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let sense = if row.archived {
+        egui::Sense::click()
+    } else {
+        egui::Sense::click_and_drag()
+    };
+    let resp =
+        ui.interact(rect, ui.id().with(("ws_row", row.tab_id.as_str())), sense);
+    // Gated on `drag_started` rather than called every frame: the payload is
+    // only stored on that frame anyway, and the row list repaints constantly
+    // (a breathing status light alone drives ~15fps), so an ungated call
+    // would clone every visible row's id on every one of those frames.
+    if !row.archived && resp.drag_started() {
+        resp.dnd_set_drag_payload(DraggedRow(row.tab_id.clone()));
+    }
+    let dragging = resp.dragged();
+    // Where a hovering drag would land. `dnd_hover_payload` tests
+    // `contains_pointer`, not `hovered` - egui reports every widget as
+    // un-hovered while a drag is in flight, so the row's own hover flag is
+    // useless here. Same reason the pointer position comes from the input
+    // state rather than `resp.hover_pos()`.
+    let hovering = (!row.archived)
+        .then(|| resp.dnd_hover_payload::<DraggedRow>())
+        .flatten();
+    let drop = hovering.as_ref().and_then(|_| {
+        let pointer = ui.input(|i| i.pointer.interact_pos())?;
+        Some(if pointer.y < rect.center().y {
+            DropSide::Above
+        } else {
+            DropSide::Below
+        })
+    });
+    let released = hovering
+        .is_some()
+        .then(|| resp.dnd_release_payload::<DraggedRow>())
+        .flatten()
+        .map(|p| p.0.clone());
 
     // The hover-revealed affordances: their own interact rects on the right,
     // registered after the row so they win the click there. Created before
@@ -982,7 +1096,10 @@ fn workspace_row(
             CornerRadius::same(4),
             theme::blend(t.bg, t.accent, 0.14),
         );
-    } else if hovered {
+    } else if hovered || dragging {
+        // `dragging` counts here because egui reports every widget as
+        // un-hovered mid-drag: without it the row being dragged is the one
+        // row on screen with no highlight at all.
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(4),
@@ -1030,11 +1147,26 @@ fn workspace_row(
             );
         }
     }
+    // The insertion caret: where the dragged row would land. Painted last so
+    // it sits over the row's own background and text.
+    if let Some(side) = drop {
+        let y = match side {
+            DropSide::Above => rect.top(),
+            DropSide::Below => rect.bottom(),
+        };
+        ui.painter().hline(
+            rect.x_range(),
+            y,
+            Stroke::new((font.size * 0.14).max(2.0), t.accent),
+        );
+    }
     RowResponse {
         body: resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked(),
         icon: icon_resp.clicked(),
         delete: del_resp.is_some_and(|r| r.clicked()),
         hovered,
+        drop,
+        released,
     }
 }
 
@@ -1068,6 +1200,7 @@ mod tests {
         let rows = vec![
             Row {
                 tab_index: 0,
+                tab_id: "mux-tab-0".into(),
                 title: "resting-ws".into(),
                 subtitle: None,
                 active: false,
@@ -1077,6 +1210,7 @@ mod tests {
             },
             Row {
                 tab_index: 1,
+                tab_id: "mux-tab-1".into(),
                 title: "busy-ws".into(),
                 subtitle: Some("feat/x".into()),
                 active: false,
@@ -1086,6 +1220,7 @@ mod tests {
             },
             Row {
                 tab_index: 2,
+                tab_id: "mux-tab-2".into(),
                 title: "stuck-ws".into(),
                 subtitle: None,
                 active: false,
@@ -1095,6 +1230,7 @@ mod tests {
             },
             Row {
                 tab_index: 3,
+                tab_id: "mux-tab-3".into(),
                 title: "bg-ws".into(),
                 subtitle: None,
                 active: false,
@@ -1104,6 +1240,7 @@ mod tests {
             },
             Row {
                 tab_index: 4,
+                tab_id: "mux-tab-4".into(),
                 title: "cmd-ws".into(),
                 subtitle: None,
                 active: false,
@@ -1181,6 +1318,7 @@ mod tests {
         let rows = vec![
             Row {
                 tab_index: 0,
+                tab_id: "mux-tab-0".into(),
                 title: "live-ws".into(),
                 subtitle: None,
                 active: true,
@@ -1190,6 +1328,7 @@ mod tests {
             },
             Row {
                 tab_index: 1,
+                tab_id: "mux-tab-1".into(),
                 title: "parked-ws".into(),
                 subtitle: None,
                 active: false,
@@ -1254,6 +1393,7 @@ mod tests {
         let rows = vec![
             Row {
                 tab_index: 0,
+                tab_id: "mux-tab-0".into(),
                 title: "live-ws".into(),
                 subtitle: None,
                 active: true,
@@ -1263,6 +1403,7 @@ mod tests {
             },
             Row {
                 tab_index: 1,
+                tab_id: "mux-tab-1".into(),
                 title: "other-ws".into(),
                 subtitle: None,
                 active: false,
@@ -1272,6 +1413,7 @@ mod tests {
             },
             Row {
                 tab_index: 2,
+                tab_id: "mux-tab-2".into(),
                 title: "parked-ws".into(),
                 subtitle: None,
                 active: false,
@@ -1343,6 +1485,7 @@ mod tests {
         let font = FontId::monospace(14.0);
         let rows = vec![Row {
             tab_index: 0,
+            tab_id: "mux-tab-0".into(),
             title: "live-ws".into(),
             subtitle: None,
             active: true,
@@ -1427,6 +1570,7 @@ mod tests {
         for status in [Status::Working, Status::Background, Status::Command] {
             let rows = vec![Row {
                 tab_index: 0,
+                tab_id: "mux-tab-0".into(),
                 title: "busy-ws".into(),
                 subtitle: None,
                 active: false,
@@ -1469,9 +1613,24 @@ mod tests {
         }
     }
 
+    /// A live row to spread over with `..`; callers set what they care about.
+    fn plain_row() -> Row {
+        Row {
+            tab_index: 0,
+            tab_id: "mux-tab-0".into(),
+            title: "live-ws".into(),
+            subtitle: None,
+            active: false,
+            status: Status::Idle,
+            archived: false,
+            delete_armed: false,
+        }
+    }
+
     fn archived_row(delete_armed: bool) -> Row {
         Row {
             tab_index: 0,
+            tab_id: "mux-tab-0".into(),
             title: "parked-ws".into(),
             subtitle: None,
             active: false,
@@ -1581,6 +1740,7 @@ mod tests {
         let autos = vec![automation(0, "nightly", false)];
         let rows = vec![Row {
             tab_index: 0,
+            tab_id: "mux-tab-0".into(),
             title: "live-ws".into(),
             subtitle: None,
             active: true,
@@ -1807,6 +1967,196 @@ mod tests {
         );
     }
 
+    /// Where a released drag says the row should land. Pure, because a drag
+    /// spans frames and only becomes a drag once the pointer has moved far
+    /// enough, which makes the geometry awkward to synthesize headlessly.
+    #[test]
+    fn drop_above_and_below_resolve_to_the_row_it_lands_before() {
+        let target = Row { tab_index: 1, tab_id: "b".into(), ..plain_row() };
+        let dropped = |side, released: &str| RowResponse {
+            body: false,
+            icon: false,
+            delete: false,
+            hovered: false,
+            
+            drop: Some(side),
+            released: Some(released.to_string()),
+        };
+
+        // Upper half of b: land before b.
+        let a = drop_action(&dropped(DropSide::Above, "a"), &target, Some("c"));
+        assert!(matches!(
+            a,
+            Some(SidebarAction::ReorderWorkspace { ref moved, ref before })
+                if moved == "a" && before.as_deref() == Some("b")
+        ));
+
+        // Lower half of b: land before whatever follows b.
+        let a = drop_action(&dropped(DropSide::Below, "a"), &target, Some("c"));
+        assert!(matches!(
+            a,
+            Some(SidebarAction::ReorderWorkspace { ref moved, ref before })
+                if moved == "a" && before.as_deref() == Some("c")
+        ));
+
+        // Lower half of the last row: nothing follows, so land last.
+        let a = drop_action(&dropped(DropSide::Below, "a"), &target, None);
+        assert!(matches!(
+            a,
+            Some(SidebarAction::ReorderWorkspace { ref moved, before: None })
+                if moved == "a"
+        ));
+    }
+
+    /// Releasing over the row you picked up selects it instead of moving it.
+    /// egui calls a press held ~0.8s a drag even if the pointer never moved,
+    /// so without this a slow click would silently stop selecting.
+    #[test]
+    fn a_drag_released_on_its_own_row_is_a_select() {
+        let row = Row { tab_index: 7, tab_id: "b".into(), ..plain_row() };
+        for side in [DropSide::Above, DropSide::Below] {
+            let r = RowResponse {
+                body: false,
+                icon: false,
+                delete: false,
+                hovered: false,
+                
+                drop: Some(side),
+                released: Some("b".into()),
+            };
+            assert!(matches!(
+                drop_action(&r, &row, Some("c")),
+                Some(SidebarAction::Select(7))
+            ));
+        }
+    }
+
+    /// The gesture end to end, through real egui interaction: press on the
+    /// first row, move onto the second, release. Takes several passes
+    /// because egui deliberately withholds judgement on press - a press that
+    /// has not moved yet might still become a click - so `dragged()` cannot
+    /// be true on the same frame as the press.
+    #[test]
+    fn dragging_a_row_onto_another_reorders_it() {
+        let ctx = egui::Context::default();
+        let preset = theme::preset("iterm-dark").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let font = FontId::monospace(14.0);
+        let rows = vec![
+            Row { tab_index: 0, tab_id: "a".into(), ..plain_row() },
+            Row {
+                tab_index: 1,
+                tab_id: "b".into(),
+                title: "second-ws".into(),
+                ..plain_row()
+            },
+        ];
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(900.0, 700.0),
+        );
+        let mut seen: Vec<SidebarAction> = Vec::new();
+        let mut frame = |ctx: &egui::Context, input: egui::RawInput| {
+            let mut got = Vec::new();
+            let _ = ctx.run(input, |ctx| {
+                got = show(
+                    ctx, &rows, false, &[], None, false, None, false, false,
+                    &font, &th,
+                );
+            });
+            got
+        };
+        let at = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let press = |pos| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        let release = |pos| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        };
+
+        // Find the two rows' centres from what actually got painted, rather
+        // than hard-coding geometry that every padding tweak would break.
+        let _ = frame(&ctx, at(vec![]));
+        let out = ctx.run(at(vec![]), |ctx| {
+            let _ = show(
+                ctx, &rows, false, &[], None, false, None, false, false,
+                &font, &th,
+            );
+        });
+        let mut texts: Vec<(String, egui::Pos2)> = Vec::new();
+        let mut shapes = Vec::new();
+        for clipped in &out.shapes {
+            collect(&clipped.shape, &mut shapes);
+        }
+        for s in &shapes {
+            if let egui::Shape::Text(t) = s {
+                texts.push((t.galley.text().to_string(), t.pos));
+            }
+        }
+        let row_y = |needle: &str| {
+            texts
+                .iter()
+                .find(|(s, _)| s.contains(needle))
+                .map(|(_, p)| p.y + 8.0)
+                .unwrap_or_else(|| panic!("row {needle} never painted"))
+        };
+        let a = egui::Pos2::new(80.0, row_y("live-ws"));
+        let b = egui::Pos2::new(80.0, row_y("second-ws"));
+        assert!(b.y - a.y > 6.0, "rows too close to tell a drag from a click");
+
+        // Press on row a, then move onto row b (two passes: the move has to
+        // be seen while the button is still down), then release over b.
+        seen.extend(frame(&ctx, at(vec![egui::Event::PointerMoved(a), press(a)])));
+        seen.extend(frame(&ctx, at(vec![egui::Event::PointerMoved(b)])));
+        seen.extend(frame(&ctx, at(vec![egui::Event::PointerMoved(b)])));
+        seen.extend(frame(&ctx, at(vec![release(b)])));
+
+        let reorder = seen.iter().find_map(|a| match a {
+            SidebarAction::ReorderWorkspace { moved, before } => {
+                Some((moved.clone(), before.clone()))
+            },
+            _ => None,
+        });
+        let (moved, before) = reorder.expect(
+            "dragging row a onto row b should have reordered it",
+        );
+        assert_eq!(moved, "a");
+        // Dropped on b's lower half (b is the last row), so: land last.
+        assert_eq!(before, None);
+        // And it must not also have selected something on the way.
+        assert!(
+            !seen.iter().any(|a| matches!(a, SidebarAction::Select(_))),
+            "a drag must not also fire a select",
+        );
+    }
+
+    /// No release, no action - a drag merely passing over a row must not
+    /// move anything, or the list would reshuffle under the pointer.
+    #[test]
+    fn hovering_without_releasing_moves_nothing() {
+        let row = Row { tab_index: 1, tab_id: "b".into(), ..plain_row() };
+        let r = RowResponse {
+            body: false,
+            icon: false,
+            delete: false,
+            hovered: false,
+            
+            drop: Some(DropSide::Above),
+            released: None,
+        };
+        assert!(drop_action(&r, &row, Some("c")).is_none());
+    }
+
     #[test]
     fn row_action_delete_arms_then_fires() {
         let click = |body, icon, delete| RowResponse {
@@ -1814,6 +2164,9 @@ mod tests {
             icon,
             delete,
             hovered: true,
+            
+            drop: None,
+            released: None,
         };
         assert!(matches!(
             row_action(&click(false, false, true), &archived_row(false)),
