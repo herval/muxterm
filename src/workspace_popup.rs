@@ -5,7 +5,8 @@
 //! folder and task fields stay egui `TextEdit`s - restyled to monospace with a
 //! hairline border so they sit inside the same grid.
 //!
-//! cmd+shift+n opens the same form in *project mode* (`for_project`): the
+//! cmd+n (when projects are saved) and cmd+shift+n open *project mode*:
+//! `for_project` uses the saved project list. The
 //! folder field gives way to rows over the saved projects (Settings >
 //! Projects), and the worktree toggle disappears (always on). A repo project
 //! that hasn't been cloned yet feeds the same branch typeahead from
@@ -39,7 +40,7 @@ pub struct NewWorkspaceForm {
     pub prompt: String,
     pub agent: &'static str,
     pub model: String,
-    /// Project mode (cmd+shift+n): the saved projects to pick from,
+    /// Project mode (cmd+n or cmd+shift+n): the saved projects to pick from,
     /// snapshotted at open. Empty = the plain cmd+n folder form.
     pub projects: Vec<Project>,
     /// Index into `projects` of the picked one.
@@ -104,7 +105,7 @@ impl NewWorkspaceForm {
         form
     }
 
-    /// cmd+shift+n: the same form in project mode, seeded on the first
+    /// The workspace form in project mode, seeded on the first
     /// saved project. The folder tracks the picked project; a worktree is
     /// always wanted (that's the point of a project session), even when
     /// the checkbox logic would say no because the clone doesn't exist yet.
@@ -636,23 +637,27 @@ fn project_picker(
     panel.divider(ui, "Project", th.accent);
     ui.add_space(2.0);
     let mut pick: Option<usize> = None;
-    for (i, p) in form.projects.iter().enumerate() {
-        let base = match (&p.path, &p.repo) {
-            (Some(path), _) => home_abbrev(&path.display().to_string()),
-            (None, Some(repo)) => format!("github: {repo}"),
-            (None, None) => String::new(),
-        };
-        let note = match &p.subdir {
-            Some(sub) => format!("{base} /{sub}"),
-            None => base,
-        };
-        if panel
-            .option(ui, &p.name, &note, true, i == form.project)
-            .clicked()
-        {
-            pick = Some(i);
-        }
-    }
+    egui::ScrollArea::vertical()
+        .max_height(160.0)
+        .show(ui, |ui| {
+            for (i, p) in form.projects.iter().enumerate() {
+                let base = match (&p.path, &p.repo) {
+                    (Some(path), _) => home_abbrev(&path.display().to_string()),
+                    (None, Some(repo)) => format!("github: {repo}"),
+                    (None, None) => String::new(),
+                };
+                let note = match &p.subdir {
+                    Some(sub) => format!("{base} /{sub}"),
+                    None => base,
+                };
+                if panel
+                    .option(ui, &p.name, &note, true, i == form.project)
+                    .clicked()
+                {
+                    pick = Some(i);
+                }
+            }
+        });
     if let Some(i) = pick {
         form.project = i;
         form.folder = form.projects[i].local_root().display().to_string();
@@ -842,6 +847,15 @@ fn branch_picker(
         },
     };
     panel.row(ui, vec![(caption, color)], false);
+    if matches!(
+        form.branch_choice(), BranchChoice::Codename | BranchChoice::New(_)
+    ) {
+        if let Some(base) = form.selected_project()
+            .and_then(|p| p.default_branch.as_deref())
+        {
+            panel.row(ui, vec![(format!("-> based on {base}"), th.text_dim)], false);
+        }
+    }
 }
 
 /// Case-insensitive substring filter over branch names, order-preserving
@@ -1488,6 +1502,8 @@ mod tests {
         let repo = format!("herval/dots-{}", uuid::Uuid::new_v4());
         let projects = vec![
             Project {
+                default_branch: None,
+                copy_files: Vec::new(),
                 name: "local-proj".into(),
                 path: Some("/no/such/dir/local-proj".into()),
                 repo: None,
@@ -1495,6 +1511,8 @@ mod tests {
                 subdir: None,
             },
             Project {
+                default_branch: None,
+                copy_files: Vec::new(),
                 name: "dots/nvim".into(),
                 path: None,
                 repo: Some(repo.clone()),

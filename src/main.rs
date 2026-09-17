@@ -7,6 +7,7 @@ mod attention;
 mod automation_view;
 mod bg_jobs;
 mod config;
+mod conductor_import;
 mod folder_picker;
 mod git_status;
 mod keys;

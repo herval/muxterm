@@ -76,6 +76,8 @@ folder fills the path; cancelling keeps the current value.
 | Chord | Action |
 | --- | --- |
 | cmd+t | new tab |
+| cmd+n | new workspace: saved-project picker, or folder form if no projects are saved |
+| cmd+shift+n | saved-project picker; opens Projects settings if none are saved |
 | cmd+w | close focused pane (kills its tmux session; closes tab when last pane) |
 | cmd+d / cmd+shift+d | split side-by-side / stacked |
 | cmd+shift+[ / cmd+shift+] | previous / next tab |
@@ -93,6 +95,33 @@ folder fills the path; cancelling keeps the current value.
 
 ¹ Window managers like Rectangle bind cmd+opt+arrows globally; free those
 hotkeys or use cmd+[ / cmd+].
+
+## Projects and Conductor import
+
+Open **Settings → Projects → Import from Conductor** to preview local
+Conductor repositories. Expand each project's details, select the projects,
+and click **Import selected projects**. Existing names or repository paths are
+skipped. Importing saves configuration only; it does not run scripts or move
+Conductor workspaces.
+
+Projects support an optional base branch (for example `origin/prod`) and file
+patterns to copy into new worktrees before setup. New branches start at that
+base; selecting an existing branch preserves its history. An explicit remote
+base is fetched without changing the source checkout's branch.
+
+Enter one copy pattern per line: `.env*` matches at any depth,
+`apps/web/.env*` is relative to the repository root, and `!.env.example`
+excludes matches. A trailing `/` includes a directory's contents. Exclusions
+always win. Files, including ignored files, are copied from the source checkout;
+matching tracked files in the destination are replaced. Symlinks, paths outside
+the repository, and Git metadata are rejected. A copy failure stops setup.
+
+The importer reads Conductor's local database using `sqlite3` in read-only mode,
+then merges global settings, legacy repository settings, shared repository TOML,
+and local repository TOML in that order. Archive scripts, run scripts, prompts,
+environment settings, and agent preferences are not migrated. Review the preview
+warnings; absent copy patterns default to `.env*`. Saved projects can be edited
+before creating their first workspace with **Cmd+N**.
 
 ## AI prompt
 

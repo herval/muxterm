@@ -5,8 +5,8 @@ use muxterm::layout::{Dir, SplitAxis};
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
     NewTab,
-    /// cmd+n: open the workspace-creation popup (folder + worktree + prompt +
-    /// agent). cmd+t (NewTab) stays the shortcut for a bare shell workspace.
+    /// cmd+n: open the saved-project picker, or the folder form when no
+    /// projects are saved. cmd+t (NewTab) opens a bare shell workspace.
     NewWorkspace,
     /// cmd+shift+n: the same popup over a saved project (Settings >
     /// Projects) - worktree always on, repo projects cloned on first use.

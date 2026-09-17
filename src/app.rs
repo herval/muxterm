@@ -259,7 +259,7 @@ pub struct App {
     new_workspace: Option<NewWorkspaceForm>,
     /// Folder the creation popup pre-fills - the last one a workspace used.
     last_workspace_dir: Option<String>,
-    /// The saved project registry (Settings > Projects): what cmd+shift+n
+    /// The saved project registry (Settings > Projects): what cmd+n
     /// starts sessions from. Persisted in state.json.
     projects: Vec<workspace::Project>,
     /// The saved workspace-layout templates (Settings > Templates): the
@@ -1292,6 +1292,9 @@ impl App {
                 root.clone().expect("a clone implies a root"),
                 claim.expect("a clone always claims"),
                 form.branch.clone(),
+                form.selected_project()
+                    .map(workspace::ProjectOptions::from)
+                    .unwrap_or_default(),
                 self.worktree_tx.clone(),
                 ctx.clone(),
             );
@@ -1308,6 +1311,9 @@ impl App {
                 claim,
                 branch_choice,
                 !form.projects.is_empty(),
+                form.selected_project()
+                    .map(workspace::ProjectOptions::from)
+                    .unwrap_or_default(),
                 self.worktree_tx.clone(),
                 ctx.clone(),
             );
@@ -2909,11 +2915,14 @@ impl App {
                         .find(|a| a.id == self.agent.id)
                         .copied()
                         .unwrap_or(installed[0]);
-                    let mut form = NewWorkspaceForm::new(
-                        prefill,
-                        seed.id,
-                        workspace_popup::default_model(seed.id),
-                    );
+                    let model = workspace_popup::default_model(seed.id);
+                    let mut form = if self.projects.is_empty() {
+                        NewWorkspaceForm::new(prefill, seed.id, model)
+                    } else {
+                        NewWorkspaceForm::for_project(
+                            self.projects.clone(), seed.id, model,
+                        )
+                    };
                     form.templates = self.templates.clone();
                     self.new_workspace = Some(form);
                 }
@@ -4457,6 +4466,12 @@ impl App {
             &self.automations,
             &mut self.automation_draft,
         );
+        for project in out.import_projects {
+            if !crate::conductor_import::duplicate(&project, &self.projects) {
+                self.projects.push(project);
+                self.dirty = true;
+            }
+        }
         if let Some(p) = out.add_project {
             // Upsert by name: `[ add ]` with a saved project's name is the
             // edit path (rows load themselves into the draft).

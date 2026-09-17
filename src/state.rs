@@ -138,6 +138,12 @@ pub struct WorktreeState {
 /// first pane.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProjectState {
+    /// Base ref for new branches; existing branches retain their history.
+    #[serde(default)]
+    pub default_branch: Option<String>,
+    /// Repository-relative file globs copied before setup; ! excludes.
+    #[serde(default)]
+    pub copy_files: Vec<String>,
     pub name: String,
     #[serde(default)]
     pub path: Option<PathBuf>,
@@ -444,6 +450,8 @@ mod tests {
             workspaces_collapsed: true,
             projects: vec![
                 ProjectState {
+                    default_branch: Some("origin/prod".into()),
+                    copy_files: vec![".env*".into(), "!.env.example".into()],
                     name: "muxterm".into(),
                     path: Some("/tmp/proj".into()),
                     repo: None,
@@ -451,6 +459,8 @@ mod tests {
                     subdir: None,
                 },
                 ProjectState {
+                    default_branch: None,
+                    copy_files: Vec::new(),
                     name: "dotfiles/nvim".into(),
                     path: None,
                     repo: Some("herval/dotfiles".into()),
@@ -555,6 +565,13 @@ mod tests {
         assert_eq!(ws.worktree.as_ref().unwrap().branch, "wire-up-auth");
         assert_eq!(ws.setup.as_deref(), Some("direnv allow"));
         assert_eq!(back.projects.len(), 2);
+        assert_eq!(back.projects[0].default_branch.as_deref(), Some("origin/prod"));
+        assert_eq!(back.projects[0].copy_files, vec![".env*", "!.env.example"]);
+        let legacy: ProjectState = serde_json::from_str(
+            r#"{"name":"old","path":"/tmp/old"}"#,
+        ).unwrap();
+        assert!(legacy.default_branch.is_none());
+        assert!(legacy.copy_files.is_empty());
         assert_eq!(back.projects[0].path.as_deref(), Some(Path::new("/tmp/proj")));
         assert_eq!(back.projects[1].repo.as_deref(), Some("herval/dotfiles"));
         assert_eq!(back.projects[1].subdir.as_deref(), Some("nvim"));
