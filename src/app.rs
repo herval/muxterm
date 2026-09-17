@@ -4883,19 +4883,11 @@ impl eframe::App for App {
                 .filter(|(_, tab)| in_workspace_list(&tab.workspace))
                 .map(|(i, tab)| {
                     let ws = &tab.workspace;
-                    let subtitle = ws
-                        .worktree
-                        .as_ref()
-                        .map(|w| w.branch.clone())
-                        .or_else(|| {
-                            ws.root.as_ref().and_then(|r| {
-                                r.file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                            })
-                        })
-                        // Don't echo a title that already is the folder name
-                        // (a rename can make them coincide).
-                        .filter(|s| *s != ws.title);
+                    let cwd = tab.panes
+                        .get(&tab.focused)
+                        .and_then(|p| self.pane_snap.get(&p.session))
+                        .and_then(|p| p.cwd.as_deref());
+                    let (subtitle, location) = ws.sidebar_reference(cwd);
                     // The dot is *AI-agent-first*, self-reported through the
                     // lifecycle hooks (`mux agent-event`, see agent_hooks.rs):
                     // "working" while a turn runs (even silent thinking),
@@ -4951,6 +4943,7 @@ impl eframe::App for App {
                         tab_id: tab.tab_id.clone(),
                         title,
                         subtitle,
+                        location,
                         active: i == self.active,
                         status,
                         archived: ws.is_archived(),
@@ -5263,11 +5256,15 @@ impl eframe::App for App {
                                 self.agents.get(&pane.session),
                                 &pane.name,
                             );
+                            let cwd = self.pane_snap.get(&pane.session)
+                                .and_then(|p| p.cwd.as_deref());
+                            let project = tab.workspace.project_name(cwd);
                             if let Some(key) = draw_pane_title(
                                 ui,
                                 *rect,
                                 &label,
                                 self.git.get(&pane.session),
+                                project.as_deref(),
                                 // The badge map also feeds pr_detector, so
                                 // chips gate on their own config here.
                                 if self.pr_status {
@@ -5772,6 +5769,7 @@ fn draw_pane_title(
     pane_rect: Rect,
     label: &str,
     git: Option<&git_status::Git>,
+    project: Option<&str>,
     pr: &[pr_status::Badge],
     cwd: Option<&Path>,
     pane: PaneId,
@@ -5957,7 +5955,7 @@ fn draw_pane_title(
     }
 
     if let Some(g) = git {
-        let galley = ui.fonts(|f| f.layout_job(g.chip_job(font, color, &hud)));
+        let galley = ui.fonts(|f| f.layout_job(g.chip_job(font, color, &hud, project)));
         let chip = chip_rect(galley.size(), edge);
         if fits(&chip) {
             if let Some(fill) = hud.chip_fill {
@@ -6713,6 +6711,7 @@ mod tests {
                         ),
                         label,
                         None,
+                        None,
                         &badges,
                         None,
                         PaneId(1),
@@ -7196,6 +7195,7 @@ mod tests {
                     ui,
                     pane,
                     "agent-pane",
+                    None,
                     None,
                     &badges,
                     None,
