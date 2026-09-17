@@ -108,6 +108,10 @@ copy_on_select = false
 # terminal), and "top" or "bottom".
 # bar_style = "chips"
 # bar_position = "top"
+# The bar can also carry the pane's working directory as a chip (click
+# opens it in Finder); iterm-light turns it on, the other themes leave it
+# off.
+# bar_cwd = true
 # The status line uses the theme's own font at a size the theme picked;
 # override the face and/or size here, independently of [font] below (same
 # name-or-path rule as [font] family).
@@ -186,6 +190,9 @@ pub struct ConfigFile {
     pub bar_position: Option<String>,
     /// Pane HUD style: "chips" | "solid"; unset keeps the theme's choice.
     pub bar_style: Option<String>,
+    /// The pane's working directory as a chip on the HUD (click opens it
+    /// in Finder); unset keeps the theme's choice.
+    pub bar_cwd: Option<bool>,
     /// Status-line font face, independent of the terminal `[font]`; unset
     /// keeps the theme's own face. A name or path, resolved like `[font]`.
     pub bar_font: Option<String>,
@@ -216,6 +223,7 @@ impl Default for ConfigFile {
             restore_agents: true,
             bar_position: None,
             bar_style: None,
+            bar_cwd: None,
             bar_font: None,
             bar_font_size: None,
             font: FontConfig::default(),
@@ -324,6 +332,11 @@ pub fn resolve(
         Some(other) => log::warn!(
             "config: bar_style must be \"chips\" or \"solid\", got {other:?}"
         ),
+    }
+    // A bool can't be half-valid: toml refuses `bar_cwd = "yes"` at parse
+    // time, so there is no junk arm to warn from.
+    if let Some(cwd) = cfg.bar_cwd {
+        ui.bar_cwd = cwd;
     }
 
     let agent = agent::by_id(&cfg.agent).unwrap_or_else(|| {
@@ -828,6 +841,7 @@ mod tests {
         assert_eq!(cfg.font.family, None);
         assert_eq!(cfg.bar_position, None);
         assert_eq!(cfg.bar_style, None);
+        assert_eq!(cfg.bar_cwd, None);
         assert_eq!(cfg.bar_font, None);
         assert_eq!(cfg.bar_font_size, None);
     }
@@ -904,6 +918,30 @@ mod tests {
         let (style, _, _) = resolve(&cfg);
         assert_eq!(style.ui.bar_style, theme::BarStyle::Chips);
         assert_eq!(style.ui.bar_edge, theme::BarEdge::Top);
+    }
+
+    #[test]
+    fn bar_cwd_overrides_the_theme_either_way() {
+        // Unset keeps each theme's own choice: only iterm-light wears it.
+        let (style, _, _) = resolve(&ConfigFile::default());
+        assert!(!style.ui.bar_cwd);
+        let light = ConfigFile {
+            theme: "iterm-light".into(),
+            ..ConfigFile::default()
+        };
+        let (style, _, _) = resolve(&light);
+        assert!(style.ui.bar_cwd);
+
+        // Set, it wins on any theme, in both directions.
+        let cfg = ConfigFile { bar_cwd: Some(true), ..ConfigFile::default() };
+        let (style, _, _) = resolve(&cfg);
+        assert!(style.ui.bar_cwd);
+        let cfg = ConfigFile { bar_cwd: Some(false), ..light };
+        let (style, _, _) = resolve(&cfg);
+        assert!(!style.ui.bar_cwd);
+
+        // Junk is a parse error for the whole file, not a silent default.
+        assert!(toml::from_str::<ConfigFile>("bar_cwd = \"yes\"").is_err());
     }
 
     #[test]

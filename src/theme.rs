@@ -20,6 +20,8 @@ pub struct UiTheme {
     pub bar_style: BarStyle,
     /// Pane edge the title badge, status chips, and search bar sit on.
     pub bar_edge: BarEdge,
+    /// The pane's cwd as a chip (theme default; `bar_cwd` overrides).
+    pub bar_cwd: bool,
     /// Solid-strip fill. In chips mode this equals `bg` unless overridden;
     /// chips apply their own translucency at paint time, keeping the old
     /// pixels.
@@ -101,6 +103,11 @@ pub struct BarSpec {
     /// bitmap face like Px437 VGA is only crisp at even multiples of its
     /// native grid, so the strip themes carry a size the face was cut for.
     pub font_size: f32,
+    /// Show the pane's working directory as a chip beside the title; a
+    /// click opens the folder in Finder. Off for every theme but
+    /// iterm-light, where a light pane reads more like a Finder window
+    /// than a console.
+    pub cwd: bool,
 }
 
 /// The all-derived floating-chips bar, the look every theme wore before
@@ -112,7 +119,11 @@ const CHIPS: BarSpec = BarSpec {
     fg: None,
     accent: None,
     font_size: 11.0,
+    cwd: false,
 };
+
+/// The chips bar plus the cwd chip - iterm-light's.
+const CHIPS_WITH_CWD: BarSpec = BarSpec { cwd: true, ..CHIPS };
 
 pub struct Preset {
     pub bg: &'static str,
@@ -199,6 +210,7 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 // Native VGA size: 2x the 8x16 bitmap on a 2x display, so
                 // the strip's glyphs stay as crisp as the terminal grid's.
                 font_size: 16.0,
+                cwd: false,
             },
         }),
         // The amber-phosphor monochrome monitor — bbs's sibling. Where bbs
@@ -241,6 +253,7 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 fg: Some("#17120a"),
                 accent: Some("#fff2dc"),
                 font_size: 16.0,
+                cwd: false,
             },
         }),
         "iterm-light" => Some(&Preset {
@@ -255,7 +268,7 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
             ],
             font: MONACO,
             border_width: 1.0,
-            bar: CHIPS,
+            bar: CHIPS_WITH_CWD,
         }),
         "github-light" => Some(&Preset {
             bg: "#ffffff",
@@ -287,6 +300,7 @@ pub fn preset(name: &str) -> Option<&'static Preset> {
                 fg: Some("#ffffff"),
                 accent: Some("#9ecbff"),
                 font_size: 11.0,
+                cwd: false,
             },
         }),
         _ => None,
@@ -465,6 +479,7 @@ pub fn build(
         border_width: preset.border_width,
         bar_style: spec.style,
         bar_edge: spec.edge,
+        bar_cwd: spec.cwd,
         bar_bg,
         bar_fg,
         bar_fg_dim,
@@ -630,6 +645,7 @@ mod tests {
         assert_eq!(ui.border_width, 1.0);
         assert_eq!(ui.bar_style, BarStyle::Chips);
         assert_eq!(ui.bar_edge, BarEdge::Top);
+        assert!(!ui.bar_cwd);
         // The chips pixel contract: a derived bar IS the chrome, so the
         // unified paint path reproduces the old look byte-for-byte.
         assert_eq!(ui.bar_bg, ui.bg);
@@ -643,6 +659,7 @@ mod tests {
         assert_eq!(ui.bar_bg, Color32::from_rgb(0x00, 0xaa, 0x00));
         assert_eq!(ui.bar_fg, Color32::from_rgb(0x00, 0x00, 0x00));
         assert_eq!(ui.bar_fg_dim, blend(ui.bar_fg, ui.bar_bg, 0.45));
+        assert!(!ui.bar_cwd);
         // Amber wears bbs's inverse-video solid strip, in its own amber.
         let (_, ui) = build(preset("amber").unwrap(), &HashMap::new(), 0.25);
         assert_eq!(ui.border_width, 2.0);
@@ -654,6 +671,14 @@ mod tests {
             build(preset("github-light").unwrap(), &HashMap::new(), 0.25);
         assert_eq!(ui.bar_style, BarStyle::Solid);
         assert_eq!(ui.bar_edge, BarEdge::Bottom);
+        assert!(!ui.bar_cwd);
+        // The one theme that wears the cwd chip; everything else the same
+        // floating chips as iterm-dark.
+        let (_, ui) =
+            build(preset("iterm-light").unwrap(), &HashMap::new(), 0.25);
+        assert_eq!(ui.bar_style, BarStyle::Chips);
+        assert_eq!(ui.bar_edge, BarEdge::Top);
+        assert!(ui.bar_cwd);
     }
 
     #[test]

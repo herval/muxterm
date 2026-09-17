@@ -52,6 +52,17 @@ pub fn spawn_open(
     });
 }
 
+/// Opens a folder in Finder (the HUD's cwd chip), off the render thread
+/// like `spawn_open` since `open` can take tens of ms. Plain `open <dir>`
+/// shows the folder's contents; `-R` would reveal it inside its parent
+/// instead. The dir is tmux's `pane_current_path`, always absolute, so it
+/// can't be mistaken for an `open` flag.
+pub fn spawn_open_dir(dir: PathBuf) {
+    std::thread::spawn(move || {
+        let _ = Command::new("/usr/bin/open").arg(&dir).status();
+    });
+}
+
 /// What `open` would be handed for this candidate, or None when the
 /// candidate means nothing: a known PR number first (egui_term P24 only
 /// emits `#N` for one), then a URL as-is, then a path that exists.

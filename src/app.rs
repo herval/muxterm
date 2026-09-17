@@ -5277,6 +5277,16 @@ impl eframe::App for App {
                                 } else {
                                     &[]
                                 },
+                                // The cwd chip is a theme trait; the
+                                // snapshot is the same once-a-second one
+                                // the link hover reads.
+                                if self.ui_theme.bar_cwd {
+                                    self.pane_snap
+                                        .get(&pane.session)
+                                        .and_then(|s| s.cwd.as_deref())
+                                } else {
+                                    None
+                                },
                                 *id,
                                 *id == tab.focused,
                                 &self.ui_theme,
@@ -5750,8 +5760,10 @@ fn draw_search_bar(
 
 /// One pane's HUD line: the title badge (split tabs only - `label`
 /// arrives empty on a lone pane, which gets chips without a title) and
-/// the PR/git chips beside it, floating in a corner or laid on the solid
-/// strip (`bar_h` set when the strip reserved layout space this frame).
+/// the cwd/PR/git chips beside it, floating in a corner or laid on the
+/// solid strip (`bar_h` set when the strip reserved layout space this
+/// frame). `cwd` is Some only when the theme wears the cwd chip (the
+/// caller gates on `UiTheme::bar_cwd`, as it does `pr` on `pr_status`).
 /// Returns the (root, branch) of a PR chip right-clicked away, for the
 /// App to dismiss (a free function cannot reach the poller's shared set).
 #[allow(clippy::too_many_arguments)]
@@ -5761,6 +5773,7 @@ fn draw_pane_title(
     label: &str,
     git: Option<&git_status::Git>,
     pr: &[pr_status::Badge],
+    cwd: Option<&Path>,
     pane: PaneId,
     focused: bool,
     theme: &UiTheme,
@@ -5838,6 +5851,55 @@ fn draw_pane_title(
         chip.min.x >= pane_rect.min.x + 4.0
             && chip.max.x <= pane_rect.max.x - 4.0
     };
+
+    // The cwd chip sits nearest the title: it is the pane's own identity
+    // like the name, where PR and git are derived from it and read further
+    // out - and since overflow drops the outermost chips, a narrow pane
+    // sheds those before the folder. Capped like the title so a deep path
+    // can't starve the rest of the run, elided from the *front* because
+    // a path's tail is the part that says where you are; too short to
+    // say anything and it is dropped rather than shown as a lone "…".
+    if let Some(dir) = cwd {
+        let label = cwd_label(dir, dirs::home_dir().as_deref());
+        let full = painter.layout_no_wrap(label.clone(), font.clone(), color);
+        let galley = if full.size().x <= max_w {
+            Some(full)
+        } else {
+            let char_w = full.size().x / label.chars().count().max(1) as f32;
+            let budget = (max_w / char_w) as usize;
+            (budget >= 3).then(|| {
+                painter.layout_no_wrap(
+                    elide_tail(&label, budget),
+                    font.clone(),
+                    color,
+                )
+            })
+        };
+        if let Some(galley) = galley {
+            let chip = chip_rect(galley.size(), edge);
+            if fits(&chip) {
+                if let Some(fill) = hud.chip_fill {
+                    painter.rect_filled(chip, CornerRadius::same(3), fill);
+                }
+                painter.galley(chip.min + pad, galley, color);
+                let resp = ui
+                    .interact(
+                        chip,
+                        ui.id().with(("cwd-chip", pane)),
+                        Sense::click(),
+                    )
+                    .on_hover_text(format!(
+                        "{}\nclick to open in Finder",
+                        dir.display()
+                    ))
+                    .on_hover_cursor(CursorIcon::PointingHand);
+                if resp.clicked() {
+                    crate::links::spawn_open_dir(dir.to_path_buf());
+                }
+                edge = chip.min.x;
+            }
+        }
+    }
 
     let mut dismissed = None;
     // Newest PR nearest the title, so on overflow the oldest drop first
@@ -5921,6 +5983,31 @@ fn elide(label: &str, budget: usize) -> String {
     let mut out: String = label.chars().take(budget - 1).collect();
     out.push('…');
     out
+}
+
+/// `elide`'s mirror for paths, whose tail is the part worth keeping:
+/// "…/muxterm/src" rather than "~/dev/mux…".
+fn elide_tail(label: &str, budget: usize) -> String {
+    let len = label.chars().count();
+    if len <= budget {
+        return label.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let mut out = String::from("…");
+    out.extend(label.chars().skip(len + 1 - budget));
+    out
+}
+
+/// The cwd chip's text: `~` for the home dir itself, `~/rest` under it,
+/// the path as-is anywhere else.
+fn cwd_label(cwd: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| cwd.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => cwd.display().to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6627,6 +6714,7 @@ mod tests {
                         label,
                         None,
                         &badges,
+                        None,
                         PaneId(1),
                         true,
                         &th,
@@ -6657,6 +6745,105 @@ mod tests {
                 "title box wrong for label {label:?}: {texts:?}"
             );
         }
+    }
+
+    #[test]
+    fn pane_hud_shows_cwd_chip_only_when_given() {
+        let ctx = egui::Context::default();
+        config::install_fonts(&ctx, None, None);
+        let preset = theme::preset("iterm-light").unwrap();
+        let (_, th) = theme::build(preset, &HashMap::new(), 0.12);
+        let badges = vec![pr_status::Badge {
+            number: 9,
+            url: "https://github.com/a/b/pull/9".into(),
+            title: "pr 9".into(),
+            kind: pr_status::Kind::Ok,
+            detail: "#9".into(),
+            root: "/repo".into(),
+            branch: "feat-9".into(),
+            live: false,
+        }];
+        fn collect(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            if let egui::Shape::Vec(v) = shape {
+                for s in v {
+                    collect(s, out);
+                }
+            } else {
+                out.push(shape.clone());
+            }
+        }
+        // A non-home path, so the label doesn't depend on $HOME.
+        for cwd in [Some(Path::new("/tmp/proj")), None] {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(900.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_pane_title(
+                        ui,
+                        Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(880.0, 680.0),
+                        ),
+                        "agent-pane",
+                        None,
+                        &badges,
+                        cwd,
+                        PaneId(1),
+                        true,
+                        &th,
+                        None,
+                    );
+                });
+            });
+            let mut shapes = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut shapes);
+            }
+            let texts: Vec<String> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                texts.iter().any(|t| t == "/tmp/proj"),
+                cwd.is_some(),
+                "cwd chip wrong for {cwd:?}: {texts:?}"
+            );
+            // The PR chip still lands beyond it either way.
+            assert!(texts.iter().any(|t| t == "#9"), "{texts:?}");
+        }
+    }
+
+    #[test]
+    fn cwd_label_abbreviates_home() {
+        let home = Path::new("/Users/me");
+        assert_eq!(cwd_label(Path::new("/Users/me"), Some(home)), "~");
+        assert_eq!(
+            cwd_label(Path::new("/Users/me/dev/x"), Some(home)),
+            "~/dev/x"
+        );
+        assert_eq!(cwd_label(Path::new("/tmp/x"), Some(home)), "/tmp/x");
+        assert_eq!(cwd_label(Path::new("/Users/me/dev"), None), "/Users/me/dev");
+        // A sibling that merely shares the prefix string is not under home.
+        assert_eq!(
+            cwd_label(Path::new("/Users/meow"), Some(home)),
+            "/Users/meow"
+        );
+    }
+
+    #[test]
+    fn elide_tail_keeps_the_tail() {
+        assert_eq!(elide_tail("~/dev/x", 10), "~/dev/x");
+        assert_eq!(elide_tail("~/dev/muxterm/src", 8), "…erm/src");
+        assert_eq!(elide_tail("abcdef", 1), "…");
+        assert_eq!(elide_tail("abcdef", 0), "");
     }
 
     #[test]
@@ -7011,6 +7198,7 @@ mod tests {
                     "agent-pane",
                     None,
                     &badges,
+                    None,
                     PaneId(1),
                     true,
                     &th,

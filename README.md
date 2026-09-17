@@ -156,6 +156,8 @@ pr_status = true            # the branch's GitHub PR beside the tab title
 bar_font = "Menlo"          # the status line (pane title + chips + search
 bar_font_size = 12.0        # hints); defaults to the theme's own font at a
                             # size the theme picked, independent of [font]
+bar_cwd = true              # the pane's folder as a chip beside the title
+                            # (click opens it in Finder); on for iterm-light
 
 [font]                 # overrides the theme's font for every theme
 family = "Menlo"       # font name in the macOS font folders, or a file path
