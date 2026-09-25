@@ -23,6 +23,7 @@ use crate::attention;
 use crate::automation_view;
 use crate::bg_jobs;
 use muxterm::automation;
+use muxterm::history;
 use crate::config;
 use crate::keys::{self, Action};
 use muxterm::layout::{self, Node, PaneId, Removal, SplitAxis};
@@ -41,7 +42,7 @@ use crate::switcher::{self, Switcher};
 use muxterm::state::{self, LoadResult, NodeState, StateFile, TabState, WindowState};
 use crate::tabbar::{self, TabBarAction};
 use crate::theme::{self, UiTheme};
-use crate::tmux::{self, TmuxCtl};
+use crate::tmux::{self, ServerProbe, TmuxCtl};
 use crate::workspace::{self, BranchChoice, Landing, Workspace};
 use crate::workspace_popup::{self, NewWorkspaceForm};
 
@@ -64,6 +65,24 @@ const STALE_ATTENTION_GRACE: u64 = 30;
 /// lands on the first poll tick; without this grace, that settling window
 /// could be misread as "every pane left the worktree" and drop the link.
 const WORKSPACE_SYNC_GRACE: Duration = Duration::from_secs(5);
+/// How long a freshly spawned pane's recorded agent survives a shell
+/// sighting (`Pane.spawned`): long enough for a typed `--resume` to start.
+const AGENT_CLEAR_GRACE: Duration = Duration::from_secs(15);
+/// A pane exit is held this long before it is judged (`settle_exits`): a
+/// dying tmux server shuts its sessions down while its clients exit, so a
+/// probe fired the instant a client exits can still see a server "alive
+/// with the session gone" - the shape of an ordinary shell exit.
+const EXIT_SETTLE: Duration = Duration::from_millis(400);
+/// At most one exit probe per this interval (an inconclusive probe retries).
+const EXIT_PROBE_EVERY: Duration = Duration::from_millis(500);
+/// A second server loss this soon after recovering from one is not
+/// recovered again: whatever kills the server would just kill the fresh one
+/// too, in a loop. The panes are left as they are instead - never closed.
+const RECOVERY_COOLDOWN: Duration = Duration::from_secs(20);
+/// A pane whose tmux client keeps exiting while its session lives (a client
+/// the server refuses, e.g. after a tmux upgrade) is reattached at most this
+/// many times per RECOVERY_COOLDOWN, then left alone.
+const MAX_REATTACHES: u32 = 3;
 
 /// How long after firing an automation a second attempt is ignored. Covers
 /// the gap between typing `mux automations exec` and the run record landing
@@ -356,6 +375,19 @@ pub struct App {
     /// Instant the workspace-root sync may start retargeting (launch +
     /// `WORKSPACE_SYNC_GRACE`), so the post-reboot cwd settling isn't misread.
     workspace_sync_after: Instant,
+    /// Panes whose tmux client exited, by backend id, with when - held for
+    /// `settle_exits` to judge (shell exit, dead server, or dropped client)
+    /// instead of closing on the spot.
+    exited: Vec<(u64, Instant)>,
+    /// Earliest instant `settle_exits` may probe the server again.
+    next_exit_probe: Instant,
+    /// When the app last recovered from a dead tmux server (the loop guard).
+    last_recovery: Option<Instant>,
+    /// Reattaches per session inside the current window (the other loop
+    /// guard): session -> (count, window start).
+    reattaches: HashMap<String, (u32, Instant)>,
+    /// When to snapshot the layout into `~/.muxterm/history/`.
+    journal: history::Journal,
 }
 
 impl App {
@@ -531,6 +563,11 @@ impl App {
             scrollback_enabled,
             startup_live: HashSet::new(),
             workspace_sync_after: Instant::now() + WORKSPACE_SYNC_GRACE,
+            exited: Vec::new(),
+            next_exit_probe: Instant::now(),
+            last_recovery: None,
+            reattaches: HashMap::new(),
+            journal: history::Journal::default(),
         };
 
         // Wire the agents' lifecycle hooks to `mux agent-event` (the sidebar
@@ -568,6 +605,16 @@ impl App {
                 for window in &saved.windows {
                     for tab in &window.tabs {
                         tab.tree.sessions(&mut referenced);
+                    }
+                }
+                // Keep what this launch loaded before anything can overwrite
+                // it: a restore that goes wrong must not take the last good
+                // layout with it (`mux history`).
+                let shape = history::Shape::of(&saved);
+                if !shape.is_empty() {
+                    match history::write_snapshot(&saved, "launch") {
+                        Ok(_) => app.journal.wrote(shape, mesh::now()),
+                        Err(e) => log::error!("history snapshot failed: {e:#}"),
                     }
                 }
                 // Sessions the socket still holds. A referenced session missing
@@ -692,6 +739,7 @@ impl App {
         // run, so the "?" prompt stays inert there until the first Enter.
         let restored = session.is_some();
         let session = session.unwrap_or_else(TmuxCtl::new_session_name);
+        let seed_cwd = start_dir.as_ref().map(PathBuf::from);
         let mut backend = TerminalBackend::new(
             id.0,
             ctx.clone(),
@@ -755,6 +803,9 @@ impl App {
             },
             attn: attention::Cell::new(Instant::now()),
             copy_sel: false,
+            cwd: seed_cwd,
+            agent: None,
+            spawned: Instant::now(),
         })
     }
 
@@ -1741,7 +1792,12 @@ impl App {
             recovery_dir: &Option<String>,
         ) -> anyhow::Result<Node> {
             match node {
-                NodeState::Leaf { session, cwd, name } => {
+                NodeState::Leaf {
+                    session,
+                    cwd,
+                    name,
+                    agent,
+                } => {
                     // Reboot recovery (Layer 1): a leaf whose session the
                     // socket no longer holds is being created fresh (the
                     // server died), so seed it in its saved cwd. `-c` is
@@ -1752,7 +1808,8 @@ impl App {
                     let start_dir = if app.session_recovery
                         && !app.startup_live.contains(&session)
                     {
-                        cwd.filter(|d| d.is_dir())
+                        cwd.as_ref()
+                            .filter(|d| d.is_dir())
                             .map(|d| d.display().to_string())
                             .or_else(|| recovery_dir.clone())
                     } else {
@@ -1765,6 +1822,11 @@ impl App {
                     if !name.is_empty() {
                         pane.name = name;
                     }
+                    // What the pane last knew, warm or cold: persisted as-is
+                    // until the poll tick observes something newer, so a save
+                    // before the first tick can't blank it.
+                    pane.cwd = cwd;
+                    pane.agent = agent;
                     let id = pane.id;
                     panes.insert(id, pane);
                     Ok(Node::Leaf(id))
@@ -1819,7 +1881,6 @@ impl App {
             .unwrap_or_else(|| Workspace::bare(None));
         // Panes created fresh from a dead server (Layer 2/3 recovery targets):
         // captured before the push so the borrow is clean, replayed after.
-        let first_leaf = tree.first_leaf();
         let cold: Vec<(PaneId, String)> = if self.session_recovery {
             panes
                 .iter()
@@ -1839,25 +1900,89 @@ impl App {
             workspace,
         });
         // Recovery runs after the tab exists: the typed input rides the same
-        // BackendCommand::Write path as `launch_agent`. Scrollback first (it
-        // reprints above the prompt), then the agent relaunch, so an agent
-        // pane runs `cat` and then its CLI in order.
-        if !cold.is_empty() {
-            if self.restore_scrollback {
-                for (pane_id, session) in &cold {
-                    self.replay_scrollback(&tab_id, *pane_id, session);
-                }
-            }
-            // Relaunch the agent only when its own (first) pane came back cold
-            // and the workspace had an agent (`relaunch_agent_for_recovery`
-            // no-ops otherwise).
-            if self.restore_agents
-                && cold.iter().any(|(id, _)| *id == first_leaf)
-            {
-                self.relaunch_agent_for_recovery(&tab_id);
+        // BackendCommand::Write path as `launch_agent`.
+        self.recover_cold_panes(&tab_id, &cold);
+        Ok(())
+    }
+
+    /// Bring back what a pane's dead session held, for panes just created
+    /// fresh under a saved name (reboot restore, a tmux server that died
+    /// under the running app, `mux history restore`). Scrollback first (it
+    /// reprints above the prompt), then the agent, so a pane runs `cat` and
+    /// then its CLI in order. Every pane that was running an agent
+    /// conversation resumes *that conversation* (`resume_agent_in_pane`);
+    /// the workspace's first pane falls back to a bare relaunch of the
+    /// workspace agent (`relaunch_agent_for_recovery`) when no conversation
+    /// was recorded for it.
+    fn recover_cold_panes(&mut self, tab_id: &str, cold: &[(PaneId, String)]) {
+        if cold.is_empty() {
+            return;
+        }
+        if self.restore_scrollback {
+            for (pane_id, session) in cold {
+                self.replay_scrollback(tab_id, *pane_id, session);
             }
         }
-        Ok(())
+        if !self.restore_agents {
+            return;
+        }
+        let Some(first_leaf) = self
+            .tabs
+            .iter()
+            .find(|t| t.tab_id == tab_id)
+            .map(|t| t.tree.first_leaf())
+        else {
+            return;
+        };
+        let mut first_resumed = false;
+        for (pane_id, _) in cold {
+            if self.resume_agent_in_pane(tab_id, *pane_id) && *pane_id == first_leaf {
+                first_resumed = true;
+            }
+        }
+        if !first_resumed && cold.iter().any(|(id, _)| *id == first_leaf) {
+            self.relaunch_agent_for_recovery(tab_id);
+        }
+    }
+
+    /// Recovery (Layer 3, precise): type `<cli> --resume <id>` into a pane
+    /// whose recorded agent conversation (`Pane.agent`, from the hooks) died
+    /// with its session - after a `cd` into the directory the CLI ran in when
+    /// that differs from the pane's, since the CLI's session store is keyed by
+    /// it. Unlike a fresh launch this re-sends nothing: the conversation
+    /// continues where it stopped, waiting for the user. False when there is
+    /// no conversation to resume (then the caller may fall back).
+    fn resume_agent_in_pane(&mut self, tab_id: &str, pane_id: PaneId) -> bool {
+        let Some(pane) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.tab_id == tab_id)
+            .and_then(|t| t.panes.get_mut(&pane_id))
+        else {
+            return false;
+        };
+        let Some(r) = pane.agent.clone() else {
+            return false;
+        };
+        let Some(cmd) = agent::by_id(&r.agent)
+            .and_then(|a| agent::resume_session_command(a, &r.session))
+        else {
+            return false;
+        };
+        let mut lines = Vec::new();
+        if let Some(dir) = r.cwd.as_ref().filter(|d| d.is_dir()) {
+            if pane.cwd.as_ref() != Some(dir) {
+                lines.push(format!(
+                    " cd {}",
+                    agent::shell_quote(&dir.display().to_string())
+                ));
+            }
+        }
+        lines.push(cmd);
+        let mut bytes = lines.join("\r").into_bytes();
+        bytes.push(b'\r');
+        pane.backend.process_command(BackendCommand::Write(bytes));
+        true
     }
 
     /// Reboot recovery (Layer 2): if a cold pane's pre-reboot scrollback was
@@ -1875,8 +2000,7 @@ impl App {
         let Some(file) = scrollback::recovered_file(session) else {
             return;
         };
-        let banner =
-            "──── muxterm: restored scrollback (before reboot) ────";
+        let banner = "──── muxterm: restored scrollback ────";
         let lines = vec![
             format!(
                 " printf '\\033[2m%s\\033[0m\\n' {}",
@@ -2217,6 +2341,98 @@ impl App {
         });
         self.dirty = true;
         Ok(())
+    }
+
+    /// `mux history restore` requests: reopen tabs from a history snapshot.
+    fn drain_history_requests(&mut self, ctx: &egui::Context) {
+        for req in history::take_restore_requests() {
+            let result = self.apply_history_restore(ctx, &req);
+            history::write_restore_result(&req.id, &result);
+        }
+    }
+
+    /// Reopen the requested tabs of a snapshot, in the background, through
+    /// the same `restore_tab` a launch uses: a session the socket still
+    /// holds reattaches as-is, a dead one is recreated cold - last cwd,
+    /// scrollback replayed (from the history archive), agent conversation
+    /// resumed. The spool is the trust boundary, so everything is re-checked
+    /// here: the snapshot is re-read by id, and a tab already open (by id) or
+    /// holding a session an open pane uses is skipped, never duplicated.
+    fn apply_history_restore(
+        &mut self,
+        ctx: &egui::Context,
+        req: &history::RestoreRequest,
+    ) -> history::RestoreResult {
+        let mut out = history::RestoreResult::default();
+        let refuse = |out: &mut history::RestoreResult, why: &str| {
+            for t in &req.tabs {
+                out.skipped.push((t.clone(), why.to_string()));
+            }
+        };
+        if req.v != 1 {
+            refuse(&mut out, "unsupported request version");
+            return out;
+        }
+        if mesh::now().saturating_sub(req.ts) > 60 {
+            refuse(&mut out, "request expired before muxterm saw it");
+            return out;
+        }
+        let snaps = history::list_snapshots();
+        let state = match snaps.iter().find(|s| s.id == req.snapshot) {
+            Some(snap) => match history::load(snap) {
+                Ok(state) => state,
+                Err(e) => {
+                    refuse(&mut out, &format!("unreadable snapshot: {e:#}"));
+                    return out;
+                },
+            },
+            None => {
+                refuse(&mut out, "no such snapshot");
+                return out;
+            },
+        };
+        let open_tabs: HashSet<String> =
+            self.tabs.iter().map(|t| t.tab_id.clone()).collect();
+        let open_sessions: HashSet<String> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.values().map(|p| p.session.clone()))
+            .collect();
+        // What `restore_tab` treats as warm.
+        self.startup_live = self.tmux.list_sessions().into_iter().collect();
+        let mut wanted: HashSet<&String> = req.tabs.iter().collect();
+        for tab in state.windows.into_iter().flat_map(|w| w.tabs) {
+            if !wanted.remove(&tab.id) {
+                continue;
+            }
+            let id = tab.id.clone();
+            let mut sessions = HashSet::new();
+            tab.tree.sessions(&mut sessions);
+            let why = if open_tabs.contains(&id) {
+                Some("already open")
+            } else if sessions.iter().any(|s| open_sessions.contains(s)) {
+                Some("one of its sessions is in an open pane")
+            } else if !sessions.iter().all(|s| s.starts_with(mesh::SESSION_PREFIX)) {
+                Some("not a muxterm session name")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                out.skipped.push((id, why.to_string()));
+                continue;
+            }
+            match self.restore_tab(ctx, tab) {
+                Ok(()) => out.restored.push(id),
+                Err(e) => out.skipped.push((id, format!("{e:#}"))),
+            }
+        }
+        for missing in wanted {
+            out.skipped.push((missing.clone(), "not in that snapshot".into()));
+        }
+        if !out.restored.is_empty() {
+            self.dirty = true;
+        }
+        out
     }
 
     // ---------------------------------------------------------- automations
@@ -2783,15 +2999,248 @@ impl App {
         }
     }
 
-    fn close_pane_by_backend(&mut self, ctx: &egui::Context, backend_id: u64) {
-        let target = self.tabs.iter().enumerate().find_map(|(i, tab)| {
+    /// (tab index, session) of the pane with this backend id.
+    fn locate_pane(&self, backend_id: u64) -> Option<(usize, String)> {
+        self.tabs.iter().enumerate().find_map(|(i, tab)| {
             tab.panes
-                .contains_key(&PaneId(backend_id))
-                .then_some((i, PaneId(backend_id)))
-        });
-        if let Some((tab_idx, pane_id)) = target {
-            self.close_pane(ctx, tab_idx, pane_id, false);
+                .get(&PaneId(backend_id))
+                .map(|p| (i, p.session.clone()))
+        })
+    }
+
+    /// A pane's tmux client exited. That alone doesn't say why - the shell
+    /// in it exited (close the pane), the whole tmux server died (every pane
+    /// exits at once; closing them all is how every workspace was once lost),
+    /// or just the client dropped (reattach). Held for `settle_exits` to tell
+    /// apart. A backend id already replaced by a respawn finds no pane and is
+    /// ignored, which is what makes late exits of a dead server's clients
+    /// harmless.
+    fn note_pane_exit(&mut self, ctx: &egui::Context, backend_id: u64) {
+        if self.locate_pane(backend_id).is_none()
+            || self.exited.iter().any(|(id, _)| *id == backend_id)
+        {
+            return;
         }
+        self.exited.push((backend_id, Instant::now()));
+        ctx.request_repaint_after(EXIT_SETTLE);
+    }
+
+    /// Judge the held pane exits once they've settled, with one server probe:
+    ///
+    /// - server `Dead` (only a death can leave it absent, given `exit-empty
+    ///   off`): recover every pane in place (`recover_from_server_loss`);
+    /// - `Alive` and the pane's session is gone: its shell exited - close the
+    ///   pane, as always;
+    /// - `Alive` and the session still there: only the client went away -
+    ///   reattach a fresh one (`respawn_pane`);
+    /// - `Unknown`: decide nothing and retry. A dead pane lingering is
+    ///   harmless; a wrong close cascade is not.
+    fn settle_exits(&mut self, ctx: &egui::Context) {
+        self.exited
+            .retain(|(id, _)| {
+                self.tabs.iter().any(|t| t.panes.contains_key(&PaneId(*id)))
+            });
+        let Some(oldest) = self.exited.iter().map(|(_, t)| *t).min() else {
+            return;
+        };
+        let now = Instant::now();
+        let wait = (oldest + EXIT_SETTLE)
+            .max(self.next_exit_probe)
+            .saturating_duration_since(now);
+        if !wait.is_zero() {
+            ctx.request_repaint_after(wait);
+            return;
+        }
+        self.next_exit_probe = now + EXIT_PROBE_EVERY;
+        let due: Vec<u64> = self
+            .exited
+            .iter()
+            .filter(|(_, t)| now.duration_since(*t) >= EXIT_SETTLE)
+            .map(|(id, _)| *id)
+            .collect();
+        match self.tmux.probe_server() {
+            ServerProbe::Dead => {
+                if !self.session_recovery {
+                    // Recovery switched off: the pre-recovery behavior.
+                    self.exited.clear();
+                    for id in due {
+                        self.close_exited(ctx, id);
+                    }
+                    return;
+                }
+                if self
+                    .last_recovery
+                    .is_some_and(|t| t.elapsed() < RECOVERY_COOLDOWN)
+                {
+                    log::error!(
+                        "tmux server died again within {RECOVERY_COOLDOWN:?} of a \
+                         recovery; leaving panes as they are"
+                    );
+                    self.exited.clear();
+                    attention::banner(
+                        "muxterm",
+                        "The tmux server keeps dying - panes were left as they \
+                         are. Relaunch muxterm to restore them.",
+                    );
+                    return;
+                }
+                self.recover_from_server_loss(ctx);
+            },
+            ServerProbe::Alive(live) => {
+                self.exited.retain(|(id, _)| !due.contains(id));
+                for id in due {
+                    let Some((tab_idx, session)) = self.locate_pane(id) else {
+                        continue;
+                    };
+                    if !live.contains(&session) {
+                        self.close_pane(ctx, tab_idx, PaneId(id), false);
+                        continue;
+                    }
+                    let n = {
+                        let e = self
+                            .reattaches
+                            .entry(session.clone())
+                            .or_insert((0, now));
+                        if now.duration_since(e.1) > RECOVERY_COOLDOWN {
+                            *e = (0, now);
+                        }
+                        e.0 += 1;
+                        e.0
+                    };
+                    if n > MAX_REATTACHES {
+                        log::error!(
+                            "{session}: tmux client keeps exiting while the \
+                             session lives; leaving the pane as it is"
+                        );
+                        continue;
+                    }
+                    log::warn!("{session}: tmux client exited, session alive; reattaching");
+                    if let Err(e) = self.respawn_pane(ctx, tab_idx, PaneId(id), false) {
+                        log::error!("{session}: reattach failed: {e:#}");
+                    }
+                }
+            },
+            ServerProbe::Unknown => {
+                log::warn!("tmux server probe inconclusive; holding pane exits");
+                ctx.request_repaint_after(EXIT_PROBE_EVERY);
+            },
+        }
+    }
+
+    fn close_exited(&mut self, ctx: &egui::Context, backend_id: u64) {
+        if let Some((tab_idx, _)) = self.locate_pane(backend_id) {
+            self.close_pane(ctx, tab_idx, PaneId(backend_id), false);
+        }
+    }
+
+    /// The tmux server died under the running app (crash, `kill-server`,
+    /// OOM): every pane's client exited at once. Do in place what a relaunch
+    /// after a reboot does - never close anything. Snapshot the layout into
+    /// history first, rotate the scrollback captures aside so the poller
+    /// can't overwrite them, then respawn every pane under its own session
+    /// name (the first `new-session` starts a fresh server): in its last
+    /// cwd, its scrollback replayed, its agent conversation resumed.
+    fn recover_from_server_loss(&mut self, ctx: &egui::Context) {
+        log::warn!("tmux server is gone; recovering every pane in place");
+        self.last_recovery = Some(Instant::now());
+        self.exited.clear();
+        let state = self.to_state();
+        match history::write_snapshot(&state, "server-lost") {
+            Ok(_) => self.journal.wrote(history::Shape::of(&state), mesh::now()),
+            Err(e) => log::error!("history snapshot failed: {e:#}"),
+        }
+        if self.restore_scrollback {
+            scrollback::rotate();
+        }
+        // Whatever the socket holds now (normally nothing) is warm; the rest
+        // is recreated cold.
+        let live: HashSet<String> =
+            self.tmux.list_sessions().into_iter().collect();
+        for tab_idx in 0..self.tabs.len() {
+            for pane_id in self.tabs[tab_idx].tree.leaves() {
+                let Some(session) = self.tabs[tab_idx]
+                    .panes
+                    .get(&pane_id)
+                    .map(|p| p.session.clone())
+                else {
+                    continue;
+                };
+                let cold = !live.contains(&session);
+                if let Err(e) = self.respawn_pane(ctx, tab_idx, pane_id, cold) {
+                    log::error!("{session}: respawn failed: {e:#}");
+                }
+            }
+        }
+        self.dirty = true;
+        if self.notifications {
+            attention::banner(
+                "muxterm",
+                "The tmux server died - every pane was restored in place.",
+            );
+        }
+    }
+
+    /// Give a pane a fresh tmux client under its own session name, keeping
+    /// its place in the layout, codename, and what it last knew (cwd,
+    /// agent). `cold`: the session is gone, so `new-session -A` recreates it
+    /// - seeded in the pane's last cwd (else the workspace's worktree/root),
+    /// then scrollback and agent are brought back (`recover_cold_panes`).
+    /// Warm, it just reattaches. The old backend is dropped; its late events
+    /// carry an id no pane has any more.
+    fn respawn_pane(
+        &mut self,
+        ctx: &egui::Context,
+        tab_idx: usize,
+        old: PaneId,
+        cold: bool,
+    ) -> anyhow::Result<PaneId> {
+        let tab = self
+            .tabs
+            .get(tab_idx)
+            .ok_or_else(|| anyhow::anyhow!("tab vanished"))?;
+        let prev = tab
+            .panes
+            .get(&old)
+            .ok_or_else(|| anyhow::anyhow!("pane vanished"))?;
+        let (session, name, cwd, agent) = (
+            prev.session.clone(),
+            prev.name.clone(),
+            prev.cwd.clone(),
+            prev.agent.clone(),
+        );
+        let start_dir = if cold {
+            cwd.as_ref()
+                .filter(|d| d.is_dir())
+                .or(tab
+                    .workspace
+                    .worktree
+                    .as_ref()
+                    .map(|w| &w.path)
+                    .filter(|d| d.is_dir()))
+                .or(tab.workspace.root.as_ref().filter(|d| d.is_dir()))
+                .map(|d| d.display().to_string())
+        } else {
+            None
+        };
+        let mut pane = self.create_pane(ctx, Some(session.clone()), start_dir)?;
+        pane.name = name;
+        pane.cwd = cwd;
+        pane.agent = agent;
+        let new = pane.id;
+        let tab = &mut self.tabs[tab_idx];
+        tab.panes.remove(&old);
+        tab.panes.insert(new, pane);
+        tab.tree.replace(old, new);
+        if tab.focused == old {
+            tab.focused = new;
+        }
+        tab.last_rects.remove(&old);
+        tab.last_term_rects.remove(&old);
+        let tab_id = tab.tab_id.clone();
+        if cold {
+            self.recover_cold_panes(&tab_id, &[(new, session)]);
+        }
+        Ok(new)
     }
 
     fn pane_mut(&mut self, backend_id: u64) -> Option<&mut Pane> {
@@ -2890,7 +3339,7 @@ impl App {
         while let Ok((backend_id, event)) = self.pty_rx.try_recv() {
             match event {
                 PtyEvent::Exit | PtyEvent::ChildExit(_) => {
-                    self.close_pane_by_backend(ctx, backend_id);
+                    self.note_pane_exit(ctx, backend_id);
                 },
                 PtyEvent::Title(title) => {
                     if let Some(pane) = self.pane_mut(backend_id) {
@@ -3129,31 +3578,22 @@ impl App {
     }
 
     fn to_state(&self) -> StateFile {
-        fn node_state(
-            node: &Node,
-            panes: &HashMap<PaneId, Pane>,
-            snap: &HashMap<String, tmux::PaneSnap>,
-        ) -> NodeState {
+        fn node_state(node: &Node, panes: &HashMap<PaneId, Pane>) -> NodeState {
             match node {
                 Node::Leaf(id) => {
-                    let session = panes
-                        .get(id)
-                        .map(|p| p.session.clone())
-                        .unwrap_or_default();
+                    let pane = panes.get(id);
                     NodeState::Leaf {
-                        // Persist the pane's last-known cwd (the poll tick
-                        // keeps `pane_snap` fresh) so a post-reboot restore can
-                        // reopen it there - the tmux server holding the live
-                        // cwd dies on reboot.
-                        cwd: snap
-                            .get(&session)
-                            .and_then(|s| s.cwd.clone()),
-                        // The pane's durable codename, so it survives relaunch.
-                        name: panes
-                            .get(id)
-                            .map(|p| p.name.clone())
+                        session: pane
+                            .map(|p| p.session.clone())
                             .unwrap_or_default(),
-                        session,
+                        // The pane's last *observed* cwd (`Pane.cwd`), not the
+                        // live snapshot: once the server holding the live cwd
+                        // dies (reboot, crash) the snapshot is empty, and a
+                        // save then must not forget where every pane was.
+                        cwd: pane.and_then(|p| p.cwd.clone()),
+                        // The pane's durable codename, so it survives relaunch.
+                        name: pane.map(|p| p.name.clone()).unwrap_or_default(),
+                        agent: pane.and_then(|p| p.agent.clone()),
                     }
                 },
                 Node::Split {
@@ -3164,8 +3604,8 @@ impl App {
                 } => NodeState::Split {
                     axis: *axis,
                     ratio: *ratio,
-                    first: Box::new(node_state(first, panes, snap)),
-                    second: Box::new(node_state(second, panes, snap)),
+                    first: Box::new(node_state(first, panes)),
+                    second: Box::new(node_state(second, panes)),
                 },
             }
         }
@@ -3198,7 +3638,7 @@ impl App {
                     .iter()
                     .map(|tab| TabState {
                         id: tab.tab_id.clone(),
-                        tree: node_state(&tab.tree, &tab.panes, &self.pane_snap),
+                        tree: node_state(&tab.tree, &tab.panes),
                         focused_session: tab
                             .panes
                             .get(&tab.focused)
@@ -3211,8 +3651,22 @@ impl App {
         }
     }
 
-    fn save_state(&self) {
-        if let Err(e) = state::save(&self.to_state()) {
+    fn save_state(&mut self) {
+        let state = self.to_state();
+        // History first: a save that drops a tab or pane keeps the layout
+        // from before it (`history::Journal`).
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            if let Some((snap, reason)) = self.journal.observe(
+                history::Shape::of(&state),
+                json,
+                mesh::now(),
+            ) {
+                if let Err(e) = history::write_snapshot_json(&snap, reason) {
+                    log::error!("history snapshot failed: {e:#}");
+                }
+            }
+        }
+        if let Err(e) = state::save(&state) {
             log::error!("failed to save state: {e:#}");
         }
     }
@@ -4659,23 +5113,29 @@ impl eframe::App for App {
             self.drain_notify_requests(ctx);
             self.drain_rename_requests();
             self.drain_newtab_requests(ctx);
+            self.drain_history_requests(ctx);
             self.drain_automation_requests(ctx);
-            let new_snap = self.tmux.pane_snapshot();
-            // A pane changed directory since the last tick: mark state dirty
-            // so the saved layout's per-leaf cwd (reboot recovery) tracks it.
-            // cwd changes don't otherwise flip `dirty`; bounded to real moves.
-            if self.session_recovery {
-                let prev = &self.pane_snap;
-                let moved = new_snap.keys().chain(prev.keys()).any(|s| {
-                    new_snap.get(s).and_then(|p| p.cwd.as_ref())
-                        != prev.get(s).and_then(|p| p.cwd.as_ref())
-                });
-                if moved {
-                    self.dirty = true;
+            self.pane_snap = self.tmux.pane_snapshot();
+            *self.pane_snap_shared.lock().unwrap() = self.pane_snap.clone();
+            // Each pane's last-known cwd (reboot/server-loss recovery) tracks
+            // what tmux *reports*; a session absent from the snapshot keeps
+            // its old value - a dead server reports nothing, and that is the
+            // moment the saved cwd matters. A real move marks state dirty so
+            // the saved leaf follows it.
+            for tab in &mut self.tabs {
+                for pane in tab.panes.values_mut() {
+                    let seen = self
+                        .pane_snap
+                        .get(&pane.session)
+                        .and_then(|p| p.cwd.as_ref());
+                    if let Some(cwd) = seen {
+                        if pane.cwd.as_ref() != Some(cwd) {
+                            pane.cwd = Some(cwd.clone());
+                            self.dirty = true;
+                        }
+                    }
                 }
             }
-            self.pane_snap = new_snap;
-            *self.pane_snap_shared.lock().unwrap() = self.pane_snap.clone();
             // Hook-reported agent states, pruned against liveness: a session
             // whose foreground returned to a shell (or vanished) has no live
             // agent - it exited or was killed without firing its end hook.
@@ -4710,6 +5170,37 @@ impl eframe::App for App {
                 }
                 true
             });
+            // Each pane's agent conversation (recovery's `--resume` target),
+            // by the same observation-only rule as cwd: a hook record naming a
+            // conversation sets it, the pane seen back at a shell clears it
+            // (the agent exited), and a pane tmux says nothing about keeps it -
+            // a server that just died also ran every agent's SessionEnd hook,
+            // which deleted the records this was copied from.
+            for tab in &mut self.tabs {
+                for pane in tab.panes.values_mut() {
+                    let hook = self
+                        .agent_states
+                        .get(&pane.session)
+                        .and_then(|s| s.resume.as_ref());
+                    let next = match hook {
+                        Some(r) => Some(r.clone()),
+                        None => match self.pane_snap.get(&pane.session) {
+                            Some(snap)
+                                if tmux::is_shell(&snap.cmd)
+                                    && pane.spawned.elapsed()
+                                        > AGENT_CLEAR_GRACE =>
+                            {
+                                None
+                            },
+                            _ => continue,
+                        },
+                    };
+                    if pane.agent != next {
+                        pane.agent = next;
+                        self.dirty = true;
+                    }
+                }
+            }
             // Background-job scan roots: idle hook state AND the agent CLI
             // still foreground. A shell foreground means the agent exited
             // (the prune's territory), and a marker match under a *working*
@@ -4815,6 +5306,7 @@ impl eframe::App for App {
         self.drag_intercept(ctx);
 
         self.drain_pty_events(ctx);
+        self.settle_exits(ctx);
         // Looking at a tab acknowledges its badges: seeing the active tab
         // with the window focused clears them, which covers every
         // tab-switch path and window refocus in one sweep.
@@ -6712,7 +7204,7 @@ mod tests {
             pid: Some(1),
             activity: None,
         };
-        let agent = mesh::AgentState { state: "idle".into(), ts: 0 };
+        let agent = mesh::AgentState { state: "idle".into(), ts: 0, resume: None };
 
         // A running tool with no agent state: lights the command dot.
         assert!(running_command(None, Some(&snap("vim"))));

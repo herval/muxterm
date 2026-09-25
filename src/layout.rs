@@ -114,6 +114,23 @@ impl Node {
         }
     }
 
+    /// Swap `Leaf(old)` for `Leaf(new)` in place, keeping every split and
+    /// ratio - how a pane gets a fresh terminal backend (a respawned tmux
+    /// client) without the layout noticing. Returns false if `old` is not in
+    /// the tree.
+    pub fn replace(&mut self, old: PaneId, new: PaneId) -> bool {
+        match self {
+            Node::Leaf(id) if *id == old => {
+                *id = new;
+                true
+            },
+            Node::Leaf(_) => false,
+            Node::Split { first, second, .. } => {
+                first.replace(old, new) || second.replace(old, new)
+            },
+        }
+    }
+
     pub fn first_leaf(&self) -> PaneId {
         match self {
             Node::Leaf(id) => *id,
@@ -260,6 +277,20 @@ mod tests {
             _ => panic!("expected a split"),
         }
         assert!(!tree.split_with(PaneId(99), SplitAxis::Stacked, PaneId(3), 0.3));
+    }
+
+    #[test]
+    fn replace_swaps_a_leaf_and_keeps_the_splits() {
+        let mut tree = Node::Leaf(PaneId(1));
+        tree.split_with(PaneId(1), SplitAxis::SideBySide, PaneId(2), 0.3);
+        tree.split(PaneId(2), SplitAxis::Stacked, PaneId(3));
+        assert!(tree.replace(PaneId(2), PaneId(7)));
+        assert_eq!(tree.leaves(), vec![PaneId(1), PaneId(7), PaneId(3)]);
+        match &tree {
+            Node::Split { ratio, .. } => assert_eq!(*ratio, 0.3),
+            _ => panic!("expected a split"),
+        }
+        assert!(!tree.replace(PaneId(99), PaneId(8)));
     }
 
     #[test]

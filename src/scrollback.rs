@@ -9,8 +9,9 @@
 //! restore can replay it back into the fresh pane (`app::restore_tab`).
 //! Cosmetic and best-effort: it captures plain text (no ANSI), never blocks
 //! the UI (own thread, reading the shared pane snapshot like `git_status`
-//! rather than spawning its own `list-panes`), and prunes files whose session
-//! is gone.
+//! rather than spawning its own `list-panes`), and moves files whose session
+//! is gone into the history archive (`history::archive_scrollback`) rather
+//! than deleting them, so a closed or lost pane's tail can still be read.
 
 use std::collections::HashSet;
 use std::fs;
@@ -19,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use muxterm::state;
+use muxterm::{history, state};
 
 use crate::tmux::{SharedPanes, TmuxCtl};
 
@@ -42,26 +43,56 @@ fn prev_dir() -> PathBuf {
     state::config_dir().join("scrollback-prev")
 }
 
-/// Rotate the previous run's captures aside (`scrollback` -> `scrollback-prev`,
-/// discarding any older rotation). Called once at launch, before the poller
-/// starts, and only when a cold restore may want to replay. The poller
-/// recreates `scrollback/` on its first write; `scrollback-prev` then sits
-/// untouched for the whole session, so replaying from it never races a write.
+/// Rotate the captures aside (`scrollback` -> `scrollback-prev`), moving any
+/// older rotation into the history archive rather than discarding it. Called
+/// at launch before the poller starts when a cold restore may want to
+/// replay, and when the tmux server dies under a running app
+/// (`app::recover_from_server_loss`). The poller recreates `scrollback/` on
+/// its next write; `scrollback-prev` then sits untouched until the next
+/// rotation, so replaying from it never races a write.
 pub fn rotate() {
     let (dir, prev) = (dir(), prev_dir());
     if !dir.exists() {
         return;
     }
+    if let Ok(entries) = fs::read_dir(&prev) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(session) = session_of(&path) {
+                history::archive_scrollback(&path, &session);
+            }
+        }
+    }
     let _ = fs::remove_dir_all(&prev);
     let _ = fs::rename(&dir, &prev);
 }
 
-/// The rotated-aside capture file for a session, if one exists - the source
-/// `app::restore_tab` replays on a cold restore (via `cat`, so no scrollback
-/// text is ever fed to the shell as a command).
+/// `<session>.txt` -> session.
+fn session_of(path: &std::path::Path) -> Option<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".txt"))
+        .map(str::to_string)
+}
+
+/// The capture to replay into a session being recreated: whichever is newer
+/// of the rotated-aside one (a reboot or server loss just now) and the
+/// newest archived one (a tab reopened from `mux history restore` - which,
+/// after a server loss, may have been captured again since the rotation).
+/// Replayed via `cat`, so no scrollback text is ever fed to the shell as a
+/// command.
 pub fn recovered_file(session: &str) -> Option<PathBuf> {
-    let p = prev_dir().join(format!("{session}.txt"));
-    p.is_file().then_some(p)
+    let prev = prev_dir().join(format!("{session}.txt"));
+    let prev = fs::metadata(&prev)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs(), prev));
+    let archived = history::archived_scrollback(session).into_iter().next();
+    match (prev, archived) {
+        (Some(p), Some(a)) => Some(if a.0 > p.0 { a.1 } else { p.1 }),
+        (p, a) => p.or(a).map(|(_, path)| path),
+    }
 }
 
 /// Spawn the capture poller. Idles when `enabled` is off so the config toggle
@@ -110,23 +141,21 @@ fn live_sessions(panes: &SharedPanes) -> Vec<String> {
     panes.lock().unwrap().keys().cloned().collect()
 }
 
-/// Drop capture files whose session is no longer live, so a killed pane's
-/// scrollback can't linger and be replayed into an unrelated future pane.
+/// Move capture files whose session is no longer live out of the live dir
+/// (so a killed pane's scrollback isn't replayed into an unrelated future
+/// pane by a reboot restore) and into the history archive, where
+/// `mux history scrollback` can still read it.
 fn prune(kept: &HashSet<String>) {
     let Ok(entries) = fs::read_dir(dir()) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(session) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(".txt"))
-        else {
+        let Some(session) = session_of(&path) else {
             continue;
         };
-        if !kept.contains(session) {
-            let _ = fs::remove_file(&path);
+        if !kept.contains(&session) {
+            history::archive_scrollback(&path, &session);
         }
     }
 }

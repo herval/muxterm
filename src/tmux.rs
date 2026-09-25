@@ -12,6 +12,43 @@ use egui_term::BackendSettings;
 // binary discovery are shared with the `mux` agent-mesh CLI.
 use muxterm::mesh::{find_tmux, SESSION_PREFIX, SOCKET};
 
+/// The answer to `TmuxCtl::probe_server`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServerProbe {
+    /// Up, holding these sessions (possibly none).
+    Alive(HashSet<String>),
+    /// Nothing listening on the socket: the server died.
+    Dead,
+    /// The probe failed some other way - don't conclude anything.
+    Unknown,
+}
+
+/// `list-sessions`' outcome -> ServerProbe. Only tmux's two "nobody home"
+/// messages count as dead: a missing socket file ("no server running on"
+/// / "error connecting to ... (No such file or directory)") or a stale one
+/// nobody accepts on ("Connection refused"). Pure so the wording is tested.
+fn classify_probe(ok: bool, stdout: &str, stderr: &str) -> ServerProbe {
+    if ok {
+        return ServerProbe::Alive(
+            stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
+    let dead = stderr.contains("no server running on")
+        || (stderr.contains("error connecting to")
+            && (stderr.contains("No such file or directory")
+                || stderr.contains("Connection refused")));
+    if dead {
+        ServerProbe::Dead
+    } else {
+        ServerProbe::Unknown
+    }
+}
+
 /// Regenerated on every launch (it only applies when the server starts) and
 /// re-sourced into a running server when copy_on_select changes.
 /// `status off` makes sessions look like a plain terminal; the `Ms` override
@@ -20,6 +57,11 @@ const CONF_BASE: &str = r##"# managed by muxterm - regenerated at every launch
 set -g status off
 set -g mouse on
 set -s escape-time 0
+# Keep the server up with zero sessions: then "the server is gone" can only
+# mean it died (crash, kill-server, reboot), which is what lets a pane exit
+# tell a shell exiting from the server dying under every pane at once
+# (app::settle_exits) - the latter must recover, never close the tabs.
+set -s exit-empty off
 set -g history-limit 100000
 set -g default-terminal "tmux-256color"
 set -g set-titles on
@@ -622,6 +664,28 @@ impl TmuxCtl {
         }
     }
 
+    /// Is the `-L muxterm` server up, and which sessions does it hold? The
+    /// distinction `list_sessions` flattens away: an empty list there means
+    /// "no sessions" *or* "no server". With `exit-empty off` in the conf, an
+    /// absent server is never the normal aftermath of a last shell exiting -
+    /// only of the server dying - so `Dead` is what drives in-place recovery
+    /// (`app::settle_exits`). Anything unrecognized is `Unknown`, which the
+    /// caller must treat as "decide later", never as dead: recovery types
+    /// commands into panes, and doing that to live ones would be a disaster.
+    pub fn probe_server(&self) -> ServerProbe {
+        match Command::new(&self.bin)
+            .args(["-L", SOCKET, "list-sessions", "-F", "#{session_name}"])
+            .output()
+        {
+            Ok(out) => classify_probe(
+                out.status.success(),
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            ),
+            Err(_) => ServerProbe::Unknown,
+        }
+    }
+
     /// Kill muxterm-owned sessions that no saved pane references (panes whose
     /// Exit event raced an app crash, etc.). Never called when the state file
     /// failed to parse - a corrupt state must not cost live sessions.
@@ -841,6 +905,36 @@ fn trim_capture(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_tells_a_dead_server_from_a_failed_probe() {
+        let alive = classify_probe(true, "mux-a\nmux-b\n", "");
+        assert_eq!(
+            alive,
+            ServerProbe::Alive(
+                ["mux-a", "mux-b"].map(String::from).into_iter().collect()
+            )
+        );
+        // exit-empty off: up with nothing in it is still alive.
+        assert_eq!(
+            classify_probe(true, "", ""),
+            ServerProbe::Alive(HashSet::new())
+        );
+        // The wording tmux 3.x uses, verified against a scratch socket.
+        for stderr in [
+            "no server running on /private/tmp/tmux-501/muxterm\n",
+            "error connecting to /private/tmp/tmux-501/muxterm (No such file or directory)\n",
+            "error connecting to /private/tmp/tmux-501/muxterm (Connection refused)\n",
+        ] {
+            assert_eq!(classify_probe(false, "", stderr), ServerProbe::Dead);
+        }
+        // Anything else proves nothing.
+        assert_eq!(
+            classify_probe(false, "", "error connecting to x (Permission denied)"),
+            ServerProbe::Unknown
+        );
+        assert_eq!(classify_probe(false, "", ""), ServerProbe::Unknown);
+    }
 
     /// The ordered copy-mode command names (the arg after each `-X`, past an
     /// optional `-N <count>`).

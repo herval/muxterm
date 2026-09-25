@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod ask;
 pub mod automation;
+pub mod history;
 pub mod layout;
 pub mod mesh;
 pub mod models;

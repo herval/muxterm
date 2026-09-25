@@ -238,6 +238,14 @@ pub enum NodeState {
         /// files load unchanged and get a fresh codename on restore.
         #[serde(default)]
         name: String,
+        /// The agent conversation last seen running in this pane (reported by
+        /// its hooks), so a pane whose session died can `--resume` that exact
+        /// conversation instead of starting a blank CLI. Cleared only when the
+        /// pane is *seen* back at a shell - never because the pane vanished,
+        /// which is precisely the case it exists for. Additive with
+        /// `#[serde(default)]`; omitted from the file when None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentResume>,
     },
     Split {
         axis: SplitAxis,
@@ -245,6 +253,18 @@ pub enum NodeState {
         first: Box<NodeState>,
         second: Box<NodeState>,
     },
+}
+
+/// Which agent conversation a pane was running: the registry id of the CLI
+/// (`agent::by_id`), that CLI's own session id, and the directory the CLI
+/// ran in (its session store is keyed by it - `claude --resume` from any
+/// other cwd can't find the conversation).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentResume {
+    pub agent: String,
+    pub session: String,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 impl NodeState {
@@ -513,6 +533,7 @@ mod tests {
                             session: "mux-aaaa".into(),
                             cwd: None,
                             name: String::new(),
+                            agent: None,
                         },
                         focused_session: "mux-aaaa".into(),
                         workspace: None,
@@ -526,11 +547,13 @@ mod tests {
                                 session: "mux-bbbb".into(),
                                 cwd: None,
                                 name: String::new(),
+                                agent: None,
                             }),
                             second: Box::new(NodeState::Leaf {
                                 session: "mux-cccc".into(),
                                 cwd: None,
                                 name: String::new(),
+                                agent: None,
                             }),
                         },
                         focused_session: "mux-cccc".into(),
@@ -649,18 +672,49 @@ mod tests {
             session: "mux-b".into(),
             cwd: Some(PathBuf::from("/work/proj/src")),
             name: "otter".into(),
+            agent: None,
         };
         let back: NodeState =
             serde_json::from_str(&serde_json::to_string(&leaf).unwrap())
                 .unwrap();
         match back {
-            NodeState::Leaf { session, cwd, name } => {
+            NodeState::Leaf { session, cwd, name, .. } => {
                 assert_eq!(session, "mux-b");
                 assert_eq!(cwd, Some(PathBuf::from("/work/proj/src")));
                 assert_eq!(name, "otter");
             },
             _ => panic!("expected a leaf"),
         }
+    }
+
+    #[test]
+    fn leaf_agent_round_trips_and_is_omitted_when_absent() {
+        let leaf = NodeState::Leaf {
+            session: "mux-b".into(),
+            cwd: None,
+            name: String::new(),
+            agent: Some(AgentResume {
+                agent: "claude".into(),
+                session: "7dbe68d3".into(),
+                cwd: Some(PathBuf::from("/work/app")),
+            }),
+        };
+        let text = serde_json::to_string(&leaf).unwrap();
+        match serde_json::from_str::<NodeState>(&text).unwrap() {
+            NodeState::Leaf { agent, .. } => {
+                let a = agent.unwrap();
+                assert_eq!((a.agent.as_str(), a.session.as_str()), ("claude", "7dbe68d3"));
+                assert_eq!(a.cwd, Some(PathBuf::from("/work/app")));
+            },
+            _ => panic!("expected a leaf"),
+        }
+        let bare = NodeState::Leaf {
+            session: "mux-c".into(),
+            cwd: None,
+            name: String::new(),
+            agent: None,
+        };
+        assert!(!serde_json::to_string(&bare).unwrap().contains("agent"));
     }
 
     #[test]

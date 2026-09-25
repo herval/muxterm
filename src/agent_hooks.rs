@@ -70,11 +70,11 @@ pub fn ensure_installed() {
     };
     let claude_dir = home.join(".claude");
     if claude_dir.exists() {
-        merge_hooks_file(&claude_dir.join("settings.json"), CLAUDE_EVENTS, &mux);
+        merge_hooks_file(&claude_dir.join("settings.json"), CLAUDE_EVENTS, &mux, "claude");
     }
     let codex_dir = home.join(".codex");
     if codex_dir.exists() {
-        merge_hooks_file(&codex_dir.join("hooks.json"), CODEX_EVENTS, &mux);
+        merge_hooks_file(&codex_dir.join("hooks.json"), CODEX_EVENTS, &mux, "codex");
     }
     let pi_dir = home.join(".pi");
     if pi_dir.exists() {
@@ -135,6 +135,7 @@ fn merge_hooks_file(
     path: &PathBuf,
     events: &[(&str, &str, Option<&str>, bool)],
     mux: &str,
+    agent: &str,
 ) {
     let root_text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -150,7 +151,7 @@ fn merge_hooks_file(
             return;
         },
     };
-    if !merge_hooks(&mut root, events, mux) {
+    if !merge_hooks(&mut root, events, mux, agent) {
         return;
     }
     let mut out = serde_json::to_string_pretty(&root).unwrap_or_default();
@@ -165,17 +166,20 @@ fn merge_hooks_file(
 /// The muxterm hook group for one state. Kept minimal: a short timeout so
 /// a wedged hook can never stall the agent, and a matcher only where one
 /// event multiplexes triggers we must tell apart (claude's Notification) -
-/// absent means match every tool/notification.
+/// absent means match every tool/notification. `--agent` names the CLI,
+/// which the payload doesn't: with the payload's `session_id` it is what a
+/// dead pane's conversation is resumed by (`state::AgentResume`).
 fn hook_group(
     mux: &str,
+    agent: &str,
     state: &str,
     matcher: Option<&str>,
     prompt: bool,
 ) -> Value {
     let command = if prompt {
-        format!("{mux} agent-event {state} --prompt")
+        format!("{mux} agent-event {state} --agent {agent} --prompt")
     } else {
-        format!("{mux} agent-event {state}")
+        format!("{mux} agent-event {state} --agent {agent}")
     };
     let mut group = json!({
         "hooks": [{
@@ -199,6 +203,7 @@ fn merge_hooks(
     root: &mut Value,
     events: &[(&str, &str, Option<&str>, bool)],
     mux: &str,
+    agent: &str,
 ) -> bool {
     let Some(obj) = root.as_object_mut() else {
         return false;
@@ -209,7 +214,7 @@ fn merge_hooks(
     };
     let mut changed = false;
     for (event, state, matcher, prompt) in events {
-        let desired = hook_group(mux, state, *matcher, *prompt);
+        let desired = hook_group(mux, agent, state, *matcher, *prompt);
         let entry = hooks.entry(*event).or_insert_with(|| json!([]));
         let Some(list) = entry.as_array_mut() else {
             continue;
@@ -417,20 +422,20 @@ mod tests {
     #[test]
     fn merge_into_empty_adds_all_events() {
         let mut root = json!({});
-        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux", "claude"));
         for (event, state, matcher, prompt) in CLAUDE_EVENTS {
             let group = &root["hooks"][*event][0];
             let cmd = group["hooks"][0]["command"].as_str().unwrap();
             let want = if *prompt {
-                format!("/usr/local/bin/mux agent-event {state} --prompt")
+                format!("/usr/local/bin/mux agent-event {state} --agent claude --prompt")
             } else {
-                format!("/usr/local/bin/mux agent-event {state}")
+                format!("/usr/local/bin/mux agent-event {state} --agent claude")
             };
             assert_eq!(cmd, want);
             assert_eq!(group["matcher"].as_str(), *matcher);
         }
         // Idempotent: a second merge with the same path changes nothing.
-        assert!(!merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+        assert!(!merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux", "claude"));
     }
 
     #[test]
@@ -439,7 +444,7 @@ mod tests {
         // and PreToolUse report "working", but the flag rides the former.
         for events in [CLAUDE_EVENTS, CODEX_EVENTS] {
             let mut root = json!({});
-            assert!(merge_hooks(&mut root, events, "/usr/local/bin/mux"));
+            assert!(merge_hooks(&mut root, events, "/usr/local/bin/mux", "claude"));
             let cmd = |event: &str| {
                 root["hooks"][event][0]["hooks"][0]["command"]
                     .as_str()
@@ -466,12 +471,12 @@ mod tests {
                 }],
             },
         });
-        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux", "claude"));
         let groups = root["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(
             groups[0]["hooks"][0]["command"],
-            "/usr/local/bin/mux agent-event working --prompt"
+            "/usr/local/bin/mux agent-event working --agent claude --prompt"
         );
     }
 
@@ -491,7 +496,7 @@ mod tests {
                 }],
             },
         });
-        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux"));
+        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux", "claude"));
         let groups = root["hooks"]["Notification"].as_array().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["matcher"], CLAUDE_NOTIFY_MATCHER);
@@ -511,7 +516,7 @@ mod tests {
                 }],
             },
         });
-        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/new/mux"));
+        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/new/mux", "claude"));
         // Foreign top-level keys and hook groups survive.
         assert_eq!(root["model"], "opus");
         assert_eq!(
@@ -521,14 +526,14 @@ mod tests {
         // Ours was appended after the foreign PreToolUse group...
         assert_eq!(
             root["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
-            "/new/mux agent-event working"
+            "/new/mux agent-event working --agent claude"
         );
         // ...and the stale Stop entry was replaced in place, not duplicated.
         let stops = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stops.len(), 1);
         assert_eq!(
             stops[0]["hooks"][0]["command"],
-            "/new/mux agent-event idle"
+            "/new/mux agent-event idle --agent claude"
         );
     }
 

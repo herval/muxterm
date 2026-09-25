@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use muxterm::agent;
 use muxterm::ask;
 use muxterm::automation;
+use muxterm::history;
 use muxterm::layout::SplitAxis;
 use muxterm::mesh::{self, AgentInfo};
 use muxterm::models;
@@ -113,6 +114,21 @@ usage: mux [--as <session>] [--json] <command> [args]
                                extras) and cached in models.json, else the
                                built-in seed. --refresh re-asks every
                                installed CLI now
+  history [list]               layout snapshots muxterm kept (at launch,
+                               before tabs/panes close, periodically, and
+                               when the tmux server died), newest first
+  history show [<snap>]        a snapshot's tabs and panes: branch, cwd,
+                               the agent conversation each pane ran, and
+                               whether its scrollback was kept. <snap> is
+                               latest (default), a list number, or an id
+  history scrollback <pane> [--snapshot <snap>]
+                               print a pane's last kept scrollback (<pane>
+                               is a session name or a codename)
+  history restore [<snap>] [--tab <id|title>]...
+                               reopen a snapshot's tabs that aren't open:
+                               recreates missing worktrees here, then the
+                               app brings each pane back in its cwd with
+                               its scrollback and resumes its agent
   brief                        paste-ready team briefing for a system prompt
   prune                        clean up entries for dead sessions/tabs
 ";
@@ -182,6 +198,7 @@ fn run(mut args: Vec<String>) -> CmdResult {
         "ctx" => cmd_ctx(as_session, rest, json),
         "automations" | "automation" => cmd_automations(rest, json),
         "models" => cmd_models(rest, json),
+        "history" => cmd_history(rest, json),
         "brief" => cmd_brief(as_session),
         "prune" => cmd_prune(),
         other => {
@@ -1454,7 +1471,12 @@ fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
             mesh::remove_agent_prompt(&session);
         },
         "working" | "idle" | "attention" => {
-            if let Err(e) = mesh::write_agent_state(&session, state) {
+            let agent = args
+                .iter()
+                .position(|a| a == "--agent")
+                .and_then(|i| args.get(i + 1));
+            let resume = agent.and_then(|a| resume_payload(a, &payload));
+            if let Err(e) = mesh::write_agent_state(&session, state, resume) {
                 eprintln!("mux: agent-event: {e:#}");
             }
         },
@@ -1482,6 +1504,29 @@ fn prompt_payload(input: &[u8]) -> Option<(String, String)> {
     let sid = v.get("session_id")?.as_str()?.trim();
     let prompt = v.get("prompt")?.as_str()?.trim();
     (!sid.is_empty()).then(|| (sid.to_string(), prompt.to_string()))
+}
+
+/// The conversation a hook event belongs to, for `--resume` after the pane
+/// dies: every claude/codex hook payload carries the CLI's `session_id` and
+/// its `cwd`; the agent id comes from the hook command itself (`--agent`),
+/// since the payload doesn't say which CLI sent it. None when there is no
+/// session id - nothing to resume.
+fn resume_payload(agent: &str, input: &[u8]) -> Option<muxterm::state::AgentResume> {
+    let v: serde_json::Value = serde_json::from_slice(input).ok()?;
+    let session = v.get("session_id")?.as_str()?.trim();
+    if session.is_empty() || agent.is_empty() {
+        return None;
+    }
+    let cwd = v
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+        .map(PathBuf::from);
+    Some(muxterm::state::AgentResume {
+        agent: agent.to_string(),
+        session: session.to_string(),
+        cwd,
+    })
 }
 
 /// Words a prompt needs before it can say what a session is *for*: "yes",
@@ -2434,6 +2479,471 @@ fn cmd_brief(as_session: Option<String>) -> CmdResult {
 /// came from. The GUI refreshes on its own when a CLI's version moves or a
 /// day passes; --refresh is the "I just updated codex" shortcut, and the
 /// GUI picks the rewritten file up on its mtime tick.
+// ---------------------------------------------------------------- history
+
+fn cmd_history(mut args: Vec<String>, json: bool) -> CmdResult {
+    let sub = if args.is_empty() { "list".to_string() } else { args.remove(0) };
+    match sub.as_str() {
+        "list" | "ls" => history_list(args, json),
+        "show" => history_show(args, json),
+        "scrollback" => history_scrollback(args),
+        "restore" => history_restore(args),
+        other => Err((
+            EXIT_USAGE,
+            format!("unknown history command {other:?} (list|show|scrollback|restore)"),
+        )),
+    }
+}
+
+fn snapshot_arg<'a>(
+    snaps: &'a [history::Snapshot],
+    spec: Option<&str>,
+) -> Result<&'a history::Snapshot, Fail> {
+    if snaps.is_empty() {
+        return Err((
+            EXIT_NOT_FOUND,
+            format!("no snapshots yet in {}", history::snapshots_dir().display()),
+        ));
+    }
+    history::resolve(snaps, spec).ok_or_else(|| {
+        (
+            EXIT_NOT_FOUND,
+            format!(
+                "no single snapshot matches {:?} (mux history list)",
+                spec.unwrap_or("latest")
+            ),
+        )
+    })
+}
+
+fn load_snapshot(snap: &history::Snapshot) -> Result<state::StateFile, Fail> {
+    history::load(snap).map_err(|e| {
+        (EXIT_NOT_FOUND, format!("cannot read snapshot {}: {e:#}", snap.id))
+    })
+}
+
+fn local_time(ts: u64) -> String {
+    chrono::DateTime::from_timestamp(ts as i64, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| ts.to_string())
+}
+
+fn ago(ts: u64) -> String {
+    let d = mesh::now().saturating_sub(ts);
+    match d {
+        0..=59 => format!("{d}s ago"),
+        60..=3599 => format!("{}m ago", d / 60),
+        3600..=86399 => format!("{}h ago", d / 3600),
+        _ => format!("{}d ago", d / 86400),
+    }
+}
+
+fn tilde(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    match dirs::home_dir().map(|h| h.display().to_string()) {
+        Some(home) if s.starts_with(&home) => format!("~{}", &s[home.len()..]),
+        _ => s,
+    }
+}
+
+fn snapshot_tabs(state: &state::StateFile) -> impl Iterator<Item = &state::TabState> {
+    state.windows.iter().flat_map(|w| w.tabs.iter())
+}
+
+fn tab_title(tab: &state::TabState) -> String {
+    tab.workspace
+        .as_ref()
+        .map(|w| w.title.clone())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "(untitled)".into())
+}
+
+/// Every leaf of a tab with what the snapshot recorded for it.
+fn snapshot_leaves(tab: &state::TabState) -> Vec<&state::NodeState> {
+    fn walk<'a>(n: &'a state::NodeState, out: &mut Vec<&'a state::NodeState>) {
+        match n {
+            state::NodeState::Leaf { .. } => out.push(n),
+            state::NodeState::Split { first, second, .. } => {
+                walk(first, out);
+                walk(second, out);
+            },
+        }
+    }
+    let mut out = Vec::new();
+    walk(&tab.tree, &mut out);
+    out
+}
+
+/// Tab ids open in muxterm right now (from state.json).
+fn open_tab_ids() -> HashSet<String> {
+    state::peek()
+        .map(|s| snapshot_tabs(&s).map(|t| t.id.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Where a session's scrollback survives: the live capture, the rotated-aside
+/// one, then every archived version (newest first).
+fn kept_scrollback(session: &str) -> Vec<PathBuf> {
+    let cfg = state::config_dir();
+    let mut out: Vec<PathBuf> = ["scrollback", "scrollback-prev"]
+        .iter()
+        .map(|d| cfg.join(d).join(format!("{session}.txt")))
+        .filter(|p| p.is_file())
+        .collect();
+    out.extend(history::archived_scrollback(session).into_iter().map(|(_, p)| p));
+    out
+}
+
+fn history_list(args: Vec<String>, json: bool) -> CmdResult {
+    if let Some(extra) = args.first() {
+        return Err((EXIT_USAGE, format!("unexpected argument {extra:?}")));
+    }
+    let snaps = history::list_snapshots();
+    if json {
+        let rows: Vec<serde_json::Value> = snaps
+            .iter()
+            .map(|s| {
+                let (tabs, panes) = history::load(s)
+                    .map(|st| {
+                        let tabs: Vec<_> = snapshot_tabs(&st).collect();
+                        let panes = tabs.iter().map(|t| snapshot_leaves(t).len()).sum::<usize>();
+                        (tabs.len(), panes)
+                    })
+                    .unwrap_or((0, 0));
+                serde_json::json!({
+                    "id": s.id, "ts": s.ts, "reason": s.reason,
+                    "tabs": tabs, "panes": panes,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(rows));
+        return Ok(());
+    }
+    if snaps.is_empty() {
+        println!("no snapshots yet ({})", history::snapshots_dir().display());
+        return Ok(());
+    }
+    for (i, s) in snaps.iter().enumerate() {
+        let summary = match history::load(s) {
+            Ok(st) => {
+                let tabs: Vec<_> = snapshot_tabs(&st).collect();
+                let panes: usize = tabs.iter().map(|t| snapshot_leaves(t).len()).sum();
+                let mut titles: Vec<String> = tabs.iter().map(|t| tab_title(t)).collect();
+                let more = titles.len().saturating_sub(4);
+                titles.truncate(4);
+                let mut line = format!("{} tabs, {panes} panes  {}", tabs.len(), titles.join(" · "));
+                if more > 0 {
+                    line.push_str(&format!(" · +{more}"));
+                }
+                line
+            },
+            Err(_) => "(unreadable)".into(),
+        };
+        println!(
+            "{:>3}  {}  {:<8}  {:<13} {}",
+            i + 1,
+            local_time(s.ts),
+            ago(s.ts),
+            s.reason,
+            summary
+        );
+    }
+    Ok(())
+}
+
+fn history_show(mut args: Vec<String>, json: bool) -> CmdResult {
+    let spec = if args.is_empty() { None } else { Some(args.remove(0)) };
+    if let Some(extra) = args.first() {
+        return Err((EXIT_USAGE, format!("unexpected argument {extra:?}")));
+    }
+    let snaps = history::list_snapshots();
+    let snap = snapshot_arg(&snaps, spec.as_deref())?;
+    let st = load_snapshot(snap)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&st).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    let open = open_tab_ids();
+    println!(
+        "snapshot {}  ({}, {}, {})",
+        snap.id,
+        local_time(snap.ts),
+        ago(snap.ts),
+        snap.reason
+    );
+    for (i, tab) in snapshot_tabs(&st).enumerate() {
+        let mut head = format!("\n[{}] {}", i + 1, tab_title(tab));
+        if let Some(ws) = &tab.workspace {
+            if ws.archived_at.is_some() {
+                head.push_str("  (archived)");
+            }
+            if let Some(wt) = &ws.worktree {
+                head.push_str(&format!(
+                    "  {}  {}{}",
+                    wt.branch,
+                    tilde(&wt.path),
+                    if wt.path.is_dir() { "" } else { " (missing)" }
+                ));
+            } else if let Some(root) = &ws.root {
+                head.push_str(&format!("  {}", tilde(root)));
+            }
+        }
+        if open.contains(&tab.id) {
+            head.push_str("  [open now]");
+        }
+        println!("{head}");
+        if let Some(prompt) = tab
+            .workspace
+            .as_ref()
+            .map(|w| w.prompt.trim())
+            .filter(|p| !p.is_empty())
+        {
+            let line: String = prompt.lines().next().unwrap_or("").chars().take(100).collect();
+            println!("    task: {line}");
+        }
+        for leaf in snapshot_leaves(tab) {
+            let state::NodeState::Leaf { session, cwd, name, agent } = leaf else {
+                continue;
+            };
+            let mut row = format!(
+                "    {:<10} {}  {}",
+                if name.is_empty() { "-" } else { name },
+                session,
+                cwd.as_deref().map(tilde).unwrap_or_else(|| "?".into())
+            );
+            if let Some(r) = agent {
+                let cmd = agent::by_id(&r.agent)
+                    .and_then(|a| agent::resume_session_command(a, &r.session))
+                    .unwrap_or_else(|| format!("{} session {}", r.agent, r.session));
+                row.push_str(&format!("\n               agent: {cmd}"));
+            }
+            let kept = kept_scrollback(session).len();
+            if kept > 0 {
+                row.push_str(&format!(
+                    "\n               scrollback: mux history scrollback {session}"
+                ));
+            }
+            println!("{row}");
+        }
+    }
+    Ok(())
+}
+
+fn history_scrollback(mut args: Vec<String>) -> CmdResult {
+    let spec = take_opt(&mut args, "--snapshot")?;
+    let Some(pane) = args.first().cloned() else {
+        return Err((
+            EXIT_USAGE,
+            "usage: mux history scrollback <session|codename> [--snapshot <snap>]".into(),
+        ));
+    };
+    let session = if pane.starts_with(mesh::SESSION_PREFIX) {
+        pane.clone()
+    } else {
+        // A codename: look it up in the snapshot.
+        let snaps = history::list_snapshots();
+        let snap = snapshot_arg(&snaps, spec.as_deref())?;
+        let st = load_snapshot(snap)?;
+        let hits: Vec<String> = snapshot_tabs(&st)
+            .flat_map(snapshot_leaves)
+            .filter_map(|l| match l {
+                state::NodeState::Leaf { session, name, .. } if *name == pane => {
+                    Some(session.clone())
+                },
+                _ => None,
+            })
+            .collect();
+        match hits.as_slice() {
+            [one] => one.clone(),
+            [] => {
+                return Err((
+                    EXIT_NOT_FOUND,
+                    format!("no pane named {pane:?} in snapshot {}", snap.id),
+                ))
+            },
+            _ => {
+                return Err((
+                    EXIT_CONFLICT,
+                    format!("several panes named {pane:?}; pass the session name"),
+                ))
+            },
+        }
+    };
+    let kept = kept_scrollback(&session);
+    let Some(newest) = kept.first() else {
+        return Err((EXIT_NOT_FOUND, format!("no scrollback kept for {session}")));
+    };
+    let text = fs::read_to_string(newest).map_err(|e| {
+        (EXIT_NOT_FOUND, format!("cannot read {}: {e}", newest.display()))
+    })?;
+    print!("{text}");
+    if kept.len() > 1 {
+        eprintln!(
+            "mux: {} older capture(s) of {session} in {}",
+            kept.len() - 1,
+            history::scrollback_dir().display()
+        );
+    }
+    Ok(())
+}
+
+/// Recreate a snapshot tab's worktree if it's gone, from whichever known
+/// repo still has its branch: the workspace's root, then muxterm's clones.
+/// Runs git in this terminal so a big checkout shows its progress. Ok(None)
+/// when there was nothing to do.
+fn ensure_worktree(ws: &state::WorkspaceState) -> Result<Option<String>, String> {
+    let Some(wt) = &ws.worktree else {
+        return Ok(None);
+    };
+    if wt.path.is_dir() {
+        return Ok(None);
+    }
+    let git_ok = |repo: &std::path::Path, args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let mut repos: Vec<PathBuf> = Vec::new();
+    if let Some(root) = ws.root.as_ref().filter(|r| r.is_dir() && **r != wt.path) {
+        repos.push(root.clone());
+    }
+    if let Ok(entries) = fs::read_dir(state::clones_dir()) {
+        repos.extend(entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    }
+    let local = format!("refs/heads/{}", wt.branch);
+    let remote = format!("refs/remotes/origin/{}", wt.branch);
+    for repo in &repos {
+        let args: Vec<String> = if git_ok(repo, &["rev-parse", "--verify", "--quiet", &local]) {
+            vec!["worktree".into(), "add".into(), wt.path.display().to_string(), wt.branch.clone()]
+        } else if git_ok(repo, &["rev-parse", "--verify", "--quiet", &remote]) {
+            vec![
+                "worktree".into(), "add".into(), "--track".into(), "-b".into(),
+                wt.branch.clone(), wt.path.display().to_string(), format!("origin/{}", wt.branch),
+            ]
+        } else {
+            continue;
+        };
+        // A dir deleted behind git's back still pins its branch.
+        let _ = git_ok(repo, &["worktree", "prune"]);
+        eprintln!("mux: recreating worktree {} ({}) from {}", tilde(&wt.path), wt.branch, tilde(repo));
+        let status = Command::new("git").arg("-C").arg(repo).args(&args).status();
+        return match status {
+            Ok(s) if s.success() => Ok(Some(format!("recreated {}", tilde(&wt.path)))),
+            _ => Err(format!(
+                "git worktree add failed for {} (branch {} in {})",
+                tilde(&wt.path),
+                wt.branch,
+                tilde(repo)
+            )),
+        };
+    }
+    Err(format!(
+        "branch {} not found in {} - can't recreate {}",
+        wt.branch,
+        if repos.is_empty() { "any known repo".to_string() } else {
+            repos.iter().map(|r| tilde(r)).collect::<Vec<_>>().join(", ")
+        },
+        tilde(&wt.path)
+    ))
+}
+
+fn history_restore(mut args: Vec<String>) -> CmdResult {
+    let mut picks = Vec::new();
+    while let Some(t) = take_opt(&mut args, "--tab")? {
+        picks.push(t);
+    }
+    let spec = if args.is_empty() { None } else { Some(args.remove(0)) };
+    if let Some(extra) = args.first() {
+        return Err((EXIT_USAGE, format!("unexpected argument {extra:?}")));
+    }
+    let snaps = history::list_snapshots();
+    let snap = snapshot_arg(&snaps, spec.as_deref())?;
+    let st = load_snapshot(snap)?;
+    let open = open_tab_ids();
+    let mut chosen: Vec<&state::TabState> = Vec::new();
+    for tab in snapshot_tabs(&st) {
+        let picked = picks.is_empty()
+            || picks.iter().any(|p| {
+                tab.id == *p || tab_title(tab).to_lowercase().contains(&p.to_lowercase())
+            });
+        if picked && !open.contains(&tab.id) {
+            chosen.push(tab);
+        }
+    }
+    if chosen.is_empty() {
+        println!("nothing to restore: every matching tab of {} is already open", snap.id);
+        return Ok(());
+    }
+    // Worktrees first, here, where their checkout progress is visible; a tab
+    // whose worktree can't come back is not restored (its agent conversation
+    // is keyed by that directory - reopening it anywhere else would only
+    // look restored).
+    let mut ids = Vec::new();
+    let mut failed = 0;
+    for tab in &chosen {
+        match tab.workspace.as_ref().map(ensure_worktree).unwrap_or(Ok(None)) {
+            Ok(_) => ids.push(tab.id.clone()),
+            Err(e) => {
+                failed += 1;
+                eprintln!("mux: skipping {:?}: {e}", tab_title(tab));
+            },
+        }
+    }
+    if ids.is_empty() {
+        return Err((EXIT_REFUSED, "no tab could be restored".into()));
+    }
+    let req = history::RestoreRequest {
+        v: 1,
+        ts: mesh::now(),
+        id: format!("{}-{:04x}", mesh::now(), std::process::id() & 0xffff),
+        snapshot: snap.id.clone(),
+        tabs: ids,
+    };
+    history::write_restore_request(&req)
+        .map_err(|e| (EXIT_TMUX, format!("cannot spool the request: {e:#}")))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let result = loop {
+        if let Some(r) = history::take_restore_result(&req.id) {
+            break r;
+        }
+        if Instant::now() > deadline {
+            return Err((
+                EXIT_TMUX,
+                "timed out waiting for muxterm to restore (is the app running?)".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let title_of = |id: &str| {
+        snapshot_tabs(&st)
+            .find(|t| t.id == id)
+            .map(tab_title)
+            .unwrap_or_else(|| id.to_string())
+    };
+    for id in &result.restored {
+        println!("restored  {}", title_of(id));
+    }
+    for (id, why) in &result.skipped {
+        println!("skipped   {}: {why}", title_of(id));
+    }
+    if result.restored.is_empty() || failed > 0 || !result.skipped.is_empty() {
+        return Err((EXIT_REFUSED, "some tabs were not restored".into()));
+    }
+    Ok(())
+}
+
 fn cmd_models(mut args: Vec<String>, json: bool) -> CmdResult {
     let refresh = take_flag(&mut args, "--refresh");
     if let Some(extra) = args.first() {
@@ -2589,6 +3099,23 @@ mod tests {
         assert_eq!(prompt_payload(b"not json"), None);
         assert_eq!(prompt_payload(br#"{"prompt":"no session id here"}"#), None);
         assert_eq!(prompt_payload(br#"{"session_id":"","prompt":"x"}"#), None);
+    }
+
+    #[test]
+    fn resume_payload_names_the_conversation_and_where_it_ran() {
+        let claude = br#"{"session_id":"abc","hook_event_name":"Stop","cwd":"/work/app"}"#;
+        let r = resume_payload("claude", claude).unwrap();
+        assert_eq!(
+            (r.agent.as_str(), r.session.as_str()),
+            ("claude", "abc")
+        );
+        assert_eq!(r.cwd, Some(PathBuf::from("/work/app")));
+        // No cwd is still resumable (from the pane's own cwd).
+        let bare = resume_payload("codex", br#"{"session_id":"019a"}"#).unwrap();
+        assert_eq!(bare.cwd, None);
+        assert!(resume_payload("claude", br#"{"session_id":""}"#).is_none());
+        assert!(resume_payload("claude", b"").is_none());
+        assert!(resume_payload("", br#"{"session_id":"abc"}"#).is_none());
     }
 
     #[test]

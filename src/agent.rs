@@ -48,6 +48,11 @@ pub struct Agent {
     /// Leading args for a quiet captured one-shot (workspace title
     /// generation): `{bin} {oneshot_args...} [--model {fast_model}] '<prompt>'`.
     pub oneshot_args: &'static [&'static str],
+    /// Args that reopen one specific conversation, followed by its session
+    /// id (`resume_session_command`): what brings a pane's agent back after
+    /// its tmux session died. Empty when the CLI can't be pointed at a
+    /// conversation by id - or its hooks never report one (pi, opencode).
+    pub resume_args: &'static [&'static str],
 }
 
 pub const AGENTS: &[Agent] = &[
@@ -69,6 +74,7 @@ pub const AGENTS: &[Agent] = &[
         // --strict-mcp-config: ignore user/project MCP servers - a title
         // needs no tools and must not pay their startup.
         oneshot_args: &["-p", "--max-turns", "1", "--strict-mcp-config"],
+        resume_args: &["--resume"],
     },
     Agent {
         id: "codex",
@@ -84,6 +90,7 @@ pub const AGENTS: &[Agent] = &[
             args: &["exec", "--sandbox", "workspace-write"],
         },
         oneshot_args: &["exec"],
+        resume_args: &["resume"],
     },
     Agent {
         id: "pi",
@@ -103,6 +110,7 @@ pub const AGENTS: &[Agent] = &[
         // ungated. Print mode is unrestricted, so no sandbox flag is needed.
         ask: AskInvocation::Exec { args: &["-p"] },
         oneshot_args: &["-p"],
+        resume_args: &[],
     },
     Agent {
         id: "opencode",
@@ -124,6 +132,7 @@ pub const AGENTS: &[Agent] = &[
         // lets asks act through tools while preserving explicit config denies.
         ask: AskInvocation::Exec { args: &["run", "--auto"] },
         oneshot_args: &["run"],
+        resume_args: &[],
     },
 ];
 
@@ -210,6 +219,25 @@ pub fn resume_command(agent: &Agent, model: Option<&str>) -> String {
         cmd.push_str(m);
     }
     cmd
+}
+
+/// Reopen one specific agent conversation by the CLI's own session id -
+/// `claude --resume <id>`, `codex resume <id>` - for a pane whose tmux
+/// session died under it (server crash, reboot). Unlike `resume_command`
+/// this carries no model: the conversation is what's being continued, and
+/// the CLI restores it as it was. None for a CLI with no resume-by-id.
+pub fn resume_session_command(agent: &Agent, session: &str) -> Option<String> {
+    if agent.resume_args.is_empty() || session.is_empty() {
+        return None;
+    }
+    let mut cmd = agent.bin.to_string();
+    for arg in agent.resume_args {
+        cmd.push(' ');
+        cmd.push_str(arg);
+    }
+    cmd.push(' ');
+    cmd.push_str(&shell_quote(session));
+    Some(cmd)
 }
 
 /// The captured one-shot behind AI workspace-title generation (workspace.rs,
@@ -375,6 +403,21 @@ pub fn output_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_session_command_per_cli() {
+        let id = "7dbe68d3-22d9-4bc8-9e30-86e3dac4ed1d";
+        assert_eq!(
+            resume_session_command(by_id("claude").unwrap(), id).as_deref(),
+            Some("claude --resume '7dbe68d3-22d9-4bc8-9e30-86e3dac4ed1d'")
+        );
+        assert_eq!(
+            resume_session_command(by_id("codex").unwrap(), id).as_deref(),
+            Some("codex resume '7dbe68d3-22d9-4bc8-9e30-86e3dac4ed1d'")
+        );
+        assert_eq!(resume_session_command(by_id("pi").unwrap(), id), None);
+        assert_eq!(resume_session_command(by_id("claude").unwrap(), ""), None);
+    }
 
     #[test]
     fn output_with_timeout_kills_on_deadline() {

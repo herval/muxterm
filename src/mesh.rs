@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::layout::SplitAxis;
-use crate::state::StateFile;
+use crate::state::{AgentResume, StateFile};
 
 pub const SOCKET: &str = "muxterm";
 pub const SESSION_PREFIX: &str = "mux-";
@@ -685,20 +685,37 @@ pub fn remove_session(session: &str) {
 pub struct AgentState {
     pub state: String,
     pub ts: u64,
+    /// Which conversation is running, when the hook knows (claude and codex
+    /// payloads carry `session_id` + `cwd`; the hook command names the
+    /// agent). What lets the GUI `--resume` it after the pane's session
+    /// dies. Additive with `#[serde(default)]`; omitted when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<AgentResume>,
 }
 
 /// Overwrite the session's state. Concurrent hook invocations (parallel
 /// tool calls each firing PreToolUse) may race; a pid-unique temp name plus
 /// rename keeps every observed file whole, and the racers all write the
-/// same verdict anyway.
-pub fn write_agent_state(session: &str, state: &str) -> anyhow::Result<()> {
+/// same verdict anyway. A hook that knows no conversation (pi's extension
+/// passes no payload) keeps whatever the previous record said.
+pub fn write_agent_state(
+    session: &str,
+    state: &str,
+    resume: Option<AgentResume>,
+) -> anyhow::Result<()> {
     let _ = fs::create_dir_all(agent_state_dir());
     let path = agent_state_path(session);
     let tmp = agent_state_dir().join(format!(
         "{session}.json.{}",
         std::process::id()
     ));
-    let record = AgentState { state: state.to_string(), ts: now() };
+    let resume = resume.or_else(|| {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<AgentState>(&t).ok())
+            .and_then(|prev| prev.resume)
+    });
+    let record = AgentState { state: state.to_string(), ts: now(), resume };
     fs::write(&tmp, serde_json::to_string(&record)?)?;
     fs::rename(&tmp, &path)?;
     Ok(())
@@ -913,11 +930,13 @@ mod tests {
                                 session: "mux-a".into(),
                                 cwd: None,
                                 name: "otter".into(),
+                                agent: None,
                             }),
                             second: Box::new(NodeState::Leaf {
                                 session: "mux-b".into(),
                                 cwd: None,
                                 name: "falcon".into(),
+                                agent: None,
                             }),
                         },
                     },
@@ -929,6 +948,7 @@ mod tests {
                             session: "mux-c".into(),
                             cwd: None,
                             name: String::new(),
+                            agent: None,
                         },
                     },
                 ],
@@ -962,7 +982,7 @@ mod tests {
 
     #[test]
     fn agent_state_serde_round_trips_and_tolerates_unknowns() {
-        let s = AgentState { state: "working".into(), ts: 42 };
+        let s = AgentState { state: "working".into(), ts: 42, resume: None };
         let back: AgentState =
             serde_json::from_str(&serde_json::to_string(&s).unwrap())
                 .unwrap();
