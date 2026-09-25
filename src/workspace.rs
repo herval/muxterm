@@ -171,6 +171,10 @@ impl Workspace {
 /// The layout's source of truth is `state::ProjectState`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
+    /// Base ref for new branches; existing branches retain their history.
+    pub default_branch: Option<String>,
+    /// Repository-relative file globs copied before setup; ! excludes.
+    pub copy_files: Vec<String>,
     pub name: String,
     /// Local root when set; else the project lives at `local_root()`'s
     /// clone destination.
@@ -187,6 +191,8 @@ pub struct Project {
 impl Project {
     pub fn to_state(&self) -> ProjectState {
         ProjectState {
+            default_branch: self.default_branch.clone(),
+            copy_files: self.copy_files.clone(),
             name: self.name.clone(),
             path: self.path.clone(),
             repo: self.repo.clone(),
@@ -197,6 +203,8 @@ impl Project {
 
     pub fn from_state(s: ProjectState) -> Self {
         Self {
+            default_branch: s.default_branch,
+            copy_files: s.copy_files,
             name: s.name,
             path: s.path,
             repo: s.repo,
@@ -977,6 +985,98 @@ fn populate_worktree(
     wt: &Worktree,
     choice: &BranchChoice,
 ) -> anyhow::Result<()> {
+    populate_worktree_with_options(root, wt, choice, &ProjectOptions::default())
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProjectOptions {
+    pub default_branch: Option<String>,
+    pub copy_files: Vec<String>,
+}
+
+impl From<&Project> for ProjectOptions {
+    fn from(project: &Project) -> Self {
+        Self {
+            default_branch: project.default_branch.clone(),
+            copy_files: project.copy_files.clone(),
+        }
+    }
+}
+
+fn populate_worktree_with_options(
+    root: &Path,
+    wt: &Worktree,
+    choice: &BranchChoice,
+    options: &ProjectOptions,
+) -> anyhow::Result<()> {
+    let base =
+        if matches!(choice, BranchChoice::Codename | BranchChoice::New(_)) {
+            options
+                .default_branch
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+    if let Some(base) = base {
+        // Fetch only an explicitly named remote ref; never move the user's HEAD.
+        let remotes = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("remote")
+            .output()?;
+        let qualified = base.strip_prefix("refs/remotes/").unwrap_or(base);
+        if let Some((remote, branch)) = qualified.split_once('/') {
+            if String::from_utf8_lossy(&remotes.stdout)
+                .lines()
+                .any(|r| r == remote)
+            {
+                let refspec = format!(
+                    "+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+                );
+                let out = Command::new("git")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .arg("-C")
+                    .arg(root)
+                    .args(["fetch", "--", remote, &refspec])
+                    .output()?;
+                anyhow::ensure!(
+                    out.status.success(),
+                    "fetching base '{base}' failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+        }
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{base}^{{commit}}"),
+            ])
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "base branch '{base}' does not resolve to a commit"
+        );
+        // Use the verified object ID, not user input, as a positional git argument.
+        let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["worktree", "add", "-b", &wt.branch])
+            .arg(&wt.path)
+            .arg(oid)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return copy_project_files(root, &wt.path, &options.copy_files);
+    }
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(root).args(["worktree", "add"]);
     match choice {
@@ -996,6 +1096,123 @@ fn populate_worktree(
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("git worktree add failed: {}", err.trim());
+    }
+    copy_project_files(root, &wt.path, &options.copy_files)
+}
+
+/// Copy selected files from the source checkout, including ignored files.
+/// Patterns use Git glob pathspecs: basenames match at any depth, slashes
+/// anchor to the root, and ! patterns exclude. No script is evaluated.
+fn copy_project_files(
+    root: &Path,
+    destination: &Path,
+    patterns: &[String],
+) -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+    use std::path::Component;
+    if patterns.is_empty() {
+        return Ok(());
+    }
+    let mut specs = Vec::new();
+    let mut has_include = false;
+    for pattern in patterns.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let (exclude, pattern) = match pattern.strip_prefix('!') {
+            Some(p) => (true, p),
+            None => (false, pattern),
+        };
+        anyhow::ensure!(
+            !pattern.is_empty()
+                && Path::new(pattern)
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_))),
+            "copy pattern must be repository-relative: {pattern}"
+        );
+        anyhow::ensure!(
+            !pattern.split('/').any(|p| p == ".git"),
+            "cannot copy Git metadata"
+        );
+        has_include |= !exclude;
+        let prefix = if exclude {
+            ":(top,glob,exclude)"
+        } else {
+            ":(top,glob)"
+        };
+        let glob = if pattern.ends_with('/') {
+            format!("{pattern}**")
+        } else if pattern.contains('/') {
+            pattern.to_string()
+        } else {
+            format!("**/{pattern}")
+        };
+        specs.push(format!("{prefix}{glob}"));
+    }
+    anyhow::ensure!(
+        has_include,
+        "files to copy needs at least one include pattern"
+    );
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--cached", "--others", "-z", "--"])
+        .args(specs)
+        .output()?;
+    anyhow::ensure!(
+        out.status.success(),
+        "listing files to copy failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let mut files = BTreeSet::new();
+    for bytes in out.stdout.split(|b| *b == 0).filter(|b| !b.is_empty()) {
+        #[cfg(unix)]
+        let relative = {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+        };
+        #[cfg(not(unix))]
+        let relative = PathBuf::from(std::str::from_utf8(bytes)?);
+        anyhow::ensure!(
+            relative
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+                && !relative.components().any(|c| c.as_os_str() == ".git"),
+            "unsafe copy path: {}",
+            relative.display()
+        );
+        // Check both trees component-by-component: never follow symlinks,
+        // including an innocent filename under a symlinked directory.
+        for base in [root, destination] {
+            let mut path = base.to_path_buf();
+            for part in relative.components() {
+                path.push(part);
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) => anyhow::ensure!(
+                        !meta.file_type().is_symlink(),
+                        "refusing to copy through symlink: {}",
+                        path.display()
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        let source = root.join(&relative);
+        // Deleted tracked files need no copying. Submodules are directories.
+        if !source.exists() {
+            continue;
+        }
+        anyhow::ensure!(
+            source.is_file(),
+            "copy source is not a regular file: {}",
+            relative.display()
+        );
+        files.insert(relative);
+    }
+    for relative in files {
+        let target = destination.join(&relative);
+        fs::create_dir_all(target.parent().expect("relative file has parent"))?;
+        fs::copy(root.join(&relative), &target).map_err(|e| {
+            anyhow::anyhow!("copying {} failed: {e}", relative.display())
+        })?;
     }
     Ok(())
 }
@@ -1024,6 +1241,7 @@ pub fn spawn_worktree(
     worktree: Worktree,
     choice: BranchChoice,
     fresh_base: bool,
+    options: ProjectOptions,
     tx: Sender<(String, WorktreeMsg)>,
     ctx: egui::Context,
 ) {
@@ -1032,11 +1250,16 @@ pub fn spawn_worktree(
             let _ = tx.send((tab_id.clone(), WorktreeMsg::Progress(line)));
             ctx.request_repaint();
         };
-        if fresh_base {
+        if fresh_base
+            && (options.default_branch.is_none()
+                || !matches!(choice, BranchChoice::Codename | BranchChoice::New(_)))
+        {
             refresh_base(&root, &choice, &progress);
         }
         progress("checking out worktree…".into());
-        let res = match populate_worktree(&root, &worktree, &choice) {
+        let res = match populate_worktree_with_options(
+            &root, &worktree, &choice, &options,
+        ) {
             Ok(()) => Ok(worktree),
             Err(e) => Err(format!("{e:#}")),
         };
@@ -1061,6 +1284,7 @@ pub fn spawn_clone_worktree(
     root: PathBuf,
     worktree: Worktree,
     branch_input: String,
+    options: ProjectOptions,
     tx: Sender<(String, WorktreeMsg)>,
     ctx: egui::Context,
 ) {
@@ -1075,6 +1299,7 @@ pub fn spawn_clone_worktree(
             &root,
             worktree,
             &branch_input,
+            &options,
             &progress,
         )
         .map_err(|(_, e)| format!("{e:#}"));
@@ -1329,6 +1554,7 @@ fn clone_and_populate(
     root: &Path,
     worktree: Worktree,
     branch_input: &str,
+    options: &ProjectOptions,
     progress: impl Fn(String),
 ) -> Result<Worktree, (Worktree, anyhow::Error)> {
     if let Some(parent) = root.parent() {
@@ -1364,7 +1590,7 @@ fn clone_and_populate(
         BranchChoice::Track { name, .. } => name.clone(),
     };
     progress("checking out worktree…".into());
-    match populate_worktree(root, &wt, &choice) {
+    match populate_worktree_with_options(root, &wt, &choice, options) {
         Ok(()) => Ok(wt),
         Err(e) => Err((wt, e)),
     }
@@ -2256,6 +2482,8 @@ ffeedd refs/heads/
     #[test]
     fn project_local_root_and_needs_clone() {
         let local = Project {
+            default_branch: None,
+            copy_files: Vec::new(),
             name: "muxterm".into(),
             path: Some("/tmp/muxterm".into()),
             repo: None,
@@ -2269,6 +2497,8 @@ ffeedd refs/heads/
         // machine, whatever ~/.muxterm/clones already holds.
         let repo_val = format!("herval/dot-{}", uuid::Uuid::new_v4());
         let repo = Project {
+            default_branch: None,
+            copy_files: Vec::new(),
             name: "dots/nvim".into(),
             path: None,
             repo: Some(repo_val.clone()),
@@ -2312,6 +2542,8 @@ ffeedd refs/heads/
         setup: Option<&str>,
     ) -> Project {
         Project {
+            default_branch: None,
+            copy_files: Vec::new(),
             name: name.into(),
             path: path.map(PathBuf::from),
             repo: repo.map(str::to_string),
@@ -2743,6 +2975,137 @@ ffeedd refs/heads/
         fs::remove_dir_all(&scratch).unwrap();
     }
 
+    #[test]
+    fn project_base_fetches_remote_without_moving_source_head() {
+        let (scratch, git) = scratch_git("project-base");
+        let origin = scratch.join("origin");
+        seed_repo(&git, &origin);
+        git(&origin, &["branch", "prod"]);
+        let root = scratch.join("clone");
+        git(
+            &scratch,
+            &["clone", origin.to_str().unwrap(), root.to_str().unwrap()],
+        );
+        let head = git(&root, &["rev-parse", "HEAD"]);
+        git(&origin, &["checkout", "prod"]);
+        git(
+            &origin,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "advance prod",
+            ],
+        );
+        let expected = git(&origin, &["rev-parse", "prod"]);
+        fs::write(root.join(".env.local"), "TEST_VALUE=fixture").unwrap();
+        let wt = Worktree {
+            path: scratch.join("wt"),
+            branch: "new-work".into(),
+        };
+        let options = ProjectOptions {
+            default_branch: Some("origin/prod".into()),
+            copy_files: vec![".env*".into()],
+        };
+        populate_worktree_with_options(
+            &root,
+            &wt,
+            &BranchChoice::New(wt.branch.clone()),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(git(&wt.path, &["rev-parse", "HEAD"]), expected);
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            fs::read_to_string(wt.path.join(".env.local")).unwrap(),
+            "TEST_VALUE=fixture"
+        );
+        assert_eq!(git(&wt.path, &["branch", "--show-current"]), "new-work");
+        // Existing branches ignore the default; it cannot change their history.
+        git(&root, &["branch", "existing"]);
+        let existing = Worktree {
+            path: scratch.join("existing"),
+            branch: "existing".into(),
+        };
+        populate_worktree_with_options(
+            &root,
+            &existing,
+            &BranchChoice::Existing("existing".into()),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(git(&existing.path, &["rev-parse", "HEAD"]), head);
+        let invalid = Worktree {
+            path: scratch.join("invalid"),
+            branch: "invalid".into(),
+        };
+        let invalid_options = ProjectOptions {
+            default_branch: Some("missing-base".into()),
+            ..Default::default()
+        };
+        assert!(populate_worktree_with_options(
+            &root,
+            &invalid,
+            &BranchChoice::Codename,
+            &invalid_options
+        )
+        .is_err());
+        assert!(!invalid.path.exists());
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn project_copy_includes_ignored_nested_files_and_excludes_patterns() {
+        let (scratch, git) = scratch_git("project-copy");
+        let root = scratch.join("repo");
+        seed_repo(&git, &root);
+        fs::write(root.join(".gitignore"), ".env*\n").unwrap();
+        fs::create_dir_all(root.join("apps/web")).unwrap();
+        fs::write(root.join(".env"), "root").unwrap();
+        fs::write(root.join("apps/web/.env.local"), "nested").unwrap();
+        fs::write(root.join("apps/web/.env.example"), "example").unwrap();
+        let dest = scratch.join("target");
+        fs::create_dir(&dest).unwrap();
+        copy_project_files(&root, &dest, &[".env*".into(), "!.env.example".into()])
+            .unwrap();
+        assert_eq!(fs::read_to_string(dest.join(".env")).unwrap(), "root");
+        assert_eq!(
+            fs::read_to_string(dest.join("apps/web/.env.local")).unwrap(),
+            "nested"
+        );
+        assert!(!dest.join("apps/web/.env.example").exists());
+        assert!(!dest.join(".git").exists());
+        for pattern in ["../outside", "/tmp/outside", "!.env", ".git/config"] {
+            assert!(
+                copy_project_files(&root, &dest, &[pattern.into()]).is_err(),
+                "{pattern}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                scratch.join("outside"),
+                root.join(".env.link"),
+            )
+            .unwrap();
+            assert!(copy_project_files(&root, &dest, &[".env*".into()]).is_err());
+            let dest2 = scratch.join("target2");
+            fs::create_dir(&dest2).unwrap();
+            std::os::unix::fs::symlink(&dest, dest2.join("apps")).unwrap();
+            assert!(copy_project_files(
+                &root,
+                &dest2,
+                &["apps/web/.env.local".into()]
+            )
+            .is_err());
+        }
+        fs::remove_dir_all(scratch).unwrap();
+    }
+
     fn scratch_git(
         name: &str,
     ) -> (PathBuf, impl Fn(&Path, &[&str]) -> String) {
@@ -2800,6 +3163,7 @@ ffeedd refs/heads/
             &root,
             wt,
             "feat/x",
+            &ProjectOptions::default(),
             |_| {},
         )
         .expect("clone + checkout");
@@ -2821,6 +3185,7 @@ ffeedd refs/heads/
             &root2,
             wt,
             "x",
+            &ProjectOptions::default(),
             |_| {},
         )
         .expect_err("clone must fail");
@@ -2991,6 +3356,7 @@ ffeedd refs/heads/
             Worktree { path: claim.clone(), branch: "wt".into() },
             BranchChoice::Codename,
             false,
+            ProjectOptions::default(),
             tx,
             egui::Context::default(),
         );
