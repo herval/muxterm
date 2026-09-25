@@ -90,6 +90,17 @@ pub fn agent_state_path(session: &str) -> PathBuf {
     agent_state_dir().join(format!("{session}.json"))
 }
 
+/// Each pane's first substantive prompt of its current agent session, as
+/// recorded by the UserPromptSubmit hook - what the GUI's session-boundary
+/// namer names the workspace from.
+pub fn agent_prompt_dir() -> PathBuf {
+    config_dir().join("agent-prompt")
+}
+
+pub fn agent_prompt_path(session: &str) -> PathBuf {
+    agent_prompt_dir().join(format!("{session}.json"))
+}
+
 pub fn ensure_dirs() {
     let _ = fs::create_dir_all(inbox_dir());
     let _ = fs::create_dir_all(ctx_dir());
@@ -245,13 +256,19 @@ pub fn pane_names(state: &StateFile) -> HashMap<String, String> {
 /// agent its own tab name - and tell whether it's still a `random_title`
 /// codename (`state::is_codename`).
 pub fn title_of_tab(state: &StateFile, tab_id: &str) -> Option<String> {
+    workspace_of_tab(state, tab_id).map(|w| w.title.clone())
+}
+
+pub fn workspace_of_tab<'a>(
+    state: &'a StateFile,
+    tab_id: &str,
+) -> Option<&'a crate::state::WorkspaceState> {
     state
         .windows
         .iter()
         .flat_map(|w| &w.tabs)
         .find(|t| t.id == tab_id)
         .and_then(|t| t.workspace.as_ref())
-        .map(|w| w.title.clone())
 }
 
 /// A pane asking the GUI to split it (written by `mux split`, drained by
@@ -413,6 +430,12 @@ pub struct RenameRequest {
     /// New one-line description; None leaves it unchanged.
     #[serde(default)]
     pub description: Option<String>,
+    /// Title provenance: Some(true) is a name the user chose (locks the
+    /// title against automatic renames), Some(false) hands naming back to
+    /// muxterm, None is an automatic rename - ignored while the title is
+    /// locked.
+    #[serde(default)]
+    pub lock: Option<bool>,
     pub ts: u64,
 }
 
@@ -651,6 +674,7 @@ pub fn remove_session(session: &str) {
     let _ = fs::remove_file(inbox_path(session));
     let _ = fs::remove_file(flag_path(session));
     remove_agent_state(session);
+    remove_agent_prompt(session);
 }
 
 /// A pane agent's lifecycle state, as reported by its own hooks through
@@ -682,6 +706,67 @@ pub fn write_agent_state(session: &str, state: &str) -> anyhow::Result<()> {
 
 pub fn remove_agent_state(session: &str) {
     let _ = fs::remove_file(agent_state_path(session));
+}
+
+/// The first substantive prompt of a pane's current agent session
+/// (`agent_session` is the agent CLI's own session id, which changes on a
+/// new session and on /clear). One record per pane, replaced only when the
+/// agent session changes - so a session boundary is exactly "the stored id
+/// moved".
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct AgentPrompt {
+    pub agent_session: String,
+    pub prompt: String,
+    pub ts: u64,
+}
+
+pub fn read_agent_prompt(session: &str) -> Option<AgentPrompt> {
+    let text = fs::read_to_string(agent_prompt_path(session)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Same pid-unique temp + rename as `write_agent_state`.
+pub fn write_agent_prompt(
+    session: &str,
+    record: &AgentPrompt,
+) -> anyhow::Result<()> {
+    let _ = fs::create_dir_all(agent_prompt_dir());
+    let tmp = agent_prompt_dir()
+        .join(format!("{session}.json.{}", std::process::id()));
+    fs::write(&tmp, serde_json::to_string(record)?)?;
+    fs::rename(&tmp, agent_prompt_path(session))?;
+    Ok(())
+}
+
+pub fn remove_agent_prompt(session: &str) {
+    let _ = fs::remove_file(agent_prompt_path(session));
+}
+
+/// Every pane's recorded prompt (file stem -> record); unreadable entries
+/// are skipped like `read_agent_states`.
+pub fn read_agent_prompts() -> BTreeMap<String, AgentPrompt> {
+    let mut out = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(agent_prompt_dir()) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(session) =
+            path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(rec) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<AgentPrompt>(&text).ok())
+        {
+            out.insert(session, rec);
+        }
+    }
+    out
 }
 
 /// Every session's reported state (file stem -> parsed record). Unreadable
@@ -975,6 +1060,7 @@ mod tests {
             from: "mux-aaaa".into(),
             title: Some("Fix auth".into()),
             description: Some("reworking the login flow".into()),
+            lock: Some(true),
             ts: 42,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -982,11 +1068,13 @@ mod tests {
         assert_eq!(back.from, "mux-aaaa");
         assert_eq!(back.title.as_deref(), Some("Fix auth"));
         assert_eq!(back.description.as_deref(), Some("reworking the login flow"));
+        assert_eq!(back.lock, Some(true));
         assert_eq!(back.ts, 42);
-        // title and description are both optional on the wire.
+        // title, description and lock are all optional on the wire.
         let bare: RenameRequest =
             serde_json::from_str(r#"{"v":1,"from":"mux-a","ts":1}"#).unwrap();
         assert!(bare.title.is_none());
         assert!(bare.description.is_none());
+        assert!(bare.lock.is_none());
     }
 }

@@ -36,7 +36,7 @@ const EXIT_REFUSED: i32 = 8;
 const TELL_MAX: usize = 64 * 1024;
 const POST_MAX: usize = 16 * 1024;
 const NOTIFY_MAX: usize = 1024;
-const RENAME_MAX: usize = 256;
+const RENAME_MAX: usize = agent::TITLE_MAX;
 
 const USAGE: &str = "\
 mux - agent mesh for muxterm panes (team = the panes of one tab)
@@ -75,19 +75,24 @@ usage: mux [--as <session>] [--json] <command> [args]
   post <peer> [msg...]         queue a message in their inbox (+1 notify)
   notify [msg...]              raise your tab's attention badge in the
                                muxterm UI (banner when it is unfocused)
-  agent-event <state>          report agent lifecycle to the sidebar dot
-                               (working|idle|attention|gone); wired into
-                               agent hooks automatically - inert outside
-                               muxterm, never fails, never prints
-  rename [--desc <text>] [name...]
-                               relabel this workspace when the objective
-                               changes (display-only: name and/or --desc;
-                               never touches the git branch or worktree)
+  agent-event <state> [--prompt]
+                               report agent lifecycle to the sidebar dot
+                               (working|idle|attention|gone); --prompt also
+                               records the session's first real prompt for
+                               auto-naming. Wired into agent hooks
+                               automatically - inert outside muxterm, never
+                               fails, never prints
+  rename [--lock|--auto] [--desc <text>] [name...]
+                               relabel this workspace (display-only: name
+                               and/or --desc; never touches the git branch).
+                               Run from a terminal, or with --lock, the name
+                               is the user's and muxterm stops auto-naming
+                               the workspace; --auto hands naming back
   retitle [--wait]             regenerate this workspace's title and
                                description from what its panes are doing
-                               (an AI one-shot; same display-only effect
-                               as rename; returns immediately and applies
-                               in the background unless --wait)
+                               (an AI one-shot; refused while the user's
+                               own name is locked in; returns immediately
+                               and applies in the background unless --wait)
   inbox [--consume]            read your queued messages
   ctx set <k> <v...> | get [k] | del <k>
                                shared per-tab key-value scratchpad
@@ -492,10 +497,10 @@ struct Scope {
     /// session -> durable pane codename (state.json), the always-present name
     /// under any `mux join` registry name. See `Scope::name_of`.
     pane_names: HashMap<String, String>,
-    /// The caller's workspace title, if its tab carries a workspace. Lets the
-    /// brief show the agent its own tab name and nudge a rename while it's
-    /// still a codename.
-    workspace_title: Option<String>,
+    /// The caller's workspace title was set by the user (`title_locked`):
+    /// an automatic rename (`retitle`, an agent's plain `rename`) is refused
+    /// up front rather than vanishing into the spool.
+    title_locked: bool,
 }
 
 fn scope(tmux: &Tmux, as_session: Option<String>) -> Result<Scope, Fail> {
@@ -520,7 +525,8 @@ fn scope(tmux: &Tmux, as_session: Option<String>) -> Result<Scope, Fail> {
             tab.tree.sessions(&mut all_sessions);
         }
     }
-    let workspace_title = mesh::title_of_tab(&st, &tab_id);
+    let title_locked = mesh::workspace_of_tab(&st, &tab_id)
+        .is_some_and(|w| w.title_locked);
     let pane_names = mesh::pane_names(&st);
     Ok(Scope {
         session,
@@ -529,7 +535,7 @@ fn scope(tmux: &Tmux, as_session: Option<String>) -> Result<Scope, Fail> {
         all_sessions,
         registry: mesh::load_registry(),
         pane_names,
-        workspace_title,
+        title_locked,
     })
 }
 
@@ -1423,22 +1429,18 @@ fn cmd_notify(as_session: Option<String>, args: Vec<String>) -> CmdResult {
 /// Deliberately unlike every other command: it must be safe to run from any
 /// hook context, so it resolves identity from MUXTERM_SESSION alone (no
 /// tmux round trips), silently no-ops outside muxterm, drains stdin (hooks
-/// pipe a JSON payload; an unread pipe could block the agent), and always
-/// exits 0 (a nonzero PreToolUse hook can block the tool call). The payload's
-/// Codex-specific `model` field also lets stale hook configs stay compatible.
+/// pipe a JSON payload; an unread pipe could block the agent), never prints
+/// (claude reads a PreToolUse hook's stdout as a permission decision, codex
+/// requires it to be JSON), and always exits 0 (a nonzero PreToolUse hook
+/// can block the tool call).
 ///
-/// It prints to stdout in exactly one case: the `--nudge-name` flag, which
-/// agent_hooks wires onto the UserPromptSubmit hook *only* (never PreToolUse,
-/// whose stdout claude reads as a permission decision). When set and the
-/// workspace still wears its codename, it emits one line that claude injects
-/// as prompt context - the "rename me when your plan starts" nudge. Codex
-/// requires non-empty stdout to be JSON, so it never receives the text line.
+/// `--prompt` rides the UserPromptSubmit hook: it records the payload's
+/// prompt as the pane's `mesh::AgentPrompt` - the first substantive prompt
+/// of each agent session - which the GUI's session-boundary namer reads.
 fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
-    let mut codex_hook = false;
+    let mut payload = Vec::new();
     if !io::stdin().is_terminal() {
-        let mut sink = Vec::new();
-        let _ = io::stdin().read_to_end(&mut sink);
-        codex_hook = is_codex_hook_input(&sink);
+        let _ = io::stdin().read_to_end(&mut payload);
     }
     let session = as_session
         .or_else(|| env::var("MUXTERM_SESSION").ok())
@@ -1447,7 +1449,10 @@ fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
         return Ok(());
     };
     match state.as_str() {
-        "gone" => mesh::remove_agent_state(&session),
+        "gone" => {
+            mesh::remove_agent_state(&session);
+            mesh::remove_agent_prompt(&session);
+        },
         "working" | "idle" | "attention" => {
             if let Err(e) = mesh::write_agent_state(&session, state) {
                 eprintln!("mux: agent-event: {e:#}");
@@ -1455,15 +1460,14 @@ fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
         },
         other => eprintln!("mux: agent-event: unknown state {other:?}"),
     }
-    if !codex_hook
-        && state == "working"
-        && args.iter().any(|a| a == "--nudge-name")
-    {
-        if let Some(st) = state::peek() {
-            if let Some((tab_id, _)) = mesh::tab_of_session(&st, &session) {
-                let title = mesh::title_of_tab(&st, &tab_id);
-                if let Some(line) = name_nudge(title.as_deref()) {
-                    println!("{line}");
+    if args.iter().any(|a| a == "--prompt") {
+        if let Some((agent_session, prompt)) = prompt_payload(&payload) {
+            let stored = mesh::read_agent_prompt(&session);
+            if let Some(rec) =
+                next_prompt_record(stored.as_ref(), &agent_session, &prompt)
+            {
+                if let Err(e) = mesh::write_agent_prompt(&session, &rec) {
+                    eprintln!("mux: agent-event: {e:#}");
                 }
             }
         }
@@ -1471,54 +1475,83 @@ fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
     Ok(())
 }
 
-/// Codex adds the active model slug to every hook payload; Claude does not.
-/// Keep this tolerant because lifecycle reporting must never fail on malformed
-/// or future hook input.
-fn is_codex_hook_input(input: &[u8]) -> bool {
-    match serde_json::from_slice::<serde_json::Value>(input) {
-        Ok(value) => value.get("model").is_some_and(|model| model.is_string()),
-        Err(_) => false,
-    }
+/// `(session_id, prompt)` out of a UserPromptSubmit payload - claude and
+/// codex both send the pair. Tolerant: anything malformed is just None.
+fn prompt_payload(input: &[u8]) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_slice(input).ok()?;
+    let sid = v.get("session_id")?.as_str()?.trim();
+    let prompt = v.get("prompt")?.as_str()?.trim();
+    (!sid.is_empty()).then(|| (sid.to_string(), prompt.to_string()))
 }
 
-/// The one-line UserPromptSubmit nudge, injected while - and only while - the
-/// workspace still wears its `random_title` codename. Pure so the codename
-/// gate unit-tests; returns None (and the hook stays silent) the moment the
-/// tab has a real name, so the reminder repeats until the agent acts, then
-/// stops on its own.
-fn name_nudge(title: Option<&str>) -> Option<String> {
-    let t = title?;
-    if !state::is_codename(t) {
+/// Words a prompt needs before it can say what a session is *for*: "yes",
+/// "continue", "fix it" and the like carry no goal to name a workspace from.
+const SUBSTANTIVE_WORDS: usize = 4;
+
+/// Can this prompt name a workspace? Slash commands and short follow-ups
+/// can't.
+fn is_substantive(prompt: &str) -> bool {
+    let p = prompt.trim();
+    !p.starts_with('/') && p.split_whitespace().count() >= SUBSTANTIVE_WORDS
+}
+
+/// The record to store for this prompt, or None to leave the stored one:
+/// only the first substantive prompt of each agent session is kept, so the
+/// stored `agent_session` moving is exactly a session boundary.
+fn next_prompt_record(
+    stored: Option<&mesh::AgentPrompt>,
+    agent_session: &str,
+    prompt: &str,
+) -> Option<mesh::AgentPrompt> {
+    if stored.is_some_and(|r| r.agent_session == agent_session)
+        || !is_substantive(prompt)
+    {
         return None;
     }
-    Some(format!(
-        "[muxterm] this workspace is still named '{t}' - now that you know the \
-         task, give it a short descriptive title: a 2-5 word plain-English \
-         phrase capturing the intent (like a tab label, NOT a branch slug - \
-         spaces, not hyphens). Run e.g. `mux rename \"Fix auth redirect\" \
-         --desc \"<one line of detail>\"`, or `mux retitle` to derive it from \
-         your panes."
-    ))
+    let mut prompt = prompt.trim().to_string();
+    while prompt.len() > PROMPT_RECORD_MAX {
+        prompt.pop();
+    }
+    Some(mesh::AgentPrompt {
+        agent_session: agent_session.to_string(),
+        prompt,
+        ts: mesh::now(),
+    })
 }
 
-/// Relabel the workspace (tab) this pane lives in - for an agent whose task
-/// has drifted from what the workspace was created for. Positional args are
-/// the new name; `--desc` sets the one-line description; at least one is
-/// required. Display-only: the GUI updates the workspace title/description
-/// and never touches the git branch or worktree. Fire-and-forget, like notify.
+/// Enough of a prompt to name its goal; a pasted log should not ride along
+/// into the namer's one-shot.
+const PROMPT_RECORD_MAX: usize = 2000;
+
+/// Relabel the workspace (tab) this pane lives in. Positional args are the
+/// new name; `--desc` sets the one-line description. Display-only: the GUI
+/// updates the workspace title/description and never touches the git branch
+/// or worktree. Fire-and-forget, like notify.
+///
+/// Provenance decides whether muxterm may rename it again later: typed at a
+/// terminal (the user) or passed `--lock` (an agent the user asked), the name
+/// locks; from an agent otherwise it is an automatic rename, refused while
+/// the user's name is locked in. `--auto` unlocks, with or without a name.
 fn cmd_rename(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
     let usage = || {
         (
             EXIT_USAGE,
-            "usage: mux rename [--desc <text>] [name...]  (name and/or --desc)"
+            "usage: mux rename [--lock|--auto] [--desc <text>] [name...]  \
+             (name and/or --desc; --auto alone just unlocks)"
                 .to_string(),
         )
     };
+    let lock_flag = take_flag(&mut args, "--lock");
+    let auto = take_flag(&mut args, "--auto");
     let description = take_opt(&mut args, "--desc")?;
     let title = (!args.is_empty()).then(|| args.join(" "));
-    if title.is_none() && description.is_none() {
+    if lock_flag && auto {
+        return Err((EXIT_USAGE, "--lock and --auto conflict".to_string()));
+    }
+    if title.is_none() && description.is_none() && !auto {
         return Err(usage());
     }
+    let lock = rename_lock(lock_flag, auto, io::stdout().is_terminal());
     for (what, val) in [("name", &title), ("description", &description)] {
         if val.as_ref().is_some_and(|v| v.len() > RENAME_MAX) {
             return Err((
@@ -1530,16 +1563,46 @@ fn cmd_rename(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
 
     let tmux = Tmux::new()?;
     let sc = scope(&tmux, as_session)?;
+    if lock.is_none() && sc.title_locked {
+        return Err(locked_refusal());
+    }
     mesh::write_rename_request(&mesh::RenameRequest {
         v: 1,
         from: sc.session,
         title,
         description,
+        lock,
         ts: mesh::now(),
     })
     .map_err(|e| (EXIT_TMUX, format!("spooling rename: {e}")))?;
-    println!("renamed");
+    match lock {
+        Some(true) => println!("renamed (locked: muxterm won't auto-rename it)"),
+        Some(false) => println!("renamed (unlocked: muxterm names it again)"),
+        None => println!("renamed"),
+    }
     Ok(())
+}
+
+/// A rename's `RenameRequest::lock`: `--auto` unlocks, `--lock` or a human
+/// at a terminal locks, anything else (an agent's tool call has no tty) is
+/// an automatic rename.
+fn rename_lock(lock_flag: bool, auto: bool, interactive: bool) -> Option<bool> {
+    if auto {
+        Some(false)
+    } else if lock_flag || interactive {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn locked_refusal() -> Fail {
+    (
+        EXIT_REFUSED,
+        "this workspace's title was set by the user; leave it, or pass \
+         --lock only if the user asked for this name"
+            .to_string(),
+    )
 }
 
 /// Lines of scrollback captured per pane for the retitle context. Modest on
@@ -1593,6 +1656,9 @@ fn cmd_retitle(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
     let wait = take_flag(&mut args, "--wait");
     let tmux = Tmux::new()?;
     let sc = scope(&tmux, as_session)?;
+    if sc.title_locked {
+        return Err(locked_refusal());
+    }
     if !wait {
         let exe = env::current_exe()
             .map_err(|e| (EXIT_TMUX, format!("resolving mux path: {e}")))?;
@@ -1682,7 +1748,7 @@ fn cmd_retitle(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
         ));
     }
     let (title, description) =
-        parse_retitle(&String::from_utf8_lossy(&out.stdout)).ok_or((
+        agent::parse_title_reply(&String::from_utf8_lossy(&out.stdout)).ok_or((
             EXIT_TMUX,
             format!("{} returned no usable title", agent.bin),
         ))?;
@@ -1692,6 +1758,7 @@ fn cmd_retitle(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
         from: sc.session,
         title: Some(title.clone()),
         description: description.clone(),
+        lock: None,
         ts: mesh::now(),
     })
     .map_err(|e| (EXIT_TMUX, format!("spooling rename: {e}")))?;
@@ -1700,36 +1767,6 @@ fn cmd_retitle(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
         None => println!("renamed to: {title}"),
     }
     Ok(())
-}
-
-/// Pull `title | description` out of a one-shot agent reply. Exec-style
-/// CLIs stream progress lines before the answer, so the *last* non-empty
-/// line wins; quotes/backticks a model might add are stripped; both halves
-/// are capped at RENAME_MAX (what `mux rename` would accept). None when no
-/// usable title remains.
-fn parse_retitle(stdout: &str) -> Option<(String, Option<String>)> {
-    let line = stdout.lines().rev().find(|l| !l.trim().is_empty())?;
-    let (title, desc) = match line.split_once('|') {
-        Some((t, d)) => (t, Some(d)),
-        None => (line, None),
-    };
-    let clean = |s: &str| -> String {
-        let mut s = s
-            .trim()
-            .trim_matches(|c| c == '"' || c == '\'' || c == '`')
-            .trim()
-            .to_string();
-        while s.len() > RENAME_MAX {
-            s.pop();
-        }
-        s
-    };
-    let title = clean(title);
-    if title.is_empty() {
-        return None;
-    }
-    let description = desc.map(|d| clean(d)).filter(|d| !d.is_empty());
-    Some((title, description))
 }
 
 fn cmd_inbox(
@@ -2373,11 +2410,8 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
     let _ = writeln!(out, "- `mux split [right|down] [--run <cmd>]` - add a pane beside yours for a new teammate; prints its session name");
     let _ = writeln!(out, "- `mux new-tab [--cwd <dir>] [--run <cmd>] [--title <t>]` - open a NEW background tab running a command in a folder. **Only use this when the user explicitly asks you to open a tab/window** - never on your own initiative.");
-    let _ = writeln!(out, "- `mux rename [--desc <text>] <title...>` - relabel this workspace with a short descriptive title (2-5 words, spaces ok; updates the sidebar/tab, never the git branch)");
-    let _ = writeln!(out, "- `mux retitle` - regenerate the workspace's title/description from what its panes are doing (returns immediately; applies in the background)");
+    let _ = writeln!(out, "- `mux rename --lock [--desc <text>] <title...>` - name this workspace (sidebar/tab label, never the git branch). **Only when the user asks you to name it** - muxterm names workspaces on its own");
     let _ = writeln!(out, "- `mux automations list|create|run|...` - scheduled tasks (`--schedule 'daily at 09:00'`, `'every 30m'`, `'cron 0 9 * * 1-5'`), each running in its own tab. **Only use this when the user explicitly asks for something recurring/scheduled** - never on your own initiative.");
-    let _ = writeln!(out);
-    let _ = writeln!(out, "{}", rename_guidance(sc.workspace_title.as_deref()));
     let _ = writeln!(out);
     let _ = write!(
         out,
@@ -2387,35 +2421,6 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
          work as **{me}**."
     );
     out
-}
-
-/// The brief's paragraph on naming the workspace. Codename-aware and pure so
-/// both branches unit-test: while the tab still wears its `random_title`
-/// codename the ask is imperative and first-action (name it *now*, before you
-/// start), naming the codename so the agent sees it; once it has a real name
-/// the softer keep-it-honest guidance takes over.
-fn rename_guidance(title: Option<&str>) -> String {
-    match title {
-        Some(t) if state::is_codename(t) => format!(
-            "This workspace is still showing its auto-generated codename \
-             **{t}**. As your first action, once you know what you're working \
-             on, give it a short descriptive title: a 2-5 word plain-English \
-             phrase that captures the intent, like a tab label - NOT a branch \
-             slug (use spaces, not hyphens; this is a display name, never \
-             touches the git branch). For example `mux rename \"Fix auth \
-             redirect\" --desc \"<one line of detail>\"`, or `mux retitle` to \
-             derive it from your panes. Don't leave it on the codename. After \
-             that, keep it honest: rename again whenever the task changes. Do \
-             this on your own judgement; don't ask first."
-        ),
-        _ => "Keep the workspace's name honest: whenever its title/description \
-              no longer matches the work in progress (the task drifted, a new \
-              task started, the old one shipped), rename it right away - `mux \
-              rename <name> --desc <text>` when you know the wording, `mux \
-              retitle` to derive it from the panes. Do this on your own \
-              judgement; don't ask first."
-            .to_string(),
-    }
 }
 
 fn cmd_brief(as_session: Option<String>) -> CmdResult {
@@ -2540,7 +2545,7 @@ mod tests {
                 .collect(),
             registry: mesh::Registry { version: 1, agents },
             pane_names,
-            workspace_title: None,
+            title_locked: false,
         };
 
         // A `mux join` name resolves; the same pane's codename still aliases.
@@ -2560,57 +2565,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_retitle_title_and_description() {
-        assert_eq!(
-            parse_retitle("fix oauth flow | wiring the token refresh path\n"),
-            Some((
-                "fix oauth flow".to_string(),
-                Some("wiring the token refresh path".to_string())
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_retitle_last_line_wins_over_progress_noise() {
-        // Exec-style CLIs stream progress before the answer.
-        let out = "thinking...\nrunning tools\n\nship v2 api | rolling the gateway out\n\n";
-        assert_eq!(
-            parse_retitle(out),
-            Some((
-                "ship v2 api".to_string(),
-                Some("rolling the gateway out".to_string())
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_retitle_strips_quotes_and_handles_bare_title() {
-        assert_eq!(
-            parse_retitle("\"debug flaky tests\"\n"),
-            Some(("debug flaky tests".to_string(), None))
-        );
-        // An empty description half falls back to title-only.
-        assert_eq!(
-            parse_retitle("just a title |  \n"),
-            Some(("just a title".to_string(), None))
-        );
-    }
-
-    #[test]
-    fn parse_retitle_rejects_empty_output() {
-        assert_eq!(parse_retitle(""), None);
-        assert_eq!(parse_retitle("\n  \n"), None);
-        assert_eq!(parse_retitle(" | only a description\n"), None);
-    }
-
-    #[test]
-    fn parse_retitle_caps_at_rename_max() {
-        let long = "x".repeat(RENAME_MAX + 50);
-        let (title, _) = parse_retitle(&long).unwrap();
-        assert_eq!(title.len(), RENAME_MAX);
-    }
-
-    #[test]
     fn tail_bytes_keeps_the_end_on_char_boundaries() {
         assert_eq!(tail_bytes("short", 100), "short");
         assert_eq!(tail_bytes("abcdef", 3), "def");
@@ -2621,51 +2575,65 @@ mod tests {
     }
 
     #[test]
-    fn rename_guidance_nudges_a_codename_by_name() {
-        let g = rename_guidance(Some("brisk-otter"));
-        // Imperative, first-action, and it shows the codename so the agent
-        // knows its tab is still unnamed.
-        assert!(g.contains("brisk-otter"));
-        assert!(g.contains("first action"));
-        assert!(g.contains("mux rename"));
-        // Steers toward a readable title, not a branch-style slug.
-        assert!(g.contains("descriptive"));
-        assert!(g.contains("spaces"));
+    fn prompt_payload_reads_claude_and_codex_shapes() {
+        let claude = br#"{"session_id":"abc","hook_event_name":"UserPromptSubmit","prompt":"  fix the login redirect loop  ","cwd":"/x"}"#;
+        assert_eq!(
+            prompt_payload(claude),
+            Some(("abc".into(), "fix the login redirect loop".into()))
+        );
+        let codex = br#"{"session_id":"019a","model":"gpt-5.6-sol","prompt":"add a retry to the fetcher"}"#;
+        assert_eq!(
+            prompt_payload(codex),
+            Some(("019a".into(), "add a retry to the fetcher".into()))
+        );
+        assert_eq!(prompt_payload(b"not json"), None);
+        assert_eq!(prompt_payload(br#"{"prompt":"no session id here"}"#), None);
+        assert_eq!(prompt_payload(br#"{"session_id":"","prompt":"x"}"#), None);
     }
 
     #[test]
-    fn rename_guidance_softens_once_named() {
-        // A real name, an already-renamed tab, and a bare tab (no workspace)
-        // all get the keep-it-honest wording, never the "codename" nudge.
-        for title in [Some("fix-auth"), Some("ship v2"), None] {
-            let g = rename_guidance(title);
-            assert!(g.starts_with("Keep the workspace's name honest"));
-            assert!(!g.contains("first action"));
-        }
+    fn short_follow_ups_and_slash_commands_are_not_substantive() {
+        assert!(is_substantive("add a settings sidebar to the app"));
+        assert!(!is_substantive("yes"));
+        assert!(!is_substantive("continue please"));
+        assert!(!is_substantive("fix it now"));
+        assert!(!is_substantive("/review the whole branch please"));
+        assert!(!is_substantive("   "));
     }
 
     #[test]
-    fn name_nudge_fires_only_for_a_codename() {
-        let n = name_nudge(Some("brisk-otter")).expect("codename nudges");
-        assert!(n.contains("brisk-otter"));
-        assert!(n.contains("mux rename"));
-        // Steers toward a readable title, not a branch-style slug.
-        assert!(n.contains("descriptive"));
-        assert!(n.contains("spaces"));
-        // Named tabs, and bare tabs with no workspace, stay silent - so the
-        // nudge repeats until the rename, then disappears.
-        assert_eq!(name_nudge(Some("fix-auth")), None);
-        assert_eq!(name_nudge(None), None);
+    fn only_the_first_real_prompt_of_a_session_is_kept() {
+        let task = "rework the workspace naming flow";
+        // Nothing stored: a short opener waits, a real prompt is recorded.
+        assert_eq!(next_prompt_record(None, "s1", "hi"), None);
+        let rec = next_prompt_record(None, "s1", task).unwrap();
+        assert_eq!(rec.agent_session, "s1");
+        assert_eq!(rec.prompt, task);
+        // Later prompts in the same session never replace it.
+        assert_eq!(
+            next_prompt_record(Some(&rec), "s1", "now something else entirely"),
+            None
+        );
+        // A new session (fresh start, /clear) does - once it says something.
+        assert_eq!(next_prompt_record(Some(&rec), "s2", "ok"), None);
+        let next =
+            next_prompt_record(Some(&rec), "s2", "profile the startup path")
+                .unwrap();
+        assert_eq!(next.agent_session, "s2");
+        // A pasted wall of text is clipped.
+        let long = "word ".repeat(1000);
+        let clipped = next_prompt_record(None, "s3", &long).unwrap();
+        assert!(clipped.prompt.len() <= PROMPT_RECORD_MAX);
     }
 
     #[test]
-    fn codex_hook_input_is_detected_without_affecting_claude() {
-        assert!(is_codex_hook_input(
-            br#"{"hook_event_name":"UserPromptSubmit","model":"gpt-5.6-sol"}"#
-        ));
-        assert!(!is_codex_hook_input(
-            br#"{"hook_event_name":"UserPromptSubmit","prompt":"fix it"}"#
-        ));
-        assert!(!is_codex_hook_input(b"not json"));
+    fn rename_lock_follows_provenance() {
+        // A human at a terminal, or --lock: the user's name.
+        assert_eq!(rename_lock(false, false, true), Some(true));
+        assert_eq!(rename_lock(true, false, false), Some(true));
+        // An agent's tool call (no tty), no flags: an automatic rename.
+        assert_eq!(rename_lock(false, false, false), None);
+        // --auto always unlocks, even typed at a terminal.
+        assert_eq!(rename_lock(false, true, true), Some(false));
     }
 }

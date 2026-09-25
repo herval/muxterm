@@ -221,6 +221,40 @@ pub fn resume_command(agent: &Agent, model: Option<&str>) -> String {
 /// Argv form (bin first), for callers that spawn the process directly: no
 /// shell means no quoting surface and - load-bearing for `mux retitle`'s
 /// timeout - a `kill()` that reaches the agent instead of a wrapper sh.
+/// Longest title/description `mux rename` accepts and a one-shot reply is
+/// clipped to.
+pub const TITLE_MAX: usize = 256;
+
+/// Pull `title | description` out of a one-shot agent reply. Exec-style
+/// CLIs stream progress lines before the answer, so the *last* non-empty
+/// line wins; quotes/backticks a model might add are stripped; both halves
+/// are capped at TITLE_MAX (what `mux rename` would accept). None when no
+/// usable title remains.
+pub fn parse_title_reply(stdout: &str) -> Option<(String, Option<String>)> {
+    let line = stdout.lines().rev().find(|l| !l.trim().is_empty())?;
+    let (title, desc) = match line.split_once('|') {
+        Some((t, d)) => (t, Some(d)),
+        None => (line, None),
+    };
+    let clean = |s: &str| -> String {
+        let mut s = s
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+            .trim()
+            .to_string();
+        while s.len() > TITLE_MAX {
+            s.pop();
+        }
+        s
+    };
+    let title = clean(title);
+    if title.is_empty() || title.eq_ignore_ascii_case("keep") {
+        return None;
+    }
+    let description = desc.map(|d| clean(d)).filter(|d| !d.is_empty());
+    Some((title, description))
+}
+
 pub fn oneshot_argv(agent: &Agent, prompt: &str) -> Vec<String> {
     let mut argv = vec![agent.bin.to_string()];
     argv.extend(agent.oneshot_args.iter().map(|s| s.to_string()));
@@ -578,5 +612,70 @@ mod tests {
             model_label("anthropic/claude-sonnet-5"),
             "anthropic/claude-sonnet-5"
         );
+    }
+
+    #[test]
+    fn parse_title_reply_title_and_description() {
+        assert_eq!(
+            parse_title_reply("fix oauth flow | wiring the token refresh path\n"),
+            Some((
+                "fix oauth flow".to_string(),
+                Some("wiring the token refresh path".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_title_reply_last_line_wins_over_progress_noise() {
+        // Exec-style CLIs stream progress before the answer.
+        let out = "thinking...\nrunning tools\n\nship v2 api | rolling the gateway out\n\n";
+        assert_eq!(
+            parse_title_reply(out),
+            Some((
+                "ship v2 api".to_string(),
+                Some("rolling the gateway out".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_title_reply_strips_quotes_and_handles_bare_title() {
+        assert_eq!(
+            parse_title_reply("\"debug flaky tests\"\n"),
+            Some(("debug flaky tests".to_string(), None))
+        );
+        // An empty description half falls back to title-only.
+        assert_eq!(
+            parse_title_reply("just a title |  \n"),
+            Some(("just a title".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn parse_title_reply_rejects_empty_output() {
+        assert_eq!(parse_title_reply(""), None);
+        assert_eq!(parse_title_reply("\n  \n"), None);
+        assert_eq!(parse_title_reply(" | only a description\n"), None);
+    }
+
+    #[test]
+    fn parse_title_reply_keep_means_no_rename() {
+        assert_eq!(parse_title_reply("KEEP\n"), None);
+        assert_eq!(parse_title_reply("progress...\n\"keep\"\n"), None);
+        // A title that merely starts with the word is still a title.
+        assert_eq!(
+            parse_title_reply("keep alive fixes | pinging idle sockets"),
+            Some((
+                "keep alive fixes".to_string(),
+                Some("pinging idle sockets".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_title_reply_caps_at_title_max() {
+        let long = "x".repeat(TITLE_MAX + 50);
+        let (title, _) = parse_title_reply(&long).unwrap();
+        assert_eq!(title.len(), TITLE_MAX);
     }
 }

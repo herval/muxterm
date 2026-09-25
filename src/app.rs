@@ -266,9 +266,10 @@ pub struct App {
     /// multi-pane presets the new-workspace popup can apply. Persisted in
     /// state.json.
     templates: Vec<workspace::Template>,
-    /// tab_id -> AI-generated title, streamed in by `workspace::spawn_title`.
-    title_tx: Sender<(String, String)>,
-    title_rx: Receiver<(String, String)>,
+    /// AI titles, streamed in by `workspace::spawn_title` (cmd+n) and
+    /// `workspace::spawn_rename` (the session-boundary namer).
+    title_tx: Sender<workspace::TitleUpdate>,
+    title_rx: Receiver<workspace::TitleUpdate>,
     /// tab_ids with a title generation in flight. A drained title only lands
     /// while its tab is still here; `mux rename` removes it, so a deliberate
     /// name can't be clobbered by a late auto-title.
@@ -1245,6 +1246,8 @@ impl App {
             subdir: form.selected_project().and_then(|p| p.subdir.clone()),
             pr: None,
             automation: None,
+            title_locked: false,
+            named_session: None,
         };
 
         self.tabs.push(Tab {
@@ -2018,16 +2021,74 @@ impl App {
                 continue;
             };
             let tab_id = tab.tab_id.clone();
-            if let Some(title) = req.title {
-                tab.workspace.title = title;
-            }
-            if let Some(description) = req.description {
-                tab.workspace.description = Some(description);
+            let applied = workspace::apply_rename(
+                &mut tab.workspace,
+                req.title,
+                req.description,
+                req.lock,
+            );
+            if !applied {
+                // The CLI refuses this up front; a race with a lock landing
+                // in the same tick is all that gets here.
+                log::debug!("rename from {}: title is user-locked", req.from);
+                continue;
             }
             // A deliberate rename ends any pending auto-title for this tab, so
             // a late one can't clobber the name the agent just chose.
             self.naming.remove(&tab_id);
             self.dirty = true;
+        }
+    }
+
+    /// The session-boundary namer: a pane whose agent started a new session
+    /// (fresh launch, or /clear) records that session's first real prompt
+    /// (`mux agent-event --prompt`, `mesh::AgentPrompt`). Each such session
+    /// gets one look - `named_session` is stamped before the one-shot runs -
+    /// and the one-shot answers KEEP unless the goal changed, so a workspace
+    /// is renamed rarely, and never once the user has named it.
+    fn name_at_session_boundaries(&mut self, ctx: &egui::Context) {
+        for (session, rec) in mesh::read_agent_prompts() {
+            // A record for a pane that is gone: drop it. An empty snapshot
+            // is a failed tmux call, not a dead world.
+            if !self.pane_snap.is_empty()
+                && !self.pane_snap.contains_key(&session)
+            {
+                mesh::remove_agent_prompt(&session);
+                continue;
+            }
+            let Some(tab) = self
+                .tabs
+                .iter_mut()
+                .find(|t| t.panes.values().any(|p| p.session == session))
+            else {
+                continue;
+            };
+            if self.naming.contains(&tab.tab_id)
+                || !workspace::rename_due(&tab.workspace, &rec)
+            {
+                continue;
+            }
+            tab.workspace.named_session = Some(rec.agent_session.clone());
+            self.dirty = true;
+            // The task the workspace was created from (cmd+n) was already
+            // titled by spawn_title; its own launch is no boundary.
+            if rec.prompt.trim() == tab.workspace.prompt.trim() {
+                continue;
+            }
+            let agent = tab
+                .workspace
+                .agent
+                .and_then(agent::by_id)
+                .unwrap_or_else(|| muxterm::ask::configured().0);
+            self.naming.insert(tab.tab_id.clone());
+            workspace::spawn_rename(
+                tab.tab_id.clone(),
+                &tab.workspace,
+                rec.prompt,
+                agent,
+                self.title_tx.clone(),
+                ctx.clone(),
+            );
         }
     }
 
@@ -4656,6 +4717,7 @@ impl eframe::App for App {
                 self.bg_scan_inflight = true;
                 bg_jobs::spawn_scan(roots, self.bg_tx.clone(), ctx.clone());
             }
+            self.name_at_session_boundaries(ctx);
             self.sync_workspace_roots();
             // Run history first: the scheduler reads it to know whether a
             // run is already in flight, and the overlay follows it.
@@ -4811,14 +4873,22 @@ impl eframe::App for App {
         // AI titles arrive out of band; upgrade the workspace's label. A tab
         // dropped from `naming` (killed, or renamed via `mux rename`) means the
         // title is no longer up for grabs, so a late arrival is ignored.
-        while let Ok((tab_id, title)) = self.title_rx.try_recv() {
-            if !self.naming.remove(&tab_id) {
+        while let Ok(update) = self.title_rx.try_recv() {
+            if !self.naming.remove(&update.tab_id) {
                 continue;
             }
-            if let Some(tab) = self.tabs.iter_mut().find(|t| t.tab_id == tab_id)
+            if let Some(tab) =
+                self.tabs.iter_mut().find(|t| t.tab_id == update.tab_id)
             {
-                tab.workspace.title = title;
-                self.dirty = true;
+                // Locked since the one-shot started: the user's name wins.
+                if workspace::apply_rename(
+                    &mut tab.workspace,
+                    Some(update.title),
+                    update.description,
+                    None,
+                ) {
+                    self.dirty = true;
+                }
             }
         }
         // Finished worktree checkouts: launch the agent in the waiting pane.

@@ -66,6 +66,13 @@ pub struct Workspace {
     /// cmd+1..9 flow (see `App::visible_tab_indices`) but - unlike an
     /// archived workspace - remains fully interactive when activated.
     pub automation: Option<String>,
+    /// The user named this workspace (`mux rename` from a shell, or
+    /// `--lock`): the session-boundary namer and agents' plain renames
+    /// leave the title alone until `mux rename --auto` unlocks it.
+    pub title_locked: bool,
+    /// The last agent session id the namer considered (see
+    /// `mesh::AgentPrompt`), so each session gets at most one attempt.
+    pub named_session: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,6 +99,8 @@ impl Workspace {
             subdir: None,
             pr: None,
             automation: None,
+            title_locked: false,
+            named_session: None,
         }
     }
 
@@ -123,6 +132,8 @@ impl Workspace {
             subdir: self.subdir.clone(),
             pr: self.pr.clone(),
             automation: self.automation.clone(),
+            title_locked: self.title_locked,
+            named_session: self.named_session.clone(),
         }
     }
 
@@ -146,6 +157,8 @@ impl Workspace {
             subdir: s.subdir,
             pr: s.pr,
             automation: s.automation,
+            title_locked: s.title_locked,
+            named_session: s.named_session,
         }
     }
 }
@@ -1540,7 +1553,7 @@ pub fn spawn_title(
     tab_id: String,
     prompt: String,
     agent: &'static Agent,
-    tx: Sender<(String, String)>,
+    tx: Sender<TitleUpdate>,
     ctx: egui::Context,
 ) {
     thread::spawn(move || {
@@ -1554,7 +1567,110 @@ pub fn spawn_title(
             title.is_some()
         );
         if let Some(title) = title {
-            if tx.send((tab_id, title)).is_ok() {
+            let update = TitleUpdate { tab_id, title, description: None };
+            if tx.send(update).is_ok() {
+                ctx.request_repaint();
+            }
+        }
+    });
+}
+
+/// An AI title landing for a tab, from `spawn_title` or `spawn_rename`.
+/// `description` None leaves the workspace's description as it is.
+pub struct TitleUpdate {
+    pub tab_id: String,
+    pub title: String,
+    pub description: Option<String>,
+}
+
+/// Should the session-boundary namer look at this prompt for this
+/// workspace? Pure; the caller has already mapped the prompt's pane to the
+/// tab. A user-named (locked) workspace and an automation's log tab are
+/// never renamed, and each agent session gets exactly one look
+/// (`named_session`).
+pub fn rename_due(ws: &Workspace, rec: &mesh::AgentPrompt) -> bool {
+    !ws.title_locked
+        && !ws.is_automation()
+        && ws.named_session.as_deref() != Some(rec.agent_session.as_str())
+}
+
+/// A rename request landing on a workspace, by provenance
+/// (`mesh::RenameRequest::lock`): Some(true) sets and locks, Some(false)
+/// unlocks (and sets whatever it carries), None is an automatic rename -
+/// dropped while the title is locked. Returns whether anything applied.
+pub fn apply_rename(
+    ws: &mut Workspace,
+    title: Option<String>,
+    description: Option<String>,
+    lock: Option<bool>,
+) -> bool {
+    match lock {
+        None if ws.title_locked => return false,
+        None => {},
+        Some(l) => ws.title_locked = l,
+    }
+    if let Some(title) = title {
+        ws.title = title;
+    }
+    if let Some(description) = description {
+        ws.description = Some(description);
+    }
+    true
+}
+
+const RENAME_INSTRUCTION: &str =
+    "A terminal workspace is labelled with a short title. A new AI coding \
+     session just started in it with the task below. If that task continues \
+     the goal the current title describes (a follow-up, a fix to the same \
+     feature, a next step), reply with exactly KEEP. Only if the overall \
+     goal is clearly different, reply with exactly one line: a new 2 to 5 \
+     word plain-English title, a ' | ' separator, then a one-line \
+     description (under 100 characters). No quotes, no markdown, nothing \
+     else.";
+
+const FIRST_NAME_INSTRUCTION: &str =
+    "Name a terminal workspace from the AI coding task just started in it. \
+     Reply with exactly one line: a short descriptive title of 2 to 5 \
+     plain-English words, a ' | ' separator, then a one-line description \
+     (under 100 characters). No quotes, no markdown, nothing else.";
+
+/// The session-boundary namer: a one-shot on the agent's fast model that
+/// decides whether a new agent session's first prompt changed the
+/// workspace's goal, and if so what to call it. A workspace still on its
+/// codename has no goal to keep, so it is simply named. Best-effort and
+/// silent: KEEP, a failure or an unusable reply all leave the title alone.
+pub fn spawn_rename(
+    tab_id: String,
+    ws: &Workspace,
+    prompt: String,
+    agent: &'static Agent,
+    tx: Sender<TitleUpdate>,
+    ctx: egui::Context,
+) {
+    let first = state::is_codename(&ws.title);
+    let mut body = String::new();
+    if !first {
+        body.push_str(&format!("Current title: {}\n", ws.title));
+        if let Some(desc) = &ws.description {
+            body.push_str(&format!("Current description: {desc}\n"));
+        }
+    }
+    body.push_str(&format!("New task: {prompt}"));
+    let instruction =
+        if first { FIRST_NAME_INSTRUCTION } else { RENAME_INSTRUCTION };
+    thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let reply = generate_raw(agent, instruction, &body)
+            .and_then(|out| agent::parse_title_reply(&out));
+        log::info!(
+            "rename one-shot ({}) took {:.1}s (renamed={})",
+            agent.id,
+            started.elapsed().as_secs_f32(),
+            reply.is_some()
+        );
+        if let Some((title, description)) = reply {
+            let update = TitleUpdate { tab_id, title, description };
+            if tx.send(update).is_ok() {
                 ctx.request_repaint();
             }
         }
@@ -1562,6 +1678,12 @@ pub fn spawn_title(
 }
 
 fn generate(agent: &Agent, instruction: &str, body: &str) -> Option<String> {
+    let title = clean_title(&generate_raw(agent, instruction, body)?);
+    (!title.is_empty()).then_some(title)
+}
+
+/// The one-shot's raw stdout, None when it could not run or failed.
+fn generate_raw(agent: &Agent, instruction: &str, body: &str) -> Option<String> {
     let full = format!("{instruction}\n\n{body}");
     // Exec-style CLIs stream their own progress; the final assistant line
     // is last, which `clean_title` picks up.
@@ -1573,8 +1695,7 @@ fn generate(agent: &Agent, instruction: &str, body: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let title = clean_title(&String::from_utf8_lossy(&out.stdout));
-    (!title.is_empty()).then_some(title)
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Reduce a model reply to one tidy title line: the last non-empty line
@@ -1806,6 +1927,59 @@ mod tests {
     }
 
     #[test]
+    fn rename_lock_rules() {
+        let mut ws = Workspace::bare(None);
+        // An automatic rename applies while unlocked, and doesn't lock.
+        assert!(apply_rename(&mut ws, Some("auto one".into()), None, None));
+        assert_eq!(ws.title, "auto one");
+        assert!(!ws.title_locked);
+        // The user's name locks...
+        assert!(apply_rename(
+            &mut ws,
+            Some("mine".into()),
+            Some("d".into()),
+            Some(true)
+        ));
+        assert!(ws.title_locked);
+        assert_eq!(ws.description.as_deref(), Some("d"));
+        // ...and automatic renames bounce off it, description included.
+        assert!(!apply_rename(
+            &mut ws,
+            Some("auto two".into()),
+            Some("x".into()),
+            None
+        ));
+        assert_eq!(ws.title, "mine");
+        assert_eq!(ws.description.as_deref(), Some("d"));
+        // --auto alone unlocks without touching the name.
+        assert!(apply_rename(&mut ws, None, None, Some(false)));
+        assert!(!ws.title_locked);
+        assert_eq!(ws.title, "mine");
+        assert!(apply_rename(&mut ws, Some("auto three".into()), None, None));
+        assert_eq!(ws.title, "auto three");
+    }
+
+    #[test]
+    fn rename_due_once_per_session_and_never_when_locked() {
+        let rec = |sid: &str| mesh::AgentPrompt {
+            agent_session: sid.into(),
+            prompt: "rework the naming flow".into(),
+            ts: 1,
+        };
+        let mut ws = Workspace::bare(None);
+        assert!(rename_due(&ws, &rec("s1")));
+        ws.named_session = Some("s1".into());
+        assert!(!rename_due(&ws, &rec("s1")));
+        // A new agent session (relaunch, /clear) is a boundary.
+        assert!(rename_due(&ws, &rec("s2")));
+        ws.title_locked = true;
+        assert!(!rename_due(&ws, &rec("s2")));
+        ws.title_locked = false;
+        ws.automation = Some("nightly".into());
+        assert!(!rename_due(&ws, &rec("s2")));
+    }
+
+    #[test]
     fn bare_workspace_gets_a_codename() {
         let ws = Workspace::bare(Some(PathBuf::from("/home/u/thing")));
         assert!(ws.title.contains('-'));
@@ -1817,6 +1991,8 @@ mod tests {
     fn state_round_trip_resolves_agent() {
         let ws = Workspace {
             automation: None,
+            title_locked: true,
+            named_session: Some("s1".into()),
             root: Some(PathBuf::from("/p")),
             title: "t".into(),
             description: Some("d".into()),
@@ -1839,6 +2015,8 @@ mod tests {
         assert_eq!(back.archived_at, Some(9));
         assert_eq!(back.setup.as_deref(), Some("direnv allow"));
         assert_eq!(back.subdir.as_deref(), Some("apps/web"));
+        assert!(back.title_locked);
+        assert_eq!(back.named_session.as_deref(), Some("s1"));
         // An unknown agent id resolves to None rather than panicking.
         let mut st = ws.to_state();
         st.agent = Some("nope".into());

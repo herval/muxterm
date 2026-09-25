@@ -123,6 +123,14 @@ pub struct WorkspaceState {
     /// sidebar's automations section. Additive with `#[serde(default)]`.
     #[serde(default)]
     pub automation: Option<String>,
+    /// The title was set by the user (`mux rename` from a shell, or an agent
+    /// passing `--lock` on the user's say-so): automatic renames leave it be.
+    #[serde(default)]
+    pub title_locked: bool,
+    /// The last agent session id (the CLI's own, from its UserPromptSubmit
+    /// payload) the session-boundary namer considered - one attempt each.
+    #[serde(default)]
+    pub named_session: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -534,6 +542,8 @@ mod tests {
                             subdir: Some("apps/web".into()),
                             pr: None,
                             automation: None,
+                            title_locked: false,
+                            named_session: None,
                         }),
                     },
                 ],
