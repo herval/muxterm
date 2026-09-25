@@ -54,13 +54,22 @@ impl Git {
     /// The chip as a colored run: a state dot, the branch, then compact
     /// `*dirty`/`↑ahead`/`↓behind` markers (zero parts omitted). `base` is
     /// the branch/marker text color (active vs. dim tab).
-    pub fn chip_job(&self, font: FontId, base: Color32, hud: &HudColors) -> LayoutJob {
+    pub fn chip_job(
+        &self,
+        font: FontId,
+        base: Color32,
+        hud: &HudColors,
+        project: Option<&str>,
+    ) -> LayoutJob {
         let mut job = LayoutJob::default();
         let seg = |job: &mut LayoutJob, s: &str, c: Color32| {
             job.append(s, 0.0, TextFormat::simple(font.clone(), c));
         };
         seg(&mut job, "\u{25CF} ", self.dot(hud));
         seg(&mut job, &self.branch, base);
+        if let Some(project) = project.filter(|p| !p.is_empty()) {
+            seg(&mut job, &format!(" {project}"), base);
+        }
         if self.dirty > 0 {
             seg(&mut job, &format!("  *{}", self.dirty), hud.warn);
         }

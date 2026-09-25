@@ -104,6 +104,63 @@ impl Workspace {
         }
     }
 
+    /// Keep the project visible even when a worktree has a random branch
+    /// name. The focused pane supplies the actual working path; saved
+    /// workspace paths cover startup before the first tmux snapshot.
+    pub fn sidebar_reference(
+        &self,
+        cwd: Option<&Path>,
+    ) -> (Option<String>, Option<String>) {
+        let path = cwd
+            .or_else(|| self.worktree.as_ref().map(|w| w.path.as_path()))
+            .or(self.root.as_deref());
+        let in_workspace = path.is_some_and(|p| {
+            self.root.as_ref().is_some_and(|r| p.starts_with(r))
+                || self
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|w| p.starts_with(&w.path))
+        });
+        let name = self.project_name(cwd);
+        let branch = self
+            .worktree
+            .as_ref()
+            .filter(|_| in_workspace)
+            .map(|w| w.branch.as_str())
+            .filter(|b| !b.is_empty());
+        let subtitle = match (name, branch) {
+            (Some(name), Some(branch)) if name != branch => {
+                Some(format!("{name} · {branch}"))
+            },
+            (Some(name), _) => Some(name),
+            (None, Some(branch)) => Some(branch.to_owned()),
+            (None, None) => None,
+        };
+        (subtitle, path.map(|p| p.display().to_string()))
+    }
+
+    /// Project folder for a pane, including panes in a dedicated worktree.
+    pub fn project_name(&self, cwd: Option<&Path>) -> Option<String> {
+        let path = cwd
+            .or_else(|| self.worktree.as_ref().map(|w| w.path.as_path()))
+            .or(self.root.as_deref());
+        let in_workspace = path.is_some_and(|p| {
+            self.root.as_ref().is_some_and(|r| p.starts_with(r))
+                || self.worktree.as_ref().is_some_and(|w| p.starts_with(&w.path))
+        });
+        let project = if in_workspace {
+            self.root.as_deref().or(path)
+        } else {
+            path
+        };
+        project.map(|p| {
+            p.file_name()
+                .unwrap_or(p.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
     /// Is this workspace parked in the sidebar's archived pile?
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()

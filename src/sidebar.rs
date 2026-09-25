@@ -113,6 +113,8 @@ pub struct Row {
     pub tab_id: String,
     pub title: String,
     pub subtitle: Option<String>,
+    /// Full working directory of the focused pane, shown on hover.
+    pub location: Option<String>,
     pub active: bool,
     /// Drives the leading status icon (`status_icon`: ring / play / `!`).
     pub status: Status,
@@ -1095,6 +1097,11 @@ fn workspace_row(
     };
     let resp =
         ui.interact(rect, ui.id().with(("ws_row", row.tab_id.as_str())), sense);
+    let resp = if let Some(path) = &row.location {
+        resp.on_hover_text(path)
+    } else {
+        resp
+    };
     // Gated on `drag_started` rather than called every frame: the payload is
     // only stored on that frame anyway, and the row list repaints constantly
     // (a breathing status light alone drives ~15fps), so an ungated call
@@ -1349,6 +1356,7 @@ mod tests {
                 tab_id: "mux-tab-0".into(),
                 title: "resting-ws".into(),
                 subtitle: None,
+                location: None,
                 active: false,
                 status: Status::Idle,
                 archived: false,
@@ -1360,6 +1368,7 @@ mod tests {
                 tab_id: "mux-tab-1".into(),
                 title: "busy-ws".into(),
                 subtitle: Some("feat/x".into()),
+                location: None,
                 active: false,
                 status: Status::Working,
                 archived: false,
@@ -1371,6 +1380,7 @@ mod tests {
                 tab_id: "mux-tab-2".into(),
                 title: "stuck-ws".into(),
                 subtitle: None,
+                location: None,
                 active: false,
                 status: Status::Blocked,
                 archived: false,
@@ -1382,6 +1392,7 @@ mod tests {
                 tab_id: "mux-tab-3".into(),
                 title: "bg-ws".into(),
                 subtitle: None,
+                location: None,
                 active: false,
                 status: Status::Background,
                 archived: false,
@@ -1393,6 +1404,7 @@ mod tests {
                 tab_id: "mux-tab-4".into(),
                 title: "cmd-ws".into(),
                 subtitle: None,
+                location: None,
                 active: false,
                 status: Status::Command,
                 archived: false,
@@ -1472,6 +1484,7 @@ mod tests {
                 tab_id: "mux-tab-0".into(),
                 title: "live-ws".into(),
                 subtitle: None,
+                location: None,
                 active: true,
                 status: Status::Idle,
                 archived: false,
@@ -1483,6 +1496,7 @@ mod tests {
                 tab_id: "mux-tab-1".into(),
                 title: "parked-ws".into(),
                 subtitle: None,
+                location: None,
                 active: false,
                 status: Status::Idle,
                 archived: true,
@@ -1549,6 +1563,7 @@ mod tests {
                 tab_id: "mux-tab-0".into(),
                 title: "live-ws".into(),
                 subtitle: None,
+                location: None,
                 active: true,
                 status: Status::Idle,
                 archived: false,
@@ -1560,6 +1575,7 @@ mod tests {
                 tab_id: "mux-tab-1".into(),
                 title: "other-ws".into(),
                 subtitle: None,
+                location: None,
                 active: false,
                 status: Status::Idle,
                 archived: false,
@@ -1571,6 +1587,7 @@ mod tests {
                 tab_id: "mux-tab-2".into(),
                 title: "parked-ws".into(),
                 subtitle: None,
+                location: None,
                 active: false,
                 status: Status::Idle,
                 archived: true,
@@ -1644,6 +1661,7 @@ mod tests {
             tab_id: "mux-tab-0".into(),
             title: "live-ws".into(),
             subtitle: None,
+            location: None,
             active: true,
             status: Status::Idle,
             archived: false,
@@ -1730,6 +1748,7 @@ mod tests {
                 tab_id: "mux-tab-0".into(),
                 title: "busy-ws".into(),
                 subtitle: None,
+                location: None,
                 active: false,
                 status,
                 archived: false,
@@ -1778,6 +1797,7 @@ mod tests {
             tab_id: "mux-tab-0".into(),
             title: "live-ws".into(),
             subtitle: None,
+            location: None,
             active: false,
             status: Status::Idle,
             archived: false,
@@ -1792,6 +1812,7 @@ mod tests {
             tab_id: "mux-tab-0".into(),
             title: "parked-ws".into(),
             subtitle: None,
+            location: None,
             active: false,
             status: Status::Idle,
             archived: true,
@@ -1897,6 +1918,7 @@ mod tests {
                 tab_id: "mux-tab-0".into(),
                 title: "chipped".into(),
                 subtitle: Some("feat".into()),
+                location: None,
                 prs: vec![chip(12), chip(34)],
                 ..plain_row()
             },
@@ -2053,6 +2075,7 @@ mod tests {
             tab_id: "mux-tab-0".into(),
             title: "live-ws".into(),
             subtitle: None,
+            location: None,
             active: true,
             status: Status::Idle,
             archived: false,
