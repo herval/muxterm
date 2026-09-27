@@ -276,11 +276,30 @@ pub fn parse_title_reply(stdout: &str) -> Option<(String, Option<String>)> {
         s
     };
     let title = clean(title);
-    if title.is_empty() || title.eq_ignore_ascii_case("keep") {
+    if title.eq_ignore_ascii_case("keep") || !plausible_title(&title) {
         return None;
     }
     let description = desc.map(|d| clean(d)).filter(|d| !d.is_empty());
     Some((title, description))
+}
+
+/// Longest title (in words) a one-shot reply may carry. The prompts ask for
+/// 2 to 5; the slack is for a model that runs a little long, not for prose.
+pub const TITLE_MAX_WORDS: usize = 8;
+
+/// Does a one-shot reply read as a title rather than a chat answer? A fast
+/// model handed a vague task sometimes answers it ("I don't have context
+/// about which project you mean...") instead of labelling it, and a
+/// sentence like that must never become the workspace's name. Rejecting it
+/// leaves the current title in place, which is always the better outcome.
+pub fn plausible_title(title: &str) -> bool {
+    let t = title.trim();
+    !t.is_empty()
+        && t.split_whitespace().count() <= TITLE_MAX_WORDS
+        && t.chars().count() <= 80
+        && !t.ends_with('?')
+        // More than one sentence is an answer, not a label.
+        && !t.contains(". ")
 }
 
 pub fn oneshot_argv(agent: &Agent, prompt: &str) -> Vec<String> {
@@ -716,9 +735,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_title_reply_caps_at_title_max() {
-        let long = "x".repeat(TITLE_MAX + 50);
-        let (title, _) = parse_title_reply(&long).unwrap();
-        assert_eq!(title.len(), TITLE_MAX);
+    fn parse_title_reply_caps_description_at_title_max() {
+        let long = format!("short title | {}", "x".repeat(TITLE_MAX + 50));
+        let (_, desc) = parse_title_reply(&long).unwrap();
+        assert_eq!(desc.unwrap().len(), TITLE_MAX);
+    }
+
+    #[test]
+    fn parse_title_reply_rejects_chat_answers() {
+        // A fast model that answered a vague task instead of naming it.
+        let out = "I don't have context about which video project you're \
+                   referring to. Can you tell me the project name or \
+                   directory?";
+        assert_eq!(parse_title_reply(out), None);
+        assert_eq!(parse_title_reply("Which project do you mean?"), None);
+        assert_eq!(parse_title_reply("Sure. Here it is"), None);
+        assert_eq!(parse_title_reply(&"x".repeat(120)), None);
+        // Up to TITLE_MAX_WORDS still passes.
+        assert!(
+            parse_title_reply("tidy the video export pipeline for web")
+                .is_some()
+        );
     }
 }

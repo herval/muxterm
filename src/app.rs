@@ -7367,6 +7367,7 @@ mod tests {
                         ),
                         "agent-pane",
                         None,
+                        None,
                         &badges,
                         cwd,
                         PaneId(1),
