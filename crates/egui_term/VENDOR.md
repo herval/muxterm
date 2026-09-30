@@ -446,3 +446,14 @@ tmux-backed design. Local patches:
   click on whitespace selects nothing rather than the neighbouring word.
   Triple-click takes the row's content. The widget's local selection is
   untouched and still paints instantly; it is simply no longer contradicted.
+- **P36** (`src/backend/mod.rs`, `row_wraps`): P19's full-row soft-wrap
+  guess no longer fires when the next row opens with a blank. A TUI hard
+  wrap (P20's case: Claude Code breaks a long path at its layout edge and
+  indents the rest) whose head row *happens* to end exactly on the grid's
+  last column used to be glued into one logical line with the continuation's
+  indent inside it - so the path split into two whitespace-separated runs,
+  and P20, which joins only across lines, never rejoined them: neither half
+  existed, nothing lit, cmd+click did nothing. No token spans whitespace, so
+  a row followed by a leading blank gains nothing from the glue; leaving the
+  rows separate hands the wrap to P20 as usual. WRAPLINE (a real alacritty
+  soft wrap) is still taken at its word.

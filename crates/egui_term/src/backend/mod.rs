@@ -1,4 +1,4 @@
-pub mod settings;
+ter sua configpub mod settings;
 
 use crate::types::Size;
 use alacritty_terminal::event::{
@@ -1090,9 +1090,18 @@ fn stop_at(stops: &[usize], col: f32, edge: bool) -> usize {
 /// glyph (a full row). tmux repaints soft-wrapped output as discrete
 /// cursor-positioned rows that drop WRAPLINE, so the full-row heuristic is
 /// what stitches a URL that ran off the right edge back together.
+///
+/// muxterm patch P36: the full-row guess is off when the next row opens
+/// with a blank. No token spans whitespace, so gluing those rows can never
+/// complete a match - but it can hide a TUI hard wrap whose head happened
+/// to land on the last column: the continuation's indent ends up *inside*
+/// the logical line, splitting the token in two, and P20 (which only joins
+/// across lines) never sees it. Callers only ask about a row that has one
+/// below it.
 fn row_wraps(grid: &Grid<Cell>, line: Line, last_col: Column) -> bool {
     let cell = &grid[line][last_col];
-    cell.flags.contains(Flags::WRAPLINE) || cell.c != ' '
+    cell.flags.contains(Flags::WRAPLINE)
+        || (cell.c != ' ' && grid[line + 1i32][Column(0)].c != ' ')
 }
 
 /// muxterm patch P19: the logical line through `line` - the run of visually
@@ -1760,6 +1769,25 @@ mod tests {
         assert_eq!(
             link_candidates(content, 1, 6),
             Some(vec![joined.into(), "db05/badges.png".into()])
+        );
+    }
+
+    // muxterm patch P36: the same hard wrap, but the head row happens to
+    // land exactly on the grid's last column (here it is the longest row,
+    // so it fills the width). P19's full-row heuristic used to glue the
+    // rows into one logical line with the continuation's indent inside it,
+    // which split the path into two runs P20 never joins.
+    #[test]
+    fn indent_wrapped_paths_join_when_the_head_row_is_full() {
+        let content = "  Screenshot: /var/aa/scr\r\n  eenshot-6.png";
+        let joined = "/var/aa/screenshot-6.png";
+        assert_eq!(
+            link_candidates(content, 0, 16),
+            Some(vec![joined.into(), "/var/aa/scr".into()])
+        );
+        assert_eq!(
+            link_candidates(content, 1, 4),
+            Some(vec![joined.into()])
         );
     }
 
