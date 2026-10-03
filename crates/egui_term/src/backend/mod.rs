@@ -139,6 +139,12 @@ impl TerminalSize {
     pub fn screen_lines(&self) -> usize {
         self.num_lines as usize
     }
+
+    /// muxterm patch P38: visible columns, for the same reason - the app
+    /// needs the width to know where tmux can no longer be pointed.
+    pub fn columns(&self) -> usize {
+        self.num_cols as usize
+    }
 }
 
 impl Dimensions for TerminalSize {
@@ -433,150 +439,51 @@ impl TerminalBackend {
         viewport_to_point(display_offset, Point::new(line, col))
     }
 
-    /// muxterm patch P33: where a pane-relative pixel position lands as a
-    /// tmux copy-mode motion - the visible row, and how many `cursor-right`
-    /// presses from that row's column 0 reach it.
+    /// muxterm patch P38: the visible (row, column) under a pane-relative
+    /// pixel position, clamped into the grid. The app relays drags and
+    /// clicks to tmux as mouse reports, which address cells, so this is the
+    /// whole of the mapping - and a column is exact where P33's character
+    /// counts were not: tmux keeps a tab as one character spanning several
+    /// columns, but sends the client plain spaces, so no count read off this
+    /// grid could know it was there.
     ///
-    /// Two conversions the app cannot do for itself. tmux counts
-    /// *characters*, not columns: a wide CJK glyph is one press but two
-    /// cells, so a column number handed straight to `cursor-right -N`
-    /// overshoots by one press per wide glyph before it. And `cursor-right`
-    /// does not stop at the end of a row - it wraps onto the next one - so a
-    /// count past the row's content walks the cursor *down* instead of
-    /// clamping. Both are answered off the rendered grid, which is the same
-    /// copy tmux is showing.
-    ///
-    /// `edge` picks the nearest character *boundary* rather than the
-    /// character under the pointer: tmux's selection runs [lower, upper) in
-    /// content order, so boundaries make a press and release inside one cell
-    /// select nothing and a drag past a glyph's midpoint take it whole - the
-    /// rule `selection_side` already uses for the local selection. `false`
-    /// picks the character itself (double/triple click).
-    pub fn copy_target(&self, x: f32, y: f32, edge: bool) -> (usize, usize) {
+    /// `edge` rounds to the nearest cell *boundary* instead of taking the
+    /// cell under the pointer. tmux's selection runs [lower, upper) between
+    /// the two cells it was given, so boundaries are what make a drag past a
+    /// glyph's midpoint take it whole and a press and release inside one
+    /// half-cell select nothing - the rule `selection_side` applies to the
+    /// local selection.
+    pub fn grid_cell(&self, x: f32, y: f32, edge: bool) -> (usize, usize) {
+        let size = &self.last_content().terminal_size;
+        let x = (x - crate::view::GRID_INSET.x).max(0.0)
+            / size.cell_width.max(1.0);
+        let y = (y - crate::view::GRID_INSET.y).max(0.0)
+            / size.cell_height.max(1.0);
+        let col = if edge { x.round() } else { x.floor() } as usize;
+        (
+            (y as usize).min(size.screen_lines().saturating_sub(1)),
+            col.min(size.columns().saturating_sub(1)),
+        )
+    }
+
+    /// muxterm patch P38: the word through a visible cell, in columns - P14's
+    /// rule, the whole run of non-whitespace, so `foo(bar)` and `a/b:c` come
+    /// whole. None on whitespace, so a double-click on a gap selects nothing
+    /// rather than the neighbouring word.
+    pub fn word_at(&self, row: usize, col: usize) -> Option<WordSpan> {
         let content = self.last_content();
-        let size = &content.terminal_size;
-        let rows = size.screen_lines().max(1);
-        let x = (x - crate::view::GRID_INSET.x).max(0.0);
-        let y = (y - crate::view::GRID_INSET.y).max(0.0);
-        let row = ((y / size.cell_height.max(1.0)) as usize).min(rows - 1);
-        let col = x / size.cell_width.max(1.0);
-        (row, stop_at(&self.row_stops_at(row), col, edge))
-    }
-
-    /// muxterm patch P33: the `cursor-right` stops of one *visible* row.
-    fn row_stops_at(&self, row: usize) -> Vec<usize> {
-        let content = self.last_content();
-        let grid = &content.grid;
-        let line = Line(row as i32 - grid.display_offset() as i32);
-        row_stops((0..content.terminal_size.columns()).map(|c| {
-            let cell = &grid[line][Column(c)];
-            (cell.c, cell.flags)
-        }))
-    }
-
-    /// muxterm patch P33: (re)assert a plain local selection between two
-    /// pane-relative points. Entering copy-mode repaints the pane once, and
-    /// that repaint erases rows - taking the widget's selection with it, the
-    /// very thing this whole mechanism exists to stop. The app re-asserts
-    /// the drag's highlight until it sticks; once the pane is frozen nothing
-    /// repaints it again, so it sticks on the first try after the entry.
-    pub fn restore_selection(&mut self, from: (f32, f32), to: (f32, f32)) {
-        let inset = crate::view::GRID_INSET;
-        self.process_command(BackendCommand::SelectStart(
-            SelectionType::Simple,
-            from.0 - inset.x,
-            from.1 - inset.y,
-        ));
-        self.process_command(BackendCommand::SelectUpdate(
-            to.0 - inset.x,
-            to.1 - inset.y,
-        ));
-    }
-
-    /// muxterm patch P35: the characters of one *visible* row, indexed the
-    /// same way `row_stops` counts `cursor-right` presses (wide-char spacers
-    /// skipped, trailing blanks dropped) so an index means the same thing to
-    /// both.
-    fn row_chars(&self, row: usize) -> Vec<char> {
-        let content = self.last_content();
-        let grid = &content.grid;
-        let line = Line(row as i32 - grid.display_offset() as i32);
-        let mut out = Vec::new();
-        let mut last_glyph = 0usize;
-        for c in 0..content.terminal_size.columns() {
-            let cell = &grid[line][Column(c)];
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            out.push(cell.c);
-            if cell.c != ' ' {
-                last_glyph = out.len();
-            }
-        }
-        out.truncate(last_glyph);
-        out
-    }
-
-    /// muxterm patch P35: the word or line under a pane-relative point, as a
-    /// pair of tmux copy-mode targets (the far end exclusive, like the rest
-    /// of P33).
-    ///
-    /// A double-click selects the whole run of non-whitespace around the
-    /// click - P14's rule, which reduced alacritty's semantic boundaries to
-    /// whitespace so `foo(bar)` and `a/b:c` come whole. Computed here off the
-    /// grid rather than handed to tmux's `select-word`, because tmux decides
-    /// it with its own `word-separators` and from coordinates that are a
-    /// round trip old: two answers to one question is how a double-click
-    /// ended up highlighting the right word and then selecting a different
-    /// one.
-    pub fn word_bounds_at(
-        &self,
-        x: f32,
-        y: f32,
-        whole_line: bool,
-    ) -> Option<((usize, usize), (usize, usize))> {
-        let (row, idx) = self.copy_target(x, y, false);
-        let chars = self.row_chars(row);
-        if chars.is_empty() {
+        if row >= content.terminal_size.screen_lines() {
             return None;
         }
-        if whole_line {
-            return Some(((row, 0), (row, chars.len())));
-        }
-        let (start, end) = word_run(&chars, idx)?;
-        Some(((row, start), (row, end)))
-    }
-
-    /// muxterm patch P33: the live local selection as a pair of tmux
-    /// copy-mode targets - (row, `cursor-right` count) for each end, the far
-    /// end one character past the last selected cell because tmux's selection
-    /// runs [lower, upper).
-    ///
-    /// The app recreates a drag in copy-mode from *this* rather than from the
-    /// pointer's pixels. alacritty rotates a selection with the content when
-    /// the grid scrolls, so this is the range actually under the highlight
-    /// the user has been watching - whereas a press position re-resolved
-    /// against the grid points wherever that screen row has since ended up.
-    pub fn copy_selection_bounds(
-        &self,
-    ) -> Option<((usize, usize), (usize, usize))> {
-        let content = self.last_content();
-        let range = content.selectable_range?;
-        let off = content.grid.display_offset() as i32;
-        let rows = content.terminal_size.screen_lines();
-        let target = |p: alacritty_terminal::index::Point, past: bool| {
-            let row = ((p.line.0 + off).max(0) as usize).min(rows - 1);
-            let stops = self.row_stops_at(row);
-            let mut idx = stops
-                .iter()
-                .rposition(|&s| s <= p.column.0)
-                .unwrap_or(0);
-            if past {
-                idx = (idx + 1).min(stops.len() - 1);
-            }
-            (row, idx)
-        };
-        Some((target(range.start, false), target(range.end, true)))
+        let grid = &content.grid;
+        let line = Line(row as i32 - grid.display_offset() as i32);
+        let cells: Vec<(char, Flags)> = (0..content.terminal_size.columns())
+            .map(|c| {
+                let cell = &grid[line][Column(c)];
+                (cell.c, cell.flags)
+            })
+            .collect();
+        word_span(&cells, col)
     }
 
     pub fn selectable_content(&self) -> String {
@@ -656,17 +563,6 @@ impl TerminalBackend {
         cands: &[(String, RangeInclusive<Point>)],
     ) -> Option<RangeInclusive<Point>> {
         link_pick(self.link_validator.as_deref(), cands)
-    }
-
-    /// muxterm patch P26: drop the local selection. The app calls this after
-    /// its scroll-intercept has recreated the selection in tmux copy-mode (so
-    /// it survives the wheel repaint) - clearing the local one drops the stale
-    /// highlight and makes the hand-off one-shot. `&self` is enough: the
-    /// selection lives behind the term lock (interior mutability, like the
-    /// selection setters).
-    pub fn clear_selection(&self) {
-        self.term.lock().selection = None;
-        self.dirty.store(true, Ordering::Release);
     }
 
     /// muxterm patch P24: which PR numbers a `#<number>` token may link
@@ -1012,77 +908,39 @@ fn pr_regex() -> regex::Regex {
     regex::Regex::new(r"#\d+\b").unwrap()
 }
 
-/// muxterm patch P35: the run of non-whitespace around `idx`, as a half-open
-/// range of character indices - P14's rule, so brackets, slashes and colons
-/// stay inside the word and `foo(bar)` or `a/b:c` comes whole. None when the
-/// index is past the row's content or lands on whitespace, which is what
-/// makes a double-click on a gap select nothing rather than the next word.
-fn word_run(chars: &[char], idx: usize) -> Option<(usize, usize)> {
-    if idx >= chars.len() || chars[idx].is_whitespace() {
+/// muxterm patch P38: a word on one grid row - columns `start..end`, `end`
+/// exclusive - and how many characters it holds, which is not its width
+/// when it has a wide glyph in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WordSpan {
+    pub start: usize,
+    pub end: usize,
+    pub chars: usize,
+}
+
+/// muxterm patch P38: the run of non-whitespace cells through `col` (P14's
+/// rule). A wide glyph's spacer cell is part of the glyph, not a gap, so a
+/// click on either half of it lands on the same word.
+fn word_span(cells: &[(char, Flags)], col: usize) -> Option<WordSpan> {
+    let spacer = |i: usize| cells[i].1.contains(Flags::WIDE_CHAR_SPACER);
+    let blank = |i: usize| !spacer(i) && cells[i].0.is_whitespace();
+    if col >= cells.len() {
         return None;
     }
-    let mut start = idx;
-    while start > 0 && !chars[start - 1].is_whitespace() {
+    let col = if spacer(col) { col.checked_sub(1)? } else { col };
+    if blank(col) {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && !blank(start - 1) {
         start -= 1;
     }
-    let mut end = idx;
-    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+    let mut end = col + 1;
+    while end < cells.len() && !blank(end) {
         end += 1;
     }
-    Some((start, end + 1))
-}
-
-/// muxterm patch P33: the `cursor-right` stops of one grid row - the column
-/// each character starts at, in order, plus a final entry for the
-/// end-of-content boundary (a legal stop; one press further wraps onto the
-/// next row). Wide-char spacer cells are not characters. The trailing run of
-/// blanks is dropped the way tmux's own line length does it: it walks back
-/// over spaces and padding cells and never looks at their colors, so a row
-/// an agent CLI padded with coloured spaces ends at its last glyph.
-fn row_stops(cells: impl Iterator<Item = (char, Flags)>) -> Vec<usize> {
-    let mut stops = Vec::new();
-    let mut end = 0usize; // 1 past the last non-blank column
-    let mut chars = 0usize; // characters up to and including that column
-    let mut col = 0usize;
-    for (c, flags) in cells {
-        if flags.contains(Flags::WIDE_CHAR_SPACER) {
-            col += 1;
-            continue;
-        }
-        stops.push(col);
-        // The cell walk advances one column per cell - a wide glyph's second
-        // column arrives as its spacer - but the *content* it ends at is two
-        // columns on, which is where the end boundary belongs.
-        let w = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
-        if c != ' ' {
-            end = col + w;
-            chars = stops.len();
-        }
-        col += 1;
-    }
-    stops.truncate(chars);
-    stops.push(end);
-    stops
-}
-
-/// muxterm patch P33: the `cursor-right` count for a pointer at fractional
-/// column `col`, snapped to the nearest boundary (`edge`) or to the
-/// character containing it. Never exceeds the row's content, so the cursor
-/// cannot be walked onto the next row.
-fn stop_at(stops: &[usize], col: f32, edge: bool) -> usize {
-    if edge {
-        return (0..stops.len())
-            .min_by(|&a, &b| {
-                let d = |i: usize| (stops[i] as f32 - col).abs();
-                d(a).total_cmp(&d(b))
-            })
-            .unwrap_or(0);
-    }
-    stops
-        .iter()
-        .rposition(|&s| (s as f32) <= col)
-        .unwrap_or(0)
-        .min(stops.len().saturating_sub(2))
+    let chars = (start..end).filter(|&i| !spacer(i)).count();
+    Some(WordSpan { start, end, chars })
 }
 
 /// muxterm patch P19: a grid row wraps into the next when it carries the
@@ -1573,90 +1431,76 @@ mod tests {
         out
     }
 
-    /// P35 word expansion. The rule is P14's: a run of non-whitespace, so
+    /// The text of the P38 word through `col`, read back off the cells.
+    fn word(row: &[(char, Flags)], col: usize) -> Option<String> {
+        word_span(row, col).map(|w| {
+            row[w.start..w.end]
+                .iter()
+                .filter(|(_, f)| !f.contains(Flags::WIDE_CHAR_SPACER))
+                .map(|(c, _)| c)
+                .collect()
+        })
+    }
+
+    /// P38 word expansion. The rule is P14's: a run of non-whitespace, so
     /// brackets, slashes and colons stay inside the word.
     #[test]
     fn a_word_is_the_whole_non_whitespace_run() {
-        let row: Vec<char> = "cd src/app.rs && ls foo(bar) a/b:c".chars().collect();
-        let word = |i: usize| {
-            word_run(&row, i).map(|(a, b)| row[a..b].iter().collect::<String>())
-        };
+        let row = cells("cd src/app.rs && ls foo(bar) a/b:c", 40);
         // Punctuation must not end a word (P14).
-        assert_eq!(word(5).as_deref(), Some("src/app.rs"));
-        assert_eq!(word(21).as_deref(), Some("foo(bar)"));
-        assert_eq!(word(30).as_deref(), Some("a/b:c"));
-        // Every index inside a word gives the same word.
-        for i in 20..28 {
-            assert_eq!(word(i).as_deref(), Some("foo(bar)"), "index {i}");
+        assert_eq!(word(&row, 5).as_deref(), Some("src/app.rs"));
+        assert_eq!(word(&row, 21).as_deref(), Some("foo(bar)"));
+        assert_eq!(word(&row, 30).as_deref(), Some("a/b:c"));
+        // Every column inside a word gives the same word.
+        for c in 20..28 {
+            assert_eq!(word(&row, c).as_deref(), Some("foo(bar)"), "col {c}");
         }
-        // The first and last words reach the row's edges.
-        assert_eq!(word_run(&row, 0), Some((0, 2)));
-        assert_eq!(word_run(&row, row.len() - 1).unwrap().1, row.len());
+        // The first word starts the row.
+        assert_eq!(
+            word_span(&row, 0),
+            Some(WordSpan { start: 0, end: 2, chars: 2 })
+        );
         // Whitespace selects nothing rather than the neighbouring word, and
-        // so does anything past the content.
-        assert_eq!(word_run(&row, 2), None);
-        assert_eq!(word_run(&row, 28), None);
-        assert_eq!(word_run(&row, 999), None);
-        assert_eq!(word_run(&[], 0), None);
+        // so does the blank padding past the content or anything off the row.
+        assert_eq!(word_span(&row, 2), None);
+        assert_eq!(word_span(&row, 28), None);
+        assert_eq!(word_span(&row, 38), None);
+        assert_eq!(word_span(&row, 999), None);
+        assert_eq!(word_span(&[], 0), None);
     }
 
-    /// P33: tmux's `cursor-right` counts characters, so a wide glyph is one
-    /// press but two columns. Measured against tmux 3.7b on this exact
-    /// string: `-N 7` lands at cx=8, `-N 13` at cx=20, `-N 17` at cx=24.
+    /// A word that runs to the last column ends at the row's width, which
+    /// the app has to know: tmux cannot be pointed one cell past the edge.
     #[test]
-    fn row_stops_counts_characters_not_columns() {
-        let stops = row_stops(cells("wide: 日本語テキスト end", 40).into_iter());
-        assert_eq!(stops, vec![
-            0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 21, 22, 23, 24,
-        ]);
-        // The three measured tmux stops, by press count.
-        assert_eq!(stops[7], 8);
-        assert_eq!(stops[13], 20);
-        assert_eq!(stops[17], 24);
+    fn a_word_can_end_at_the_right_edge() {
+        let row = cells("ls longword", 11);
+        assert_eq!(
+            word_span(&row, 5),
+            Some(WordSpan { start: 3, end: 11, chars: 8 })
+        );
     }
 
-    /// The trailing blanks are dropped the way tmux's line length is, and
-    /// the final entry is the end-of-content boundary - a legal stop, one
-    /// press past which wraps onto the next row.
+    /// Spans are in columns but `chars` counts glyphs: a wide glyph is one
+    /// character over two cells, and a click on its spacer half is a click
+    /// on the glyph. The single-character case is the one the app has to
+    /// tell apart (tmux's `select-word` selects nothing for it).
     #[test]
-    fn row_stops_trims_trailing_blanks_like_tmux() {
-        assert_eq!(*row_stops(cells("xy日z  ", 20).into_iter()).last().unwrap(), 5);
-        // A row ending in a wide glyph ends past both of its columns.
-        assert_eq!(*row_stops(cells("abc日", 20).into_iter()).last().unwrap(), 5);
-        // An all-blank row has nowhere to go but column 0.
-        assert_eq!(row_stops(cells("", 20).into_iter()), vec![0]);
-        // Colour never enters into it: a padded row still ends at its glyph.
-        assert_eq!(*row_stops(cells("hi    ", 20).into_iter()).last().unwrap(), 2);
-    }
-
-    /// `edge` snaps to the nearest character boundary, which is what makes a
-    /// drag past a glyph's midpoint take it whole - and never returns a stop
-    /// that would walk the cursor onto the next row.
-    #[test]
-    fn stop_at_snaps_to_the_nearest_boundary() {
-        let stops = row_stops(cells("xy日z", 20).into_iter()); // [0,1,2,4,5]
-        assert_eq!(stop_at(&stops, 6.4, true), 4); // past the end -> boundary
-        assert_eq!(stop_at(&stops, 3.6, true), 3); // past the wide glyph
-        assert_eq!(stop_at(&stops, 2.2, true), 2); // still before it
-        // Without `edge` the character containing the point wins, and the
-        // end boundary is never it.
-        assert_eq!(stop_at(&stops, 3.0, false), 2); // inside the wide glyph
-        assert_eq!(stop_at(&stops, 4.5, false), 3);
-        assert_eq!(stop_at(&stops, 99.0, false), 3);
-        // Every result is a real press count for this row.
-        for c in [0.0f32, 1.4, 2.9, 5.5, 40.0] {
-            assert!(stop_at(&stops, c, true) < stops.len());
-            assert!(stop_at(&stops, c, false) <= stops.len() - 2);
-        }
-    }
-
-    /// Press and release inside the same half-cell must select nothing.
-    #[test]
-    fn stop_at_inside_one_cell_selects_nothing() {
-        let stops = row_stops(cells("abcd", 20).into_iter());
-        assert_eq!(stop_at(&stops, 0.1, true), stop_at(&stops, 0.4, true));
-        // ...but crossing the midpoint takes the character.
-        assert!(stop_at(&stops, 0.4, true) < stop_at(&stops, 0.6, true));
+    fn wide_glyphs_are_one_character_two_columns() {
+        let row = cells("a 日本 語 z", 20);
+        assert_eq!(
+            word_span(&row, 2),
+            Some(WordSpan { start: 2, end: 6, chars: 2 })
+        );
+        assert_eq!(word_span(&row, 3), word_span(&row, 2));
+        assert_eq!(
+            word_span(&row, 8),
+            Some(WordSpan { start: 7, end: 9, chars: 1 })
+        );
+        assert_eq!(
+            word_span(&row, 0),
+            Some(WordSpan { start: 0, end: 1, chars: 1 })
+        );
+        assert_eq!(word(&row, 10).as_deref(), Some("z"));
     }
 
     /// The best link text found when clicking (line, col) of `content`.

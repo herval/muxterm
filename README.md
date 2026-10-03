@@ -50,7 +50,7 @@ defaults rather than exposing every choice as configuration:
 cargo run --release
 ```
 
-Requires `tmux` (`brew install tmux`).
+Requires `tmux` 3.6 or newer (`brew install tmux`).
 
 ## Install as a Mac app
 

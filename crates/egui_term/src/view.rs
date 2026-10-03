@@ -31,8 +31,8 @@ const EGUI_TERM_WIDGET_ID_PREFIX: &str = "egui_term::instance::";
 // so the right/bottom edges never overflow; the floor-division remainder
 // becomes the right/bottom gutter. Draw origin, mouse->grid mapping, and
 // the resize all share this offset so they stay aligned.
-// P33: pub(crate) so the copy-mode coordinate mapping in `backend` subtracts
-// the same offset the renderer and process_mouse_move do.
+// P38: pub(crate) so `TerminalBackend::grid_cell` subtracts the same offset
+// the renderer and process_mouse_move do.
 pub(crate) const GRID_INSET: Vec2 = Vec2::new(6.0, 3.0);
 
 #[derive(Debug, Clone)]
@@ -79,6 +79,12 @@ pub struct TerminalView<'a> {
     // the background it is painted on. 1.0 (the default) disables the guard,
     // so the widget standalone renders exactly what the app asked for.
     min_contrast: f32,
+    // muxterm patch P38: when false the left button never touches the local
+    // selection - press, drag, double and triple click all leave it alone,
+    // because the host app relays them to something that draws its own
+    // (muxterm: tmux copy-mode). Links (P10) and the option+click relay
+    // (P25) are unaffected. On by default.
+    mouse_select: bool,
 }
 
 impl Widget for TerminalView<'_> {
@@ -121,6 +127,7 @@ impl<'a> TerminalView<'a> {
             copy_on_select: false,
             interactive: true,
             min_contrast: 1.0,
+            mouse_select: true,
         }
     }
 
@@ -159,6 +166,14 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_min_contrast(mut self, ratio: f32) -> Self {
         self.min_contrast = ratio;
+        self
+    }
+
+    /// muxterm patch P38: let the left button make a local selection. Off
+    /// hands selecting to the host app entirely. On by default.
+    #[inline]
+    pub fn set_mouse_select(mut self, on: bool) -> Self {
+        self.mouse_select = on;
         self
     }
 
@@ -347,6 +362,7 @@ impl<'a> TerminalView<'a> {
                         &modifiers,
                         pressed,
                         self.copy_on_select,
+                        self.mouse_select,
                     )
                 },
                 egui::Event::PointerMoved(pos) => {
@@ -360,6 +376,7 @@ impl<'a> TerminalView<'a> {
                         pos,
                         &modifiers,
                         ends_move_run,
+                        self.mouse_select,
                     )
                 },
                 _ => {},
@@ -1019,6 +1036,7 @@ fn process_button_click(
     modifiers: &Modifiers,
     pressed: bool,
     copy_on_select: bool,
+    mouse_select: bool,
 ) -> Vec<InputAction> {
     match button {
         PointerButton::Primary => process_left_button(
@@ -1030,6 +1048,7 @@ fn process_button_click(
             modifiers,
             pressed,
             copy_on_select,
+            mouse_select,
         ),
         _ => vec![],
     }
@@ -1045,6 +1064,7 @@ fn process_left_button(
     modifiers: &Modifiers,
     pressed: bool,
     copy_on_select: bool,
+    mouse_select: bool,
 ) -> Vec<InputAction> {
     // muxterm patch P16 (supersedes P7's left-button forwarding): the left
     // button is never reported to the application - clicks and drags always
@@ -1094,6 +1114,12 @@ fn process_left_button(
         if link_click {
             state.is_dragged = false;
             vec![]
+        } else if !mouse_select {
+            // P38: still a drag as far as pointer acceptance goes, so the
+            // wheel keeps reaching the app while the button is held outside
+            // the pane - but nothing is selected here.
+            state.is_dragged = true;
+            vec![]
         } else {
             process_left_button_pressed(state, layout, position)
         }
@@ -1117,6 +1143,7 @@ fn process_left_button(
             position,
             modifiers,
             copy_on_select,
+            mouse_select,
         )
     }
 }
@@ -1141,14 +1168,19 @@ fn process_left_button_released(
     position: Pos2,
     modifiers: &Modifiers,
     copy_on_select: bool,
+    mouse_select: bool,
 ) -> Vec<InputAction> {
     state.is_dragged = false;
     let mut actions = vec![];
     let mut opened_link = false;
     if layout.double_clicked() || layout.triple_clicked() {
-        actions.push(InputAction::BackendCall(build_start_select_command(
-            layout, position,
-        )));
+        // P38: otherwise the host selects the word or line itself - and a
+        // doubled-up cmd+click still opens its link only once.
+        if mouse_select {
+            actions.push(InputAction::BackendCall(
+                build_start_select_command(layout, position),
+            ));
+        }
     } else {
         let terminal_content = backend.last_content();
         let binding_action = bindings_layout.get_action(
@@ -1172,7 +1204,8 @@ fn process_left_button_released(
     // muxterm patch P10: except a link-opening click, which never touched
     // the selection - re-copying whatever older selection is still live
     // would clobber the clipboard as a side effect of following a link.
-    if copy_on_select && !opened_link {
+    // P38: and never when the host does the selecting.
+    if copy_on_select && !opened_link && mouse_select {
         actions.push(InputAction::CopySelection);
     }
     actions
@@ -1204,6 +1237,7 @@ fn process_mouse_move(
     position: Pos2,
     modifiers: &Modifiers,
     ends_move_run: bool,
+    mouse_select: bool,
 ) -> Vec<InputAction> {
     let terminal_content = backend.last_content();
     // P17: shift into grid space past the top-left inset before mapping to
@@ -1221,7 +1255,8 @@ fn process_mouse_move(
     // muxterm patch P16: drags are always the local selection - left-button
     // events are never reported to the application (see process_left_button).
     // P31: only the move that ends a run needs to move the selection.
-    if state.is_dragged && ends_move_run {
+    // P38: and only a selection this widget is drawing.
+    if state.is_dragged && ends_move_run && mouse_select {
         actions.push(InputAction::BackendCall(BackendCommand::SelectUpdate(
             cursor_x, cursor_y,
         )));

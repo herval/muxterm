@@ -276,7 +276,8 @@ tmux-backed design. Local patches:
   `#{mouse_any_flag}` (`send -M` into mouse-tracking apps, consumed
   otherwise), so an option+click on a plain shell does nothing. Plain
   clicks, drags, and double/triple selection are untouched.
-- **P26** (`src/backend/mod.rs`, `clear_selection`): a public one-liner
+- **P26** *(retired by P38: no local selection is left to clear)*
+  (`src/backend/mod.rs`, `clear_selection`): a public one-liner
   to drop the local selection (`term.selection = None` + mark dirty).
   Under tmux the wheel is forwarded (P2) and tmux repaints the pane,
   whose in-place erases wipe any local selection - so selecting text then
@@ -374,7 +375,8 @@ tmux-backed design. Local patches:
   itself reports the primary button up, *unless* this frame's queue carries
   the release, which the event loop handles normally (P8 copy-on-select
   needs the final motion applied first).
-- **P33** (`src/backend/mod.rs`, `copy_target`, `row_stops`, `stop_at`,
+- **P33** *(retired by P38, code removed)* (`src/backend/mod.rs`,
+  `copy_target`, `row_stops`, `stop_at`,
   `src/view.rs`, `GRID_INSET`): pixel positions as tmux copy-mode motions.
   muxterm drives a pane's tmux copy-mode selection from the app side - the
   left button is still never reported (P16), so a drag is mirrored by
@@ -430,7 +432,8 @@ tmux-backed design. Local patches:
   key, since changing it recolors shapes already cached. Default 1.0, which
   disables the guard: the widget standalone still renders exactly what the
   application asked for, and muxterm sets it from config `min_contrast`.
-- **P35** (`src/backend/mod.rs`, `word_bounds_at`, `word_run`, `row_chars`):
+- **P35** *(retired by P38, code removed)* (`src/backend/mod.rs`,
+  `word_bounds_at`, `word_run`, `row_chars`):
   the word under a double-click, decided from the grid. muxterm mirrors a
   selection into tmux copy-mode (P33), and a double/triple click used to ask
   tmux's own `select-word` for the range - which decides word edges with its
@@ -469,3 +472,38 @@ tmux-backed design. Local patches:
   won't open degrades to the visible text. Needs tmux to forward OSC 8 at
   all, which it does only for a client terminal with the `hyperlinks`
   feature - muxterm's tmux.conf turns it on.
+- **P38** (`src/view.rs`, `TerminalView::mouse_select` + `set_mouse_select`,
+  `process_left_button`, `process_left_button_released`,
+  `process_mouse_move`; `src/backend/mod.rs`, `grid_cell`, `word_at`,
+  `word_span`, `WordSpan`, `TerminalSize::columns`): the host can take the
+  left button's selecting away from the widget. With `set_mouse_select(false)`
+  a press, a drag, and a double or triple click leave the local selection
+  alone (and P8 copy-on-select with it), while links (P10), the option+click
+  relay (P25) and the wheel are unaffected; a press still counts as a drag
+  for pointer acceptance, so the wheel keeps reaching the app with the button
+  held outside the pane. A doubled-up cmd+click no longer selects a word
+  either, and still opens its link once. muxterm turns it off and relays the
+  gestures to tmux as mouse reports, so tmux's copy-mode draws, holds and
+  copies the one selection there is. That retires P33/P35's replay, which
+  drew the drag locally and re-created it in copy-mode as cursor motions
+  when it ended: every way the replay could land somewhere else was a copy
+  of a different line than the one on screen. tmux keeps a tab as one
+  character spanning several columns but sends the client spaces, so a
+  character count read off this grid overshot after every tab, and past the
+  row's content `cursor-right` wraps onto the next row; and `cursor-down`
+  resumes from a column it remembered from earlier, so with a blank top row
+  the whole selection started a row down and a few columns over (measured on
+  3.7b). The handoff from the local highlight to tmux's was also a visible
+  blink, as was a cmd+press on something P10 didn't take for a link, which
+  began a local selection that the next repaint wiped. What the host needs
+  now is cells, not counts: `grid_cell` maps a pane-relative pixel position
+  to a visible (row, column), rounding to the nearest cell *boundary* for a
+  drag's ends - tmux's selection runs [lower, upper) between the cells it is
+  given, so a drag past a glyph's midpoint takes it and a press and release
+  inside one half-cell take nothing, `selection_side`'s rule - and `word_at`
+  gives the run of non-whitespace through a cell (P14's rule) in columns,
+  with its character count: tmux's own `select-word` selects nothing for a
+  one-character word, so the host has to tell those apart. A wide glyph's
+  spacer belongs to the glyph, so a click on either half finds the same word.
+  `TerminalSize::columns` joins `screen_lines` (P29) as an accessor that
+  needs no alacritty trait in scope.

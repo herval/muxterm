@@ -52,7 +52,9 @@ fn classify_probe(ok: bool, stdout: &str, stderr: &str) -> ServerProbe {
 /// Regenerated on every launch (it only applies when the server starts) and
 /// re-sourced into a running server when copy_on_select changes.
 /// `status off` makes sessions look like a plain terminal; the `Ms` override
-/// makes tmux emit OSC 52 on copy, which surfaces as PtyEvent::ClipboardStore.
+/// lets tmux pass a program's clipboard escape (OSC 52) on to the client,
+/// where it surfaces as PtyEvent::ClipboardStore. muxterm's own copies don't
+/// take that route (`TmuxCtl::take_selection`).
 const CONF_BASE: &str = r##"# managed by muxterm - regenerated at every launch
 set -g status off
 set -g mouse on
@@ -106,10 +108,10 @@ bind -T copy-mode WheelUpPane send-keys -X scroll-up
 bind -T copy-mode WheelDownPane send-keys -X scroll-down
 bind -T copy-mode-vi WheelUpPane send-keys -X scroll-up
 bind -T copy-mode-vi WheelDownPane send-keys -X scroll-down
-# muxterm drives copy-mode selections itself - one chained tmux invocation
-# per drag update (TmuxCtl::select_update), because the left button is never
-# reported to tmux (egui_term P16). These four settle what a selection looks
-# like and how it can be dismissed.
+# muxterm's own drags and multi-clicks reach tmux as meta-tagged mouse
+# reports with bindings of their own (tmux::Gesture, gesture_bindings), so
+# tmux draws and holds every selection. These four settle what a selection
+# looks like and how it can be dismissed.
 # mode-keys is otherwise guessed from $EDITOR, and the vi table binds Escape
 # to clear-selection rather than cancel - which would leave a pane sitting
 # frozen in copy-mode after the user tried to dismiss a selection.
@@ -125,8 +127,9 @@ setw -g mode-style reverse
 setw -g copy-mode-position-format ''
 # Double-click selects a whole non-whitespace run, matching egui_term P14
 # (which cut alacritty's semantic boundaries down to whitespace). tmux's
-# default separators would stop select-word at the first slash or colon.
-set -g word-separators ' '
+# default separators would stop select-word at the first slash or colon. The
+# tab is there because tmux keeps one as a single character of its own.
+set -g word-separators " \t"
 "##;
 
 /// Theme-derived colors for tmux's copy-mode search highlight, built by
@@ -139,13 +142,13 @@ pub struct SearchStyle {
     pub current_fg: String,
 }
 
-/// Mouse drags inside panes are driven by tmux copy-mode, so copy-on-select
-/// for them is a tmux binding, not app code. Both values are spelled out
-/// explicitly (`on` is tmux's own default) so that re-sourcing the file
-/// flips a running server in either direction:
+/// copy_on_select for tmux's own mouse drags - those of another client
+/// attached to the socket, since muxterm's arrive as `Gesture`s and the app
+/// copies them itself. Both values are spelled out explicitly (`on` is
+/// tmux's own default) so that re-sourcing the file flips a running server
+/// in either direction:
 /// - on: releasing a drag copies the selection (OSC 52 -> clipboard).
-/// - off: releasing keeps the selection on screen and copies nothing;
-///   cmd+c (App::copy_intercept) does the explicit copy.
+/// - off: releasing keeps the selection on screen and copies nothing.
 fn conf(copy_on_select: bool, search: &SearchStyle) -> String {
     let drag_end = if copy_on_select {
         "bind -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel\n\
@@ -160,7 +163,115 @@ fn conf(copy_on_select: bool, search: &SearchStyle) -> String {
          set -g copy-mode-current-match-style 'bg={},fg={}'\n",
         search.match_bg, search.current_bg, search.current_fg,
     );
-    format!("{CONF_BASE}{drag_end}{search_style}")
+    let gestures = gesture_bindings();
+    format!("{CONF_BASE}{drag_end}{gestures}{search_style}")
+}
+
+/// The bindings that turn a `Gesture` into a selection - never a copy:
+/// muxterm makes those itself (`TmuxCtl::take_selection`), copy_on_select
+/// included, so the text comes back to it rather than depending on tmux's
+/// clipboard escape getting through.
+///
+/// Root table first, for a pane not in copy-mode yet: a drag's first report
+/// enters it and starts the drag in one step (`copy-mode -M`, anchored where
+/// the press went down), and a word or line click enters it before
+/// selecting. Every other key a gesture can produce - a press's release,
+/// tmux's own second/triple-click and delayed double-click events - is
+/// consumed rather than left unbound, because an unbound mouse key is
+/// forwarded to the pane, and a program that turned on mouse tracking (every
+/// agent CLI does) would see a click it never got from the user.
+///
+/// In copy-mode, keys the mode's table lacks fall back to root, so only the
+/// drag needs bindings there: it continues the selection instead of
+/// re-entering the mode, and its end leaves the selection standing.
+/// `send-keys -X` run from a mouse binding moves tmux's cursor to the mouse
+/// first, which is what puts `select-word` and `select-line` under the
+/// click.
+fn gesture_bindings() -> String {
+    let mut out = String::from("bind -n M-MouseDrag1Pane copy-mode -M\n");
+    for key in [
+        "MouseDown1Pane",
+        "MouseUp1Pane",
+        "SecondClick1Pane",
+        "DoubleClick1Pane",
+        "TripleClick1Pane",
+        "MouseDragEnd1Pane",
+        "MouseUp2Pane",
+        "DoubleClick2Pane",
+        "MouseUp3Pane",
+        "DoubleClick3Pane",
+    ] {
+        out += &format!("bind -n M-{key} select-pane -t =\n");
+    }
+    // A click repeated inside tmux's 300ms window arrives as a second or
+    // triple click rather than a press, so all three select.
+    for (button, cmd) in [(3, "select-word"), (2, "select-line")] {
+        for click in ["MouseDown", "SecondClick", "TripleClick"] {
+            out += &format!(
+                "bind -n M-{click}{button}Pane {{ select-pane -t = ; \
+                 copy-mode ; send-keys -X {cmd} }}\n"
+            );
+        }
+    }
+    for table in ["copy-mode", "copy-mode-vi"] {
+        out += &format!(
+            "bind -T {table} M-MouseDrag1Pane \
+             {{ select-pane ; send-keys -X begin-selection }}\n\
+             bind -T {table} M-MouseDragEnd1Pane select-pane\n"
+        );
+    }
+    out
+}
+
+/// One of muxterm's selection gestures, relayed to tmux as an SGR mouse
+/// report written to the pane's own PTY - the same channel as a wheel
+/// report, so tmux reads them in the order they happened.
+///
+/// They carry the meta bit, which nothing else muxterm reports does (egui_term
+/// P25/P30 strip modifiers), so they get tmux.conf bindings of their own
+/// (`gesture_bindings`) and can never be mistaken for a click meant for the
+/// pane's program. Word and line ride on the right and middle buttons:
+/// single presses bound to `select-word`/`select-line`, rather than tmux's
+/// own double/triple-click detection, which only fires 300ms after the click
+/// and keeps state between gestures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gesture {
+    /// The left button went down here: a drag's anchor.
+    Press,
+    /// The held button moved to this cell.
+    Drag,
+    /// The button came up, ending the drag.
+    Release,
+    /// Select the word at this cell (a double-click).
+    Word,
+    /// Select the line at this cell (a triple-click).
+    Line,
+    /// One line of copy-mode scroll. A plain wheel report, *not* meta-tagged:
+    /// it is copy-mode's own wheel binding that it is meant to reach.
+    ScrollUp,
+    ScrollDown,
+}
+
+impl Gesture {
+    /// The report bytes for this gesture at a visible (row, column) of the
+    /// pane.
+    pub fn report(self, (row, col): (usize, usize)) -> Vec<u8> {
+        const META: u8 = 8;
+        let sgr = |code: u8, press: bool| {
+            let end = if press { 'M' } else { 'm' };
+            format!("\x1b[<{code};{};{}{end}", col + 1, row + 1)
+        };
+        let report = match self {
+            Gesture::Press => sgr(META, true),
+            Gesture::Drag => sgr(32 | META, true),
+            Gesture::Release => sgr(META, false),
+            Gesture::Word => sgr(2 | META, true) + &sgr(2 | META, false),
+            Gesture::Line => sgr(1 | META, true) + &sgr(1 | META, false),
+            Gesture::ScrollUp => sgr(64, true),
+            Gesture::ScrollDown => sgr(65, true),
+        };
+        report.into_bytes()
+    }
 }
 
 /// Clone: pane link-openers each carry one onto their worker thread.
@@ -392,105 +503,52 @@ impl TmuxCtl {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Is the session's active pane sitting in copy-mode with a selection?
-    /// (`display-message` rejects the `=` target prefix; session names are
-    /// fixed-length uuids, so prefix ambiguity can't bite.)
-    pub fn selection_present(&self, session: &str) -> bool {
-        let out = Command::new(&self.bin)
-            .args([
-                "-L",
-                SOCKET,
-                "display-message",
-                "-p",
-                "-t",
-                session,
-                "#{selection_present}",
-            ])
-            .output();
-        match out {
-            Ok(out) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).trim() == "1"
-            },
-            _ => false,
-        }
-    }
-
-    /// Copy the active copy-mode selection, exactly like the default
-    /// drag-end binding would: the text reaches the clipboard through the
-    /// OSC 52 round trip (PtyEvent::ClipboardStore).
-    pub fn copy_selection(&self, session: &str) {
-        let _ = Command::new(&self.bin)
-            .args([
-                "-L",
-                SOCKET,
-                "send-keys",
-                "-t",
-                &format!("={session}:"),
-                "-X",
-                "copy-selection-and-cancel",
-            ])
-            .output();
-    }
-
-    /// Drive one step of a pane's copy-mode selection (see `select_argv`).
-    /// muxterm never forwards the left button (egui_term P16), so a drag is
-    /// mirrored into tmux from the app side: this is how a selection comes to
-    /// live somewhere that survives the pane's repaints and reaches into
-    /// scrollback.
+    /// Copy the session's copy-mode selection, leave copy-mode, and hand the
+    /// text back - None when there was no selection to copy.
     ///
-    /// Runs on a detached thread - one chained fork measures ~4ms, which is a
-    /// whole frame at the moment the user is dragging. The returned flag
-    /// flips once `output()` returns, i.e. once the server has *executed* the
-    /// sequence; the caller keeps at most one update in flight and lets every
-    /// later one supersede it (each carries absolute coordinates, so a
-    /// skipped update costs nothing).
-    pub fn select_update(
-        &self,
-        session: &str,
-        anchor: Option<(usize, usize)>,
-        cursor: (usize, usize),
-        scroll: i32,
-        finish: Finish,
-    ) -> Arc<AtomicBool> {
-        self.spawn_argv(select_argv(session, anchor, cursor, scroll, finish))
-    }
-
-    /// Freeze the pane's view by entering copy-mode, without touching the
-    /// cursor or the selection. This is the whole of what a drag does when
-    /// it arms: the freeze is what stops the pane's repaints from wiping the
-    /// widget's local highlight, and the local highlight is what draws the
-    /// drag - at sixty frames a second, with no forks and nothing to blink.
-    /// tmux only learns the selection when the drag ends.
-    pub fn enter_copy_mode(&self, session: &str) -> Arc<AtomicBool> {
-        self.spawn_argv(
-            ["-L", SOCKET, "copy-mode", "-t", &format!("={session}:")]
-                .map(String::from)
-                .to_vec(),
-        )
-    }
-
-    /// Scroll a pane already in copy-mode, leaving the cursor on its screen
-    /// row so the selection extends with the viewport. One command, so the
-    /// client gets one redraw - repositioning the cursor absolutely would
-    /// send it via `top-line`, and the trip through the top of the pane is
-    /// visible.
-    pub fn scroll_copy_mode(&self, session: &str, lines: i32) -> Arc<AtomicBool> {
-        let cmd = if lines > 0 { "scroll-up" } else { "scroll-down" };
-        self.spawn_argv(
-            [
-                "-L",
-                SOCKET,
-                "send-keys",
-                "-t",
-                &format!("={session}:"),
-                "-X",
-                "-N",
-                &lines.unsigned_abs().to_string(),
-                cmd,
-            ]
-            .map(String::from)
-            .to_vec(),
-        )
+    /// The text comes back here instead of through the clipboard escape (OSC
+    /// 52) tmux would otherwise send the client, which `-C` (tmux >= 3.6)
+    /// turns off: tmux skips that escape whenever the pane has a redraw
+    /// pending, and entering copy-mode in the same breath as copying is
+    /// enough to have one (measured on 3.7b: the paste buffer held the text,
+    /// the clipboard never heard of it).
+    ///
+    /// Two invocations. The first is atomic, so nothing interleaves: the
+    /// pane's width, then the copy - only if a selection is standing, or tmux
+    /// would copy the search match under the cursor instead - into a buffer
+    /// named under a prefix no other copy has used, then that buffer's name.
+    /// A selection of nothing but blanks makes no buffer at all, so there is
+    /// then no name, rather than whatever was copied last. The second reads
+    /// that one buffer. It can't be one invocation: `show-buffer` fails
+    /// outright once anything else in the same invocation has printed, and
+    /// `list-buffers` would print the text with every newline turned into
+    /// `_`. (`display-message` rejects the `=` target prefix; session names
+    /// are fixed-length uuids, so prefix ambiguity can't bite.)
+    pub fn take_selection(&self, session: &str) -> Option<Copied> {
+        let target = format!("={session}:");
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let prefix = format!("muxterm-copy-{}-", &id[..8]);
+        let out = Command::new(&self.bin)
+            .args(["-L", SOCKET, "display-message", "-p", "-t", session])
+            .args(["#{pane_width}", ";", "if-shell", "-F", "-t", &target])
+            .arg("#{selection_present}")
+            .arg(format!(
+                "send-keys -t {target} -X copy-selection-and-cancel -C {prefix}"
+            ))
+            .args([";", "list-buffers", "-F", "#{buffer_name}", "-f"])
+            .arg(format!("#{{m:{prefix}*,#{{buffer_name}}}}"))
+            .output()
+            .ok()?;
+        let listed = String::from_utf8_lossy(&out.stdout);
+        let (width, buffer) = copied_buffer(&listed, &prefix)?;
+        let out = Command::new(&self.bin)
+            .args(["-L", SOCKET, "show-buffer", "-b", buffer])
+            .output()
+            .ok()?;
+        out.status.success().then(|| Copied {
+            text: String::from_utf8_lossy(&out.stdout).into_owned(),
+            width,
+        })
     }
 
     /// Leave copy-mode, dropping any selection with it - the pane goes back
@@ -809,92 +867,21 @@ fn escape_semi(query: &str) -> String {
     }
 }
 
-/// The argv (after `tmux`) that recreates a visible-pane selection in
-/// copy-mode and scrolls it: `copy-mode ; top-line ; start-of-line ; [down
-/// sr] ; [right sc] ; begin-selection ; [down er-sr] ; start-of-line ;
-/// [right ec] ; [scroll]`. `top-line`+`start-of-line` give a stable anchor
-/// (top-left of the visible screen); zero-count motions are skipped. Pure so
-/// it unit-tests without a tmux server (the risky copy-mode motion sequence).
-/// What the last step of a selection update does with the result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Finish {
-    /// Leave the selection standing (cmd+c copies it later).
-    Keep,
-    /// Copy and leave copy-mode, unfreezing the pane.
-    CopyAndCancel,
+/// Text tmux copied out of a pane, and the pane width it was wrapped to.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Copied {
+    pub text: String,
+    pub width: u16,
 }
 
-/// The argv (after `tmux`) for one copy-mode selection update. `row` is
-/// 0-based within the *visible* pane; the second element is a count of
-/// `cursor-right` presses - characters, not columns, which is what
-/// egui_term's `copy_target` counts and clamps so the cursor can never wrap
-/// onto the next row.
-///
-/// `anchor` is Some while the drag origin is still on screen. tmux pins the
-/// anchor to the *content*, so re-issuing `begin-selection` there every
-/// update is self-healing; once autoscroll has pushed the origin past an
-/// edge, leaving it alone is the only way to keep it - a screen-relative
-/// motion cannot address an off-screen row.
-///
-/// `scroll` comes last, and that ordering is the whole anchor rule:
-/// scrolling moves the viewport but leaves the *cursor* on its screen row,
-/// so the cursor end travels into older lines while the anchor stays put.
-/// Anchoring the moving end instead collapses the selection to nothing and
-/// then inverts it (measured: a 3-row selection + `scroll-up -N 3` left
-/// selection_present=0).
-///
-/// No `start-of-line` anywhere: on the continuation row of a soft-wrapped
-/// line it jumps *up* to the logical line's start (measured), which is most
-/// of an agent CLI's output. `top-line` already parks the cursor at column 0
-/// of the viewport's top row, and `cursor-down` counts screen rows whether
-/// they are wrapped or not.
-fn select_argv(
-    session: &str,
-    anchor: Option<(usize, usize)>,
-    cursor: (usize, usize),
-    scroll: i32,
-    finish: Finish,
-) -> Vec<String> {
-    // A `; send-keys -t <target> -X <args...>` step (a nested fn, not a
-    // closure, so it doesn't borrow `argv` for the whole build).
-    fn step(argv: &mut Vec<String>, t: &str, args: &[&str]) {
-        argv.push(";".into());
-        argv.extend(["send-keys", "-t", t, "-X"].map(String::from));
-        argv.extend(args.iter().map(|s| s.to_string()));
-    }
-    fn seek(argv: &mut Vec<String>, t: &str, (row, col): (usize, usize)) {
-        step(argv, t, &["top-line"]);
-        if row > 0 {
-            step(argv, t, &["-N", &row.to_string(), "cursor-down"]);
-        }
-        if col > 0 {
-            step(argv, t, &["-N", &col.to_string(), "cursor-right"]);
-        }
-    }
-    let t = format!("={session}:");
-    // copy-mode first, and *bare*: it is a true no-op on a pane already in
-    // it, so every update self-heals a pane something else knocked out. `-e`
-    // is deliberately not used here - it would cancel the mode, and the
-    // selection with it, the moment a scroll reached the bottom.
-    let mut argv: Vec<String> = ["-L", SOCKET, "copy-mode", "-t", t.as_str()]
-        .map(String::from)
-        .to_vec();
-    if let Some(a) = anchor {
-        seek(&mut argv, &t, a);
-        step(&mut argv, &t, &["begin-selection"]);
-    }
-    seek(&mut argv, &t, cursor);
-    if scroll != 0 {
-        let cmd = if scroll > 0 { "scroll-up" } else { "scroll-down" };
-        step(&mut argv, &t, &["-N", &scroll.unsigned_abs().to_string(), cmd]);
-    }
-    match finish {
-        Finish::Keep => {},
-        Finish::CopyAndCancel => {
-            step(&mut argv, &t, &["copy-selection-and-cancel"])
-        },
-    }
-    argv
+/// `take_selection`'s first answer: the pane width on a line of its own,
+/// then the name of the buffer the copy made - which must carry the prefix
+/// it was asked for - or nothing at all when no copy was made.
+fn copied_buffer<'a>(out: &'a str, prefix: &str) -> Option<(u16, &'a str)> {
+    let mut lines = out.lines();
+    let width = lines.next()?.trim().parse().ok()?;
+    let buffer = lines.next().filter(|name| name.starts_with(prefix))?;
+    Some((width, buffer))
 }
 
 /// capture-pane pads the visible region with blank lines; strip them (and
@@ -942,85 +929,90 @@ mod tests {
         assert_eq!(classify_probe(false, "", ""), ServerProbe::Unknown);
     }
 
-    /// The ordered copy-mode command names (the arg after each `-X`, past an
-    /// optional `-N <count>`).
-    fn x_cmds(argv: &[String]) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < argv.len() {
-            if argv[i] == "-X" {
-                if argv.get(i + 1).map(String::as_str) == Some("-N") {
-                    out.push(argv[i + 3].clone());
-                    i += 4;
-                } else {
-                    out.push(argv[i + 1].clone());
-                    i += 2;
-                }
-            } else {
-                i += 1;
+    /// No copy, no buffer name - and only a name under this copy's own
+    /// prefix will do, so an older buffer can never be read in its place.
+    #[test]
+    fn only_this_copys_buffer_is_read() {
+        let p = "muxterm-copy-0a1b2c3d-";
+        assert_eq!(copied_buffer("80\n", p), None);
+        assert_eq!(copied_buffer("", p), None);
+        assert_eq!(
+            copied_buffer("80\nmuxterm-copy-0a1b2c3d-7\n", p),
+            Some((80, "muxterm-copy-0a1b2c3d-7"))
+        );
+        assert_eq!(copied_buffer("80\nbuffer3\n", p), None);
+        assert_eq!(copied_buffer("80\nmuxterm-copy-ffffffff-2\n", p), None);
+        // A width that isn't one means the output isn't what was asked for.
+        assert_eq!(copied_buffer("oops\nmuxterm-copy-0a1b2c3d-7\n", p), None);
+    }
+
+    /// SGR reports are 1-based, column first; the meta bit (8) is what
+    /// routes a gesture to its own bindings, and the wheel steps carry none.
+    #[test]
+    fn gestures_encode_as_meta_tagged_sgr_reports() {
+        let at = |g: Gesture| String::from_utf8(g.report((4, 9))).unwrap();
+        assert_eq!(at(Gesture::Press), "\x1b[<8;10;5M");
+        assert_eq!(at(Gesture::Drag), "\x1b[<40;10;5M");
+        assert_eq!(at(Gesture::Release), "\x1b[<8;10;5m");
+        // Word and line are whole clicks: a press and its release.
+        assert_eq!(at(Gesture::Word), "\x1b[<10;10;5M\x1b[<10;10;5m");
+        assert_eq!(at(Gesture::Line), "\x1b[<9;10;5M\x1b[<9;10;5m");
+        assert_eq!(at(Gesture::ScrollUp), "\x1b[<64;10;5M");
+        assert_eq!(at(Gesture::ScrollDown), "\x1b[<65;10;5M");
+        assert_eq!(
+            String::from_utf8(Gesture::Press.report((0, 0))).unwrap(),
+            "\x1b[<8;1;1M"
+        );
+    }
+
+    /// Every key a gesture can produce is bound in the root table: one left
+    /// unbound would be forwarded to the pane's program, which is exactly
+    /// the stray click egui_term P16 exists to prevent.
+    #[test]
+    fn every_gesture_key_is_bound() {
+        let mut keys: Vec<String> =
+            ["MouseDrag1Pane", "MouseDragEnd1Pane"].map(String::from).to_vec();
+        for button in 1..=3 {
+            for click in
+                ["MouseDown", "MouseUp", "SecondClick", "DoubleClick", "TripleClick"]
+            {
+                keys.push(format!("{click}{button}Pane"));
             }
         }
-        out
+        for copy_on_select in [true, false] {
+            let text = conf(copy_on_select, &style());
+            for key in &keys {
+                assert!(
+                    text.contains(&format!("bind -n M-{key} ")),
+                    "root M-{key} unbound (copy_on_select={copy_on_select})"
+                );
+            }
+            // A drag enters copy-mode from root and continues inside it.
+            assert!(text.contains("bind -n M-MouseDrag1Pane copy-mode -M\n"));
+            for table in ["copy-mode", "copy-mode-vi"] {
+                assert!(text.contains(&format!(
+                    "bind -T {table} M-MouseDrag1Pane {{ select-pane ; send-keys -X begin-selection }}"
+                )));
+            }
+            assert!(text.contains(
+                "bind -n M-MouseDown3Pane { select-pane -t = ; copy-mode ; send-keys -X select-word"
+            ));
+            assert!(text.contains(
+                "bind -n M-MouseDown2Pane { select-pane -t = ; copy-mode ; send-keys -X select-line"
+            ));
+        }
     }
 
+    /// A gesture only ever selects. Copying - copy_on_select's too - is
+    /// muxterm's own `take_selection`, because a copy tmux makes inside a
+    /// binding reaches the clipboard only through an escape tmux drops
+    /// whenever a redraw is pending, as it is right after entering copy-mode.
     #[test]
-    fn select_argv_anchors_then_moves_then_scrolls() {
-        // Anchor at (row 2, 3 presses), cursor at (row 4, 10), scroll up 3.
-        let a = select_argv("mux-aaaa", Some((2, 3)), (4, 10), 3, Finish::Keep);
-        assert_eq!(a[..5], ["-L", SOCKET, "copy-mode", "-t", "=mux-aaaa:"]);
-        assert_eq!(x_cmds(&a), [
-            "top-line",
-            "cursor-down",  // to the anchor row
-            "cursor-right", // to the anchor column
-            "begin-selection",
-            "top-line",
-            "cursor-down",  // to the cursor row
-            "cursor-right", // to the cursor column
-            "scroll-up",    // scroll > 0
-        ]);
-        let joined = a.join(" ");
-        assert!(joined.contains("-X -N 2 cursor-down"), "{joined}");
-        assert!(joined.contains("-X -N 10 cursor-right"), "{joined}");
-        assert!(joined.contains("-X -N 3 scroll-up"), "{joined}");
-        // `start-of-line` walks *up* to the start of a soft-wrapped logical
-        // line, which is most of an agent CLI's output - it must never
-        // appear between an absolute seek's steps.
-        assert!(!joined.contains("start-of-line"), "{joined}");
-
-        // The scroll always comes last: that ordering is what leaves the
-        // cursor end riding the viewport while the anchor stays put.
-        assert_eq!(x_cmds(&a).last().unwrap(), "scroll-up");
-
-        // Zero row/column offsets emit no motion; a negative scroll goes the
-        // other way.
-        let b = select_argv("mux-bbbb", None, (0, 0), -2, Finish::Keep);
-        assert_eq!(x_cmds(&b), ["top-line", "scroll-down"]);
-        assert!(b.join(" ").contains("-X -N 2 scroll-down"));
-    }
-
-    #[test]
-    fn select_argv_without_an_anchor_only_moves_the_cursor() {
-        // Once autoscroll has pushed the origin off screen there is no row to
-        // re-anchor to, and re-issuing begin-selection would land it on the
-        // wrong line - so the update carries the cursor alone.
-        let a = select_argv("mux-aaaa", None, (4, 10), 0, Finish::Keep);
-        assert_eq!(x_cmds(&a), ["top-line", "cursor-down", "cursor-right"]);
-        assert_eq!(a.iter().filter(|s| *s == "top-line").count(), 1);
-        assert!(!a.iter().any(|s| s == "begin-selection"));
-    }
-
-    #[test]
-    fn select_argv_finish_variants() {
-        let keep = select_argv("s", None, (1, 1), 0, Finish::Keep);
-        assert!(!keep.iter().any(|s| s.starts_with("copy-selection")));
-
-        // copy_on_select copies and hands the pane straight back, so the
-        // copy step is always last and always the cancelling one.
-        let cancel = select_argv("s", None, (1, 1), 0, Finish::CopyAndCancel);
-        assert_eq!(
-            x_cmds(&cancel).last().unwrap(),
-            "copy-selection-and-cancel",
-        );
+    fn gestures_never_copy() {
+        let text = gesture_bindings();
+        assert!(!text.contains("copy-selection"), "{text}");
+        assert!(!text.contains("copy-pipe"), "{text}");
+        assert!(text.contains("bind -T copy-mode M-MouseDragEnd1Pane select-pane\n"));
     }
 
     #[test]
@@ -1177,7 +1169,7 @@ mod tests {
                 "setw -g mode-keys emacs",
                 "setw -g mode-style reverse",
                 "setw -g copy-mode-position-format ''",
-                "set -g word-separators ' '",
+                "set -g word-separators \" \\t\"",
             ] {
                 assert!(text.contains(line), "missing: {line}");
             }
