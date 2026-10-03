@@ -68,6 +68,12 @@ set -g set-titles on
 set -g set-titles-string "#{pane_current_command}"
 set -s set-clipboard on
 set -as terminal-overrides ',xterm*:Ms=\E]52;%p1%s;%p2%s\007'
+# tmux keeps OSC 8 hyperlinks in its grid but forwards them only to clients
+# whose terminal claims the feature; without it the URL behind Claude Code's
+# `⧉ mockups` is dropped and the click has nothing to open (egui_term P37
+# reads it off the cell). Read at client attach, which follows the launch
+# re-source.
+set -as terminal-features ',xterm*:hyperlinks'
 set -g focus-events on
 setw -g aggressive-resize on
 bind -n S-PPage copy-mode -u
@@ -1126,6 +1132,7 @@ mod tests {
         for text in [&on, &off] {
             assert!(text.contains("set -g mouse on"));
             assert!(text.contains("set -s set-clipboard on"));
+            assert!(text.contains("terminal-features ',xterm*:hyperlinks'"));
             // Left-clicks route by whether the pane's app asked for the
             // mouse: relayed option+clicks (egui_term P25) reach tracking
             // apps via send -M, everything else is consumed (not unbound).

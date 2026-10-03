@@ -457,3 +457,15 @@ tmux-backed design. Local patches:
   a row followed by a leading blank gains nothing from the glue; leaving the
   rows separate hands the wrap to P20 as usual. WRAPLINE (a real alacritty
   soft wrap) is still taken at its word.
+- **P37** (`src/backend/mod.rs`, `link_match_at`, `hyperlink_at`,
+  `text_links_at`): OSC 8 hyperlinks are links. alacritty already parses
+  them onto cells (`Cell::hyperlink`), but P10's detection only ever read
+  the visible text, so a link whose text is not its target - Claude Code's
+  `⧉ mockups` over a claude.ai URL - lit nothing and opened nothing. The
+  cell's target now leads the candidate list, its span the run of
+  neighbouring cells carrying the same hyperlink (across row ends, stepping
+  over wide-char spacers); the regex candidates (now `text_links_at`) follow
+  as fallbacks, so the app's P28 validator still decides, and a target it
+  won't open degrades to the visible text. Needs tmux to forward OSC 8 at
+  all, which it does only for a client terminal with the `hyperlinks`
+  feature - muxterm's tmux.conf turns it on.

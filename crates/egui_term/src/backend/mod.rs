@@ -1,4 +1,4 @@
-ter sua configpub mod settings;
+pub mod settings;
 
 use crate::types::Size;
 use alacritty_terminal::event::{
@@ -1225,7 +1225,97 @@ fn runs_of(chars: &[char]) -> Vec<(usize, usize)> {
 /// muxterm patch P28: each candidate keeps its own grid span, so hover can
 /// underline the one the app says will actually open rather than the
 /// longest guess (`TerminalBackend::link_pick`).
+///
+/// muxterm patch P37: an OSC 8 hyperlink under the point is the first
+/// candidate - the program said where it points, which beats any guess at
+/// the visible text (Claude Code prints `⧉ mockups` over a claude.ai URL,
+/// which no regex could recover). The text matches still follow as
+/// fallbacks, so a target the app's validator rejects (a scheme it doesn't
+/// open) degrades to whatever the visible text links to.
 fn link_match_at<T: EventListener>(
+    term: &Term<T>,
+    point: Point,
+    url_regex: &regex::Regex,
+    path_regex: &regex::Regex,
+    pr: Option<(&regex::Regex, &HashSet<u64>)>,
+) -> Option<Vec<(String, RangeInclusive<Point>)>> {
+    let mut out: Vec<(String, RangeInclusive<Point>)> =
+        hyperlink_at(term, point).into_iter().collect();
+    let text = text_links_at(term, point, url_regex, path_regex, pr);
+    for (text, span) in text.into_iter().flatten() {
+        if !out.iter().any(|(t, _)| *t == text) {
+            out.push((text, span));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// muxterm patch P37: the OSC 8 hyperlink's target under a grid point, with
+/// the span of the cells it covers - the run of neighbouring cells carrying
+/// the same hyperlink (alacritty compares id *and* uri, and gives every
+/// id-less link a fresh id, so two adjacent links never merge). The walk
+/// crosses row ends, since a link the program wrapped keeps its hyperlink
+/// on every row, and steps over wide-char spacer cells without ending a
+/// span on one. Needs tmux to forward OSC 8 at all: muxterm's tmux.conf
+/// turns on the `hyperlinks` terminal feature.
+fn hyperlink_at<T: EventListener>(
+    term: &Term<T>,
+    point: Point,
+) -> Option<(String, RangeInclusive<Point>)> {
+    let cols = term.columns();
+    if cols == 0 {
+        return None;
+    }
+    let grid = term.grid();
+    let link = grid[point].hyperlink()?;
+    let same = |p: Point| grid[p].hyperlink().as_ref() == Some(&link);
+    let spacer = |p: Point| {
+        grid[p]
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+    };
+    let prev = |p: Point| {
+        if p.column.0 > 0 {
+            Some(Point::new(p.line, p.column - 1))
+        } else if p.line > term.topmost_line() {
+            Some(Point::new(p.line - 1i32, Column(cols - 1)))
+        } else {
+            None
+        }
+    };
+    let next = |p: Point| {
+        if p.column.0 + 1 < cols {
+            Some(Point::new(p.line, p.column + 1))
+        } else if p.line < term.bottommost_line() {
+            Some(Point::new(p.line + 1i32, Column(0)))
+        } else {
+            None
+        }
+    };
+    let (mut start, mut p) = (point, point);
+    while let Some(q) = prev(p) {
+        if same(q) {
+            start = q;
+        } else if !spacer(q) {
+            break;
+        }
+        p = q;
+    }
+    let (mut end, mut p) = (point, point);
+    while let Some(q) = next(p) {
+        if same(q) {
+            end = q;
+        } else if !spacer(q) {
+            break;
+        }
+        p = q;
+    }
+    Some((link.uri().to_string(), start..=end))
+}
+
+/// The regex half of `link_match_at` (P10/P19/P20/P24, see there): link
+/// candidates read off the visible text under a grid point.
+fn text_links_at<T: EventListener>(
     term: &Term<T>,
     point: Point,
     url_regex: &regex::Regex,
@@ -1925,5 +2015,103 @@ mod tests {
         let cands = link_candidates(content, 0, 14).unwrap();
         assert_eq!(cands[0], "https://x.com/a");
         assert!(!cands.contains(&"https://x.com/aand".to_string()));
+    }
+
+    /// A blank `cols`x`rows` grid with `bytes` written from the top-left
+    /// through the real parser - the only way to get OSC 8 onto cells.
+    fn parsed_term(
+        cols: usize,
+        rows: usize,
+        bytes: &str,
+    ) -> Term<alacritty_terminal::event::VoidListener> {
+        let mut term = mock_term(&vec![" ".repeat(cols); rows].join("\r\n"));
+        let mut parser = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        parser.advance(&mut term, b"\x1b[H");
+        parser.advance(&mut term, bytes.as_bytes());
+        term
+    }
+
+    fn links_at(
+        term: &Term<alacritty_terminal::event::VoidListener>,
+        line: i32,
+        col: usize,
+    ) -> Option<Vec<(String, RangeInclusive<Point>)>> {
+        link_match_at(
+            term,
+            Point::new(Line(line), Column(col)),
+            &url_regex(),
+            &path_regex(),
+            None,
+        )
+    }
+
+    // muxterm patch P37: an OSC 8 link opens its hidden target, and the
+    // underline covers exactly the cells the program marked.
+    #[test]
+    fn osc8_links_open_their_target() {
+        let term = parsed_term(
+            40,
+            2,
+            "The \x1b]8;id=a;https://claude.ai/x\x1b\\mockups\x1b]8;;\x1b\\ are done",
+        );
+        let cands = links_at(&term, 0, 6).unwrap();
+        assert_eq!(cands.len(), 1, "{cands:?}");
+        assert_eq!(cands[0].0, "https://claude.ai/x");
+        let span = &cands[0].1;
+        assert_eq!(span.start(), &Point::new(Line(0), Column(4)));
+        assert_eq!(span.end(), &Point::new(Line(0), Column(10)));
+        // The plain text either side is no link.
+        assert_eq!(links_at(&term, 0, 2), None);
+        assert_eq!(links_at(&term, 0, 12), None);
+    }
+
+    // muxterm patch P37: two links side by side stay two links.
+    #[test]
+    fn adjacent_osc8_links_do_not_merge() {
+        let term = parsed_term(
+            40,
+            2,
+            "\x1b]8;id=a;https://a.com\x1b\\aaa\x1b]8;id=b;https://b.com\x1b\\bbb\x1b]8;;\x1b\\",
+        );
+        let a = links_at(&term, 0, 1).unwrap();
+        assert_eq!(a[0].0, "https://a.com");
+        assert_eq!(a[0].1, Point::new(Line(0), Column(0))..=Point::new(Line(0), Column(2)));
+        let b = links_at(&term, 0, 4).unwrap();
+        assert_eq!(b[0].0, "https://b.com");
+        assert_eq!(b[0].1, Point::new(Line(0), Column(3))..=Point::new(Line(0), Column(5)));
+    }
+
+    // muxterm patch P37: a link the terminal wrapped is one link on both rows.
+    #[test]
+    fn osc8_links_span_a_row_wrap() {
+        let term = parsed_term(
+            10,
+            3,
+            "1234567\x1b]8;;https://w.com\x1b\\wrapped\x1b]8;;\x1b\\",
+        );
+        for (line, col) in [(0, 8), (1, 2)] {
+            let cands = links_at(&term, line, col).unwrap();
+            assert_eq!(cands[0].0, "https://w.com");
+            assert_eq!(
+                cands[0].1,
+                Point::new(Line(0), Column(7))..=Point::new(Line(1), Column(3))
+            );
+        }
+    }
+
+    // muxterm patch P37: the visible text still rides along as a fallback
+    // behind the hidden target, for when the app won't open that target.
+    #[test]
+    fn osc8_target_comes_before_the_visible_text() {
+        let term = parsed_term(
+            40,
+            2,
+            "\x1b]8;;x-weird:thing\x1b\\https://seen.com\x1b]8;;\x1b\\",
+        );
+        let texts: Vec<String> =
+            links_at(&term, 0, 3).unwrap().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(texts, vec!["x-weird:thing", "https://seen.com"]);
     }
 }
