@@ -721,6 +721,11 @@ pub fn write_agent_state(
     Ok(())
 }
 
+pub fn read_agent_state(session: &str) -> Option<AgentState> {
+    let text = fs::read_to_string(agent_state_path(session)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 pub fn remove_agent_state(session: &str) {
     let _ = fs::remove_file(agent_state_path(session));
 }

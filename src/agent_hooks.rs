@@ -32,30 +32,71 @@ use serde_json::{json, Value};
 /// reported idle, and nothing would ever downgrade the false alarm).
 const CLAUDE_NOTIFY_MATCHER: &str = "permission_prompt|elicitation_dialog";
 
-/// claude's hook events -> (the state each reports, optional matcher, whether
-/// it also records the prompt for the session-boundary namer). PreToolUse
-/// (unmatched = every tool) is deliberate: it flips attention back to working
-/// the moment a permission request is approved, not at end of turn. The
-/// `--prompt` flag rides *only* UserPromptSubmit, the one payload that
-/// carries the user's prompt.
-const CLAUDE_EVENTS: &[(&str, &str, Option<&str>, bool)] = &[
-    ("UserPromptSubmit", "working", None, true),
-    ("PreToolUse", "working", None, false),
-    ("Stop", "idle", None, false),
-    ("Notification", "attention", Some(CLAUDE_NOTIFY_MATCHER), false),
-    ("SessionEnd", "gone", None, false),
+/// One hook muxterm wires into an agent CLI's settings: the CLI's event
+/// name, the state `mux agent-event` records for it, and what else the
+/// command does. A struct rather than a tuple because two of those are
+/// adjacent bools the compiler cannot tell apart.
+#[derive(Clone, Copy)]
+struct HookEvent {
+    event: &'static str,
+    state: &'static str,
+    /// Narrows which triggers fire it; None matches every tool/notification.
+    matcher: Option<&'static str>,
+    /// `--prompt`: also record the prompt for the session-boundary namer.
+    prompt: bool,
+    /// `--inbox`: also hand the pane its mesh inbox as context.
+    inbox: bool,
+}
+
+impl HookEvent {
+    const fn new(event: &'static str, state: &'static str) -> Self {
+        HookEvent { event, state, matcher: None, prompt: false, inbox: false }
+    }
+
+    const fn matcher(self, matcher: &'static str) -> Self {
+        HookEvent { matcher: Some(matcher), ..self }
+    }
+
+    const fn prompt(self) -> Self {
+        HookEvent { prompt: true, ..self }
+    }
+
+    const fn inbox(self) -> Self {
+        HookEvent { inbox: true, ..self }
+    }
+}
+
+/// claude's hooks. PreToolUse (unmatched = every tool) is deliberate: it
+/// flips attention back to working the moment a permission request is
+/// approved, not at end of turn. The `--prompt` flag rides *only*
+/// UserPromptSubmit, the one payload that carries the user's prompt.
+///
+/// `--inbox` rides UserPromptSubmit and PostToolUse - PostToolUse exists for
+/// it alone - because those are the two points where claude reads a hook's
+/// `additionalContext`: a teammate's message reaches an idle agent with its
+/// next prompt and a working one at its next tool call, never as a turn of
+/// its own. That is what lets `mux post --fyi` skip the nudge, which wakes
+/// an idle agent for a whole turn to read a heads-up.
+const CLAUDE_EVENTS: &[HookEvent] = &[
+    HookEvent::new("UserPromptSubmit", "working").prompt().inbox(),
+    HookEvent::new("PreToolUse", "working"),
+    HookEvent::new("PostToolUse", "working").inbox(),
+    HookEvent::new("Stop", "idle"),
+    HookEvent::new("Notification", "attention").matcher(CLAUDE_NOTIFY_MATCHER),
+    HookEvent::new("SessionEnd", "gone"),
 ];
 
 /// codex shares claude's event vocabulary but has no SessionEnd (the GUI's
 /// foreground-process prune covers agent exit) and names the approval event
-/// PermissionRequest.
-const CODEX_EVENTS: &[(&str, &str, Option<&str>, bool)] = &[
-    // `mux agent-event` never prints, so codex's JSON-stdout rule for
-    // UserPromptSubmit holds with the prompt flag on.
-    ("UserPromptSubmit", "working", None, true),
-    ("PreToolUse", "working", None, false),
-    ("Stop", "idle", None, false),
-    ("PermissionRequest", "attention", None, false),
+/// PermissionRequest. No `--inbox`: codex gets its messages through the
+/// nudge, so `mux post` always nudges it.
+const CODEX_EVENTS: &[HookEvent] = &[
+    // `mux agent-event` never prints without `--inbox`, so codex's
+    // JSON-stdout rule for UserPromptSubmit holds with the prompt flag on.
+    HookEvent::new("UserPromptSubmit", "working").prompt(),
+    HookEvent::new("PreToolUse", "working"),
+    HookEvent::new("Stop", "idle"),
+    HookEvent::new("PermissionRequest", "attention"),
 ];
 
 /// Install/refresh the hooks for every agent whose config dir exists.
@@ -133,7 +174,7 @@ fn resolve_mux() -> Option<String> {
 /// left strictly alone - never clobber a user's config to install a dot.
 fn merge_hooks_file(
     path: &PathBuf,
-    events: &[(&str, &str, Option<&str>, bool)],
+    events: &[HookEvent],
     mux: &str,
     agent: &str,
 ) {
@@ -169,18 +210,14 @@ fn merge_hooks_file(
 /// absent means match every tool/notification. `--agent` names the CLI,
 /// which the payload doesn't: with the payload's `session_id` it is what a
 /// dead pane's conversation is resumed by (`state::AgentResume`).
-fn hook_group(
-    mux: &str,
-    agent: &str,
-    state: &str,
-    matcher: Option<&str>,
-    prompt: bool,
-) -> Value {
-    let command = if prompt {
-        format!("{mux} agent-event {state} --agent {agent} --prompt")
-    } else {
-        format!("{mux} agent-event {state} --agent {agent}")
-    };
+fn hook_group(mux: &str, agent: &str, hook: &HookEvent) -> Value {
+    let mut command = format!("{mux} agent-event {} --agent {agent}", hook.state);
+    if hook.prompt {
+        command.push_str(" --prompt");
+    }
+    if hook.inbox {
+        command.push_str(" --inbox");
+    }
     let mut group = json!({
         "hooks": [{
             "type": "command",
@@ -188,7 +225,7 @@ fn hook_group(
             "timeout": 5,
         }],
     });
-    if let Some(matcher) = matcher {
+    if let Some(matcher) = hook.matcher {
         group["matcher"] = json!(matcher);
     }
     group
@@ -201,7 +238,7 @@ fn hook_group(
 /// document changed.
 fn merge_hooks(
     root: &mut Value,
-    events: &[(&str, &str, Option<&str>, bool)],
+    events: &[HookEvent],
     mux: &str,
     agent: &str,
 ) -> bool {
@@ -213,9 +250,9 @@ fn merge_hooks(
         return false;
     };
     let mut changed = false;
-    for (event, state, matcher, prompt) in events {
-        let desired = hook_group(mux, agent, state, *matcher, *prompt);
-        let entry = hooks.entry(*event).or_insert_with(|| json!([]));
+    for hook in events {
+        let desired = hook_group(mux, agent, hook);
+        let entry = hooks.entry(hook.event).or_insert_with(|| json!([]));
         let Some(list) = entry.as_array_mut() else {
             continue;
         };
@@ -423,16 +460,21 @@ mod tests {
     fn merge_into_empty_adds_all_events() {
         let mut root = json!({});
         assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux", "claude"));
-        for (event, state, matcher, prompt) in CLAUDE_EVENTS {
-            let group = &root["hooks"][*event][0];
+        for hook in CLAUDE_EVENTS {
+            let group = &root["hooks"][hook.event][0];
             let cmd = group["hooks"][0]["command"].as_str().unwrap();
-            let want = if *prompt {
-                format!("/usr/local/bin/mux agent-event {state} --agent claude --prompt")
-            } else {
-                format!("/usr/local/bin/mux agent-event {state} --agent claude")
-            };
+            let mut want = format!(
+                "/usr/local/bin/mux agent-event {} --agent claude",
+                hook.state
+            );
+            if hook.prompt {
+                want.push_str(" --prompt");
+            }
+            if hook.inbox {
+                want.push_str(" --inbox");
+            }
             assert_eq!(cmd, want);
-            assert_eq!(group["matcher"].as_str(), *matcher);
+            assert_eq!(group["matcher"].as_str(), hook.matcher);
         }
         // Idempotent: a second merge with the same path changes nothing.
         assert!(!merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux", "claude"));
@@ -451,9 +493,30 @@ mod tests {
                     .unwrap()
                     .to_string()
             };
-            assert!(cmd("UserPromptSubmit").ends_with(" --prompt"));
+            assert!(cmd("UserPromptSubmit").contains(" --prompt"));
             assert!(!cmd("PreToolUse").contains("--prompt"));
         }
+    }
+
+    #[test]
+    fn only_claude_takes_its_inbox_from_hooks() {
+        // claude reads additionalContext at a prompt and after a tool call,
+        // so both deliver the inbox; nothing else does, and codex must never
+        // print (its UserPromptSubmit stdout has to be JSON of its own).
+        let mut root = json!({});
+        assert!(merge_hooks(&mut root, CLAUDE_EVENTS, "/usr/local/bin/mux", "claude"));
+        let inbox: Vec<&str> = CLAUDE_EVENTS
+            .iter()
+            .filter(|h| {
+                root["hooks"][h.event][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(" --inbox")
+            })
+            .map(|h| h.event)
+            .collect();
+        assert_eq!(inbox, ["UserPromptSubmit", "PostToolUse"]);
+        assert!(CODEX_EVENTS.iter().all(|h| !h.inbox));
     }
 
     #[test]
@@ -476,7 +539,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(
             groups[0]["hooks"][0]["command"],
-            "/usr/local/bin/mux agent-event working --agent claude --prompt"
+            "/usr/local/bin/mux agent-event working --agent claude --prompt --inbox"
         );
     }
 

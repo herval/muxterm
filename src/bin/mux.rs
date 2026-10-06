@@ -73,16 +73,19 @@ usage: mux [--as <session>] [--json] <command> [args]
   tell <peer> [msg...] [--no-enter] [--force]
                                type a message into a teammate's terminal
                                (msg from stdin when omitted)
-  post <peer> [msg...]         queue a message in their inbox (+1 notify)
+  post [--fyi] <peer> [msg...] queue a message in their inbox (+1 notify;
+                               --fyi: no reply expected, and no notify when
+                               their agent reads its inbox on its own)
   notify [msg...]              raise your tab's attention badge in the
                                muxterm UI (banner when it is unfocused)
-  agent-event <state> [--prompt]
+  agent-event <state> [--prompt] [--inbox]
                                report agent lifecycle to the sidebar dot
                                (working|idle|attention|gone); --prompt also
                                records the session's first real prompt for
-                               auto-naming. Wired into agent hooks
-                               automatically - inert outside muxterm, never
-                               fails, never prints
+                               auto-naming; --inbox prints the hook reply
+                               that hands the agent its inbox. Wired into
+                               agent hooks automatically - inert outside
+                               muxterm, never fails, prints only for --inbox
   rename [--lock|--auto] [--desc <text>] [name...]
                                relabel this workspace (display-only: name
                                and/or --desc; never touches the git branch).
@@ -1348,13 +1351,23 @@ struct InboxMsg {
     from_session: String,
     ts: u64,
     text: String,
+    /// Sent with `--fyi`: no reply expected, and no nudge was sent for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fyi: bool,
 }
 
+/// Queue a message in a teammate's inbox and nudge them to read it. The
+/// nudge is a typed prompt, so it costs an idle agent a whole turn: `--fyi`
+/// (heads-ups, status, acks) skips it when the recipient's hooks deliver its
+/// inbox on their own (`hears_inbox_quietly`), so the message is read at
+/// the agent's next step instead. Any other recipient is nudged regardless -
+/// a message nobody is told about might never be read.
 fn cmd_post(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
+    let fyi = take_flag(&mut args, "--fyi");
     if args.is_empty() {
         return Err((
             EXIT_USAGE,
-            "usage: mux post <peer> [message...]".to_string(),
+            "usage: mux post [--fyi] <peer> [message...]".to_string(),
         ));
     }
     let target = args.remove(0);
@@ -1382,6 +1395,7 @@ fn cmd_post(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
         from_session: sc.session.clone(),
         ts: mesh::now(),
         text: message,
+        fyi,
     };
     let line = serde_json::to_string(&msg)
         .map_err(|e| (EXIT_TMUX, format!("encoding message: {e}")))?
@@ -1394,9 +1408,10 @@ fn cmd_post(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
     file.write_all(line.as_bytes())
         .map_err(|e| (EXIT_TMUX, format!("writing inbox: {e}")))?;
 
+    let quiet = fyi && hears_inbox_quietly(&session);
     // One notification per inbox-check cycle, no matter how many posts:
     // whoever wins creating the flag file injects the (single) nudge.
-    if session != sc.session {
+    if session != sc.session && !quiet {
         let fresh = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1411,8 +1426,25 @@ fn cmd_post(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
             let _ = tmux.paste_text(&session, &note, true);
         }
     }
-    println!("posted to {display}");
+    if quiet {
+        println!("posted to {display} (fyi: no nudge, they read it at their next step)");
+    } else if fyi {
+        println!("posted to {display} (nudged anyway: their agent reads its inbox only when told)");
+    } else {
+        println!("posted to {display}");
+    }
     Ok(())
+}
+
+/// Does this pane's agent take its inbox from its own hooks? claude's
+/// UserPromptSubmit and PostToolUse hooks carry `--inbox` (agent_hooks.rs),
+/// so a message reaches it with its next prompt or tool call without a
+/// nudge. Read off the agent-state record, whose agent id only muxterm's own
+/// hooks write; no record, or any other agent, says no.
+fn hears_inbox_quietly(session: &str) -> bool {
+    mesh::read_agent_state(session)
+        .and_then(|s| s.resume)
+        .is_some_and(|r| r.agent == "claude")
 }
 
 /// Raise this pane's attention badge in the GUI. Fire-and-forget: the GUI
@@ -1454,6 +1486,12 @@ fn cmd_notify(as_session: Option<String>, args: Vec<String>) -> CmdResult {
 /// `--prompt` rides the UserPromptSubmit hook: it records the payload's
 /// prompt as the pane's `mesh::AgentPrompt` - the first substantive prompt
 /// of each agent session - which the GUI's session-boundary namer reads.
+///
+/// `--inbox` is the one exception to never printing, and rides only claude's
+/// UserPromptSubmit and PostToolUse hooks: it takes the pane's inbox and
+/// prints the hook reply that hands it to the model as context
+/// (`inbox_hook_reply`), so messages arrive with the next prompt or tool
+/// call instead of costing a turn of their own.
 fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
     let mut payload = Vec::new();
     if !io::stdin().is_terminal() {
@@ -1494,7 +1532,51 @@ fn cmd_agent_event(as_session: Option<String>, args: Vec<String>) -> CmdResult {
             }
         }
     }
+    if args.iter().any(|a| a == "--inbox") {
+        // The event name comes first: the reply can't be built without it,
+        // and an inbox taken but never printed would be lost.
+        if let Some(event) = hook_event_name(&payload) {
+            let text = read_inbox(&session, true);
+            if let Some(reply) = inbox_hook_reply(&event, &render_inbox(&text)) {
+                println!("{reply}");
+            }
+        }
+    }
     Ok(())
+}
+
+/// The event a hook payload is for (claude sends `hook_event_name` on every
+/// one), which its JSON reply has to name back.
+fn hook_event_name(payload: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let event = v.get("hook_event_name")?.as_str()?.trim();
+    (!event.is_empty()).then(|| event.to_string())
+}
+
+/// Leads the inbox wherever a hook delivers it. The reply rule is repeated
+/// here rather than left to the brief, which by now may be far back in a
+/// long context, because this is the moment the agent decides whether to
+/// answer.
+const INBOX_CONTEXT_HEAD: &str = "[mux] Messages from your teammates, \
+     already taken from your inbox (no need to run `mux inbox`). Reply only \
+     when one asks you to act or answer, never just to acknowledge; an \
+     (fyi) message expects no reply.";
+
+/// claude's hook reply carrying rendered inbox messages as
+/// `additionalContext`, which it adds to what the model reads next (a
+/// UserPromptSubmit or PostToolUse hook's plain stdout doesn't reliably
+/// reach the model; this shape does for both). None when there are none.
+fn inbox_hook_reply(event: &str, rendered: &str) -> Option<String> {
+    if rendered.trim().is_empty() {
+        return None;
+    }
+    let reply = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": format!("{INBOX_CONTEXT_HEAD}\n{rendered}"),
+        },
+    });
+    Some(reply.to_string())
 }
 
 /// `(session_id, prompt)` out of a UserPromptSubmit payload - claude and
@@ -1822,8 +1904,26 @@ fn cmd_inbox(
     let consume = take_flag(&mut args, "--consume");
     let tmux = Tmux::new()?;
     let session = resolve_identity(&tmux, as_session)?;
-    let path = mesh::inbox_path(&session);
+    let text = read_inbox(&session, consume);
 
+    if text.trim().is_empty() {
+        eprintln!("(inbox empty)");
+        return Ok(());
+    }
+    if json {
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            println!("{line}");
+        }
+    } else {
+        print!("{}", render_inbox(&text));
+    }
+    Ok(())
+}
+
+/// The session's inbox as raw JSONL; `consume` takes it (a rename, so a
+/// concurrent post lands in a fresh file rather than being lost).
+fn read_inbox(session: &str, consume: bool) -> String {
+    let path = mesh::inbox_path(session);
     let text = if consume {
         let tmp = path.with_extension(format!("consuming.{}", std::process::id()));
         match fs::rename(&path, &tmp) {
@@ -1838,37 +1938,35 @@ fn cmd_inbox(
         fs::read_to_string(&path).unwrap_or_default()
     };
     // The notification's job is done once the inbox is read; re-arm it.
-    let _ = fs::remove_file(mesh::flag_path(&session));
+    let _ = fs::remove_file(mesh::flag_path(session));
+    text
+}
 
-    if text.trim().is_empty() {
-        eprintln!("(inbox empty)");
-        return Ok(());
-    }
-    for line in text.lines() {
-        if line.trim().is_empty() {
+/// Inbox JSONL as `mux inbox` prints it: one `[time] sender: text` entry
+/// per message, continuation lines indented, `(fyi)` on a message that
+/// expects no reply. A line that doesn't parse is shown as is.
+fn render_inbox(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Ok(msg) = serde_json::from_str::<InboxMsg>(line) else {
+            let _ = writeln!(out, "{line}");
             continue;
-        }
-        if json {
-            println!("{line}");
-            continue;
-        }
-        match serde_json::from_str::<InboxMsg>(line) {
-            Ok(msg) => {
-                let mut lines = msg.text.lines();
-                println!(
-                    "[{}] {}: {}",
-                    fmt_ts(msg.ts),
-                    msg.from,
-                    lines.next().unwrap_or("")
-                );
-                for cont in lines {
-                    println!("    {cont}");
-                }
-            },
-            Err(_) => println!("{line}"),
+        };
+        let mut lines = msg.text.lines();
+        let tag = if msg.fyi { " (fyi)" } else { "" };
+        let _ = writeln!(
+            out,
+            "[{}] {}{tag}: {}",
+            fmt_ts(msg.ts),
+            msg.from,
+            lines.next().unwrap_or("")
+        );
+        for cont in lines {
+            let _ = writeln!(out, "    {cont}");
         }
     }
-    Ok(())
+    out
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -2449,8 +2547,9 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out, "- `mux peers` - who is on the team");
     let _ = writeln!(out, "- `mux tree` - every window, tab, and pane at a glance (read-only; start here for \"what exists?\" questions)");
     let _ = writeln!(out, "- `mux read <name> -n 200` - snapshot of a teammate's terminal (works for any program they run)");
-    let _ = writeln!(out, "- `mux post <name> <text>` - queue a message in their inbox; they get one `[mux]` nudge");
-    let _ = writeln!(out, "- `mux inbox --consume` - read messages sent to you (do this when you see a `[mux]` line)");
+    let _ = writeln!(out, "- `mux post <name> <text>` - a message they must act on or answer; they get one `[mux]` nudge, which wakes them for a whole turn if idle");
+    let _ = writeln!(out, "- `mux post --fyi <name> <text>` - heads-ups, status, results, acks: no nudge, they read it at their next step");
+    let _ = writeln!(out, "- `mux inbox --consume` - read messages sent to you (do this when you see a `[mux]` line, unless the messages were already shown to you)");
     let _ = writeln!(out, "- `mux tell <name> <text>` - type directly into their terminal (immediate but can interleave)");
     let _ = writeln!(out, "- `mux ctx set/get <key> [value]` - shared scratchpad for this tab");
     let _ = writeln!(out, "- `mux split [right|down] [--run <cmd>]` - add a pane beside yours for a new teammate; prints its session name");
@@ -2460,9 +2559,11 @@ fn build_brief(tmux: &Tmux, sc: &Scope) -> String {
     let _ = writeln!(out);
     let _ = write!(
         out,
-        "Etiquette: prefer `post` for anything a teammate should act on; \
-         `tell` only when they expect immediate input. You cannot message \
-         panes in other tabs (`mux tree` can still see them). Sign your \
+        "Etiquette: a plain `post` costs its reader a turn, so send one only \
+         when the teammate must act or answer and make everything else \
+         `--fyi`; never reply just to acknowledge, and never answer an \
+         `--fyi`. `tell` only when they expect immediate input. You cannot \
+         message panes in other tabs (`mux tree` can still see them). Sign your \
          work as **{me}**."
     );
     out
@@ -3027,6 +3128,53 @@ fn cmd_prune() -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbox_lines_from_before_fyi_still_parse_and_plain_posts_stay_unmarked() {
+        // An inbox written by an older mux has no `fyi` key; a plain post
+        // still writes none, so an older mux can read what a newer one wrote.
+        let old = r#"{"v":1,"from":"otter","from_session":"mux-a","ts":0,"text":"hi"}"#;
+        let msg: InboxMsg = serde_json::from_str(old).unwrap();
+        assert!(!msg.fyi);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("fyi"));
+        let fyi = InboxMsg { fyi: true, ..msg };
+        assert!(serde_json::to_string(&fyi).unwrap().contains(r#""fyi":true"#));
+    }
+
+    #[test]
+    fn render_inbox_marks_fyi_indents_continuations_and_keeps_junk() {
+        let text = [
+            r#"{"v":1,"from":"otter","from_session":"mux-a","ts":0,"text":"done\nall green"}"#,
+            "",
+            r#"{"v":1,"from":"wren","from_session":"mux-b","ts":0,"text":"restarting","fyi":true}"#,
+            "not json",
+        ]
+        .join("\n");
+        assert_eq!(
+            render_inbox(&text),
+            "[1970-01-01 00:00:00Z] otter: done\n    all green\n\
+             [1970-01-01 00:00:00Z] wren (fyi): restarting\n\
+             not json\n"
+        );
+    }
+
+    #[test]
+    fn inbox_hook_reply_names_the_event_and_says_nothing_when_empty() {
+        let payload = br#"{"session_id":"s","hook_event_name":"PostToolUse"}"#;
+        assert_eq!(hook_event_name(payload).as_deref(), Some("PostToolUse"));
+        assert_eq!(hook_event_name(br#"{"session_id":"s"}"#), None);
+        assert_eq!(hook_event_name(b"garbage"), None);
+
+        assert_eq!(inbox_hook_reply("PostToolUse", ""), None);
+        assert_eq!(inbox_hook_reply("PostToolUse", " \n"), None);
+        let reply = inbox_hook_reply("UserPromptSubmit", "[t] otter: hi\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        let out = &v["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "UserPromptSubmit");
+        let ctx = out["additionalContext"].as_str().unwrap();
+        assert!(ctx.starts_with(INBOX_CONTEXT_HEAD));
+        assert!(ctx.ends_with("[t] otter: hi\n"));
+    }
 
     #[test]
     fn resolve_peer_prefers_registry_then_codename() {
