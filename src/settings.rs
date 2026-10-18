@@ -20,6 +20,7 @@ use muxterm::agent::{self, Agent};
 use muxterm::automation::{self, Automation};
 use muxterm::layout::SplitAxis;
 use muxterm::models;
+use muxterm::zmx::Backend;
 
 use crate::config;
 use crate::theme::{self, UiTheme};
@@ -106,10 +107,22 @@ pub struct AutomationDraft {
     pub command: String,
 }
 
+/// The session-backend facts the Preferences tab shows.
+pub struct Sessions<'a> {
+    /// Where new panes go.
+    pub default: Backend,
+    pub zmx_installed: bool,
+    /// Why `default` isn't what config.toml asked for, if it isn't.
+    pub notice: Option<&'a str>,
+    /// Open panes per backend: (tmux, zmx).
+    pub open: (usize, usize),
+}
+
 /// What the user changed this frame; the caller persists and reloads.
 #[derive(Default)]
 pub struct Outcome {
     pub theme: Option<&'static str>,
+    pub backend: Option<Backend>,
     pub agent: Option<&'static str>,
     pub copy_on_select: Option<bool>,
     pub pane_titles: Option<bool>,
@@ -156,6 +169,7 @@ pub fn show(
     notifications: bool,
     monitor_prs: bool,
     automations_on: bool,
+    sessions: &Sessions,
     tab: &mut Tab,
     projects: &[Project],
     draft: &mut ProjectDraft,
@@ -207,6 +221,7 @@ pub fn show(
                     pr_status,
                     pr_detector,
                     notifications,
+                    sessions,
                     &mut out,
                 ),
                 Tab::Projects => {
@@ -270,6 +285,50 @@ fn show_appearance(
 
     grid.divider(ui, "", th.accent);
     grid.config_row(ui);
+}
+
+/// Which multiplexer new panes get. Both backends run side by side - a
+/// pane's session name says which one it's on - so the choice applies to
+/// the next pane at once, and open panes simply keep theirs.
+fn show_sessions(
+    ui: &mut egui::Ui,
+    grid: &Grid,
+    th: &UiTheme,
+    s: &Sessions,
+    out: &mut Outcome,
+) {
+    grid.divider(ui, "Sessions", th.accent);
+    for (backend, label, open) in [
+        (Backend::Tmux, "tmux", s.open.0),
+        (Backend::Zmx, "zmx (experimental)", s.open.1),
+    ] {
+        let selected = s.default == backend;
+        let available = backend != Backend::Zmx || s.zmx_installed;
+        let marker = if selected { "> " } else { "  " };
+        let color = if selected {
+            th.accent
+        } else if available {
+            th.text
+        } else {
+            th.text_dim
+        };
+        let mut parts = vec![(marker.to_string(), th.accent), (label.to_string(), color)];
+        if open > 0 {
+            let n = if open == 1 { "1 pane".to_string() } else { format!("{open} panes") };
+            parts.push((format!("  {n}"), th.text_dim));
+        }
+        let row = grid.body(ui, parts, available, selected);
+        if row.clicked() && available && !selected {
+            out.backend = Some(backend);
+        }
+    }
+    match s.notice {
+        Some(notice) => grid.hint(ui, notice),
+        None => grid.hint(ui, "for new panes; open ones keep theirs"),
+    }
+    if !s.zmx_installed {
+        grid.hint(ui, "zmx: brew install neurosnap/tap/zmx");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -543,8 +602,11 @@ fn show_preferences(
     pr_status: bool,
     pr_detector: bool,
     notifications: bool,
+    sessions: &Sessions,
     out: &mut Outcome,
 ) {
+    show_sessions(ui, grid, th, sessions, out);
+
     grid.divider(ui, "Mouse", th.accent);
     let mark = if copy_on_select { "[x]" } else { "[ ]" };
     let row = grid.body(
@@ -1635,6 +1697,13 @@ mod tests {
                 true,
                 true,
                 true,
+                // Mixed panes, zmx asked for but missing: every hint renders.
+                &Sessions {
+                    default: Backend::Tmux,
+                    zmx_installed: false,
+                    notice: Some("zmx not found - new panes use tmux"),
+                    open: (12, 3),
+                },
                 &mut tab,
                 &projects,
                 &mut draft,

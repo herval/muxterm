@@ -14,7 +14,27 @@ use serde::{Deserialize, Serialize};
 use crate::layout::SplitAxis;
 use crate::state::{AgentResume, StateFile};
 
-pub const SOCKET: &str = "muxterm";
+/// The dedicated tmux socket (`tmux -L <socket>`): "muxterm" for the
+/// everyday instance. A separate instance (`MUXTERM_DIR`, see
+/// state::config_dir) gets its own, derived from its directory - a shared
+/// socket would let one instance's startup GC kill the other's sessions.
+pub fn socket() -> &'static str {
+    static SOCKET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOCKET.get_or_init(|| match std::env::var("MUXTERM_DIR") {
+        Ok(dir) if !dir.is_empty() => socket_for_dir(&dir),
+        _ => "muxterm".to_string(),
+    })
+}
+
+fn socket_for_dir(dir: &str) -> String {
+    // FNV-1a: stable across runs and builds (std's hasher is not).
+    let mut h: u32 = 0x811c9dc5;
+    for b in dir.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x01000193);
+    }
+    format!("muxterm-{h:08x}")
+}
 pub const SESSION_PREFIX: &str = "mux-";
 pub const TAB_ID_PREFIX: &str = "mux-tab-";
 
@@ -127,9 +147,14 @@ pub fn new_tab_id() -> String {
 /// Session names are minted here (not in the GUI's tmux layer) because
 /// `mux split` pre-agrees the name with the GUI: the CLI picks it, the GUI
 /// creates it, and the CLI learns the outcome by polling tmux for it.
-pub fn new_session_name() -> String {
+/// The backend is part of the name (`crate::zmx::ZMX_MARK`), so whoever
+/// mints a name decides where the pane lives.
+pub fn new_session_name(backend: crate::zmx::Backend) -> String {
     let id = uuid::Uuid::new_v4().simple().to_string();
-    format!("{SESSION_PREFIX}{}", &id[..8])
+    match backend {
+        crate::zmx::Backend::Tmux => format!("{SESSION_PREFIX}{}", &id[..8]),
+        crate::zmx::Backend::Zmx => format!("{}{}", crate::zmx::ZMX_MARK, &id[..8]),
+    }
 }
 
 /// PATH is not guaranteed when launched outside a shell, so probe the usual
@@ -873,6 +898,15 @@ pub fn prune(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn separate_instances_get_their_own_socket() {
+        let a = super::socket_for_dir("/Users/me/.muxterm-zmx");
+        assert!(a.starts_with("muxterm-") && a.len() == "muxterm-".len() + 8);
+        assert_eq!(a, super::socket_for_dir("/Users/me/.muxterm-zmx"));
+        assert_ne!(a, super::socket_for_dir("/Users/me/.muxterm-other"));
+        assert_ne!(a, "muxterm");
+    }
+
     use super::*;
     use crate::layout::SplitAxis;
     use crate::state::{NodeState, TabState, WindowState};
@@ -1002,9 +1036,14 @@ mod tests {
 
     #[test]
     fn session_names_have_expected_shape() {
-        let name = new_session_name();
+        use crate::zmx::Backend;
+        let name = new_session_name(Backend::Tmux);
         assert!(name.starts_with(SESSION_PREFIX));
         assert_eq!(name.len(), SESSION_PREFIX.len() + 8);
+        assert_eq!(Backend::of_session(&name), Backend::Tmux);
+        let name = new_session_name(Backend::Zmx);
+        assert!(name.starts_with(SESSION_PREFIX));
+        assert_eq!(Backend::of_session(&name), Backend::Zmx);
         assert!(!name.starts_with(TAB_ID_PREFIX));
     }
 

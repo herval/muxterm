@@ -6,7 +6,7 @@ use alacritty_terminal::event::{
 };
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{
     Selection, SelectionRange, SelectionType as AlacrittySelectionType,
 };
@@ -15,6 +15,7 @@ use alacritty_terminal::term::{
     self,
     cell::{Cell, Flags},
     test::TermSize,
+    search::{Match, RegexIter, RegexSearch},
     viewport_to_point, Term, TermMode,
 };
 use alacritty_terminal::{tty, Grid};
@@ -182,6 +183,10 @@ impl From<TerminalSize> for WindowSize {
 
 pub struct TerminalBackend {
     pub id: u64,
+    /// muxterm patch P41: the local scrollback search - the compiled query
+    /// and the match the view is parked on.
+    search: Option<(String, RegexSearch)>,
+    search_match: Option<Match>,
     pub url_regex: regex::Regex,
     // muxterm patch P10: file paths are links too (iTerm's semantic
     // history). Kept separate from url_regex so URLs win when both match.
@@ -249,14 +254,12 @@ impl TerminalBackend {
             ..tty::Options::default()
         };
         let config = term::Config {
-            // tmux owns scrollback (history-limit in the managed tmux.conf)
-            // and the wheel is forwarded to tmux copy-mode while mouse
-            // reporting is on, so the local history is only reachable if a
-            // user manually turns tmux mouse off. Keeping it tiny matters:
-            // sync() deep-clones the whole grid, history included, on every
-            // dirty frame — at the default 10k lines that's tens of MB per
-            // clone once the buffer fills.
-            scrolling_history: 200,
+            // muxterm patch P39: the caller decides. Under tmux the local
+            // history is only reachable if a user turns tmux mouse off, so
+            // muxterm keeps it at 200; under zmx the widget *is* the
+            // scrollback. Depth no longer costs a frame: sync() snapshots
+            // only the visible rows.
+            scrolling_history: settings.scrollback,
             // muxterm patch P14: double-click selects a whole non-whitespace
             // run. Alacritty's default semantic_escape_chars (",│`|:\"' ()[]{}<>\t")
             // split words at quotes/brackets/colons/slashes' neighbors, so a
@@ -272,7 +275,8 @@ impl TerminalBackend {
         let event_proxy = EventProxy(event_sender);
         let mut term = Term::new(config, &terminal_size, event_proxy.clone());
         let initial_content = RenderableContent {
-            grid: term.grid().clone(),
+            grid: viewport(term.grid()),
+            display_offset: 0,
             selectable_range: None,
             terminal_mode: *term.mode(),
             terminal_size,
@@ -363,6 +367,8 @@ impl TerminalBackend {
             repaint_policy,
             generation: 0,
             render_cache: None,
+            search: None,
+            search_match: None,
         })
     }
 
@@ -491,7 +497,7 @@ impl TerminalBackend {
         let mut result = String::new();
         if let Some(range) = content.selectable_range {
             for indexed in content.grid.display_iter() {
-                if range.contains(indexed.point) {
+                if range.contains(content.absolute(indexed.point)) {
                     result.push(indexed.c);
                 }
             }
@@ -526,7 +532,8 @@ impl TerminalBackend {
         };
 
         let cursor = terminal.grid_mut().cursor_cell().clone();
-        self.last_content.grid = terminal.grid().clone();
+        self.last_content.grid = viewport(terminal.grid());
+        self.last_content.display_offset = terminal.grid().display_offset();
         self.last_content.selectable_range = selectable_range;
         self.last_content.cursor = cursor.clone();
         self.last_content.terminal_mode = *terminal.mode();
@@ -563,6 +570,80 @@ impl TerminalBackend {
         cands: &[(String, RangeInclusive<Point>)],
     ) -> Option<RangeInclusive<Point>> {
         link_pick(self.link_validator.as_deref(), cands)
+    }
+
+    /// muxterm patch P41: search the local scrollback for `query` (literal,
+    /// case-insensitive unless it has a capital - "smart case"), starting
+    /// from the bottom and walking *up*, the way tmux's search-backward does
+    /// from history-bottom. The match becomes the selection and is scrolled
+    /// into view, so it highlights with the same paint as a drag and cmd+c
+    /// copies it. Returns the total match count (None for an unusable query).
+    pub fn search_start(&mut self, query: &str) -> Option<usize> {
+        let regex = search_regex(query)?;
+        self.search = Some((query.to_string(), regex));
+        self.search_match = None;
+        let origin = {
+            let term = self.term.lock();
+            Point::new(term.bottommost_line(), term.last_column())
+        };
+        self.search_step_from(origin, Direction::Left, Side::Right);
+        Some(self.search_count())
+    }
+
+    /// muxterm patch P41: the next match - `older` walks up the scrollback
+    /// (cmd+g, like tmux's search-again), otherwise down (cmd+shift+g).
+    pub fn search_step(&mut self, older: bool) -> Option<usize> {
+        self.search.as_ref()?;
+        let origin = match &self.search_match {
+            Some(m) if older => *m.start(),
+            Some(m) => *m.end(),
+            None => {
+                let term = self.term.lock();
+                Point::new(term.bottommost_line(), term.last_column())
+            },
+        };
+        let (dir, side) = if older {
+            (Direction::Left, Side::Left)
+        } else {
+            (Direction::Right, Side::Right)
+        };
+        self.search_step_from(origin, dir, side);
+        Some(self.search_count())
+    }
+
+    /// muxterm patch P41: drop the search and its highlight, and return the
+    /// view to the live bottom.
+    pub fn search_clear(&mut self) {
+        self.search = None;
+        if self.search_match.take().is_some() {
+            let mut term = self.term.lock();
+            term.selection = None;
+            term.scroll_display(Scroll::Bottom);
+        }
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn search_step_from(&mut self, origin: Point, dir: Direction, side: Side) {
+        let Some((_, regex)) = self.search.as_mut() else { return };
+        let mut term = self.term.lock();
+        self.search_match =
+            search_park(&mut term, regex, origin, dir, side, self.search_match.is_some());
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn search_count(&mut self) -> usize {
+        let Some((_, regex)) = self.search.as_mut() else { return 0 };
+        search_total(&self.term.lock(), regex)
+    }
+
+    /// muxterm patch P42: cmd+k when the widget owns the scrollback - drop
+    /// the local history (the screen itself is the shell's to redraw, via
+    /// the ctrl+l the app sends alongside).
+    pub fn clear_history(&self) {
+        let mut term = self.term.lock();
+        term.grid_mut().clear_history();
+        term.selection = None;
+        self.dirty.store(true, Ordering::Release);
     }
 
     /// muxterm patch P24: which PR numbers a `#<number>` token may link
@@ -1346,7 +1427,13 @@ fn link_pick(
 }
 
 pub struct RenderableContent {
+    /// muxterm patch P39: only the rows on screen, at display offset 0 -
+    /// row `i` of this grid is screen row `i`. Points from the live terminal
+    /// (selection, hyperlinks, the cursor) are in absolute coordinates;
+    /// `display_offset` converts: absolute line = row - display_offset.
     pub grid: Grid<Cell>,
+    /// muxterm patch P39: the live terminal's scroll position.
+    pub display_offset: usize,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
     pub selectable_range: Option<SelectionRange>,
     pub cursor: Cell,
@@ -1358,6 +1445,7 @@ impl Default for RenderableContent {
     fn default() -> Self {
         Self {
             grid: Grid::new(0, 0, 0),
+            display_offset: 0,
             hovered_hyperlink: None,
             selectable_range: None,
             cursor: Cell::default(),
@@ -1365,6 +1453,82 @@ impl Default for RenderableContent {
             terminal_size: TerminalSize::default(),
         }
     }
+}
+
+impl RenderableContent {
+    /// muxterm patch P39: a snapshot grid point (screen row) in the live
+    /// terminal's absolute coordinates, which selections, hyperlink ranges
+    /// and the cursor use.
+    pub fn absolute(&self, p: Point) -> Point {
+        Point::new(Line(p.line.0 - self.display_offset as i32), p.column)
+    }
+}
+
+/// muxterm patch P41: a literal query, smart-cased.
+fn search_regex(query: &str) -> Option<RegexSearch> {
+    let pattern = if query.chars().any(char::is_uppercase) {
+        regex::escape(query)
+    } else {
+        format!("(?i){}", regex::escape(query))
+    };
+    RegexSearch::new(&pattern).ok()
+}
+
+/// muxterm patch P41: find the next match from `origin` and park the view on
+/// it - selected (so it paints like a drag and cmd+c copies it) and scrolled
+/// into view. `stepping` says the origin is the current match's edge, which
+/// must be stepped off or "next" would find the same match again.
+fn search_park<T: EventListener>(
+    term: &mut Term<T>,
+    regex: &mut RegexSearch,
+    origin: Point,
+    dir: Direction,
+    side: Side,
+    stepping: bool,
+) -> Option<Match> {
+    use alacritty_terminal::index::Boundary;
+    let origin = match dir {
+        Direction::Left if stepping => origin.sub(&*term, Boundary::None, 1),
+        Direction::Right if stepping => origin.add(&*term, Boundary::None, 1),
+        _ => origin,
+    };
+    let found = term.search_next(regex, origin, dir, side, None);
+    match &found {
+        Some(m) => {
+            let mut sel = Selection::new(AlacrittySelectionType::Simple, *m.start(), Side::Left);
+            sel.update(*m.end(), Side::Right);
+            term.selection = Some(sel);
+            term.scroll_to_point(*m.start());
+        },
+        None => term.selection = None,
+    }
+    found
+}
+
+/// muxterm patch P41: matches in the whole buffer, history included (capped
+/// so a one-letter query over a deep scrollback can't stall a frame).
+fn search_total<T>(term: &Term<T>, regex: &mut RegexSearch) -> usize {
+    let start = Point::new(term.topmost_line(), Column(0));
+    let end = Point::new(term.bottommost_line(), term.last_column());
+    RegexIter::new(start, end, Direction::Right, term, regex).take(10_000).count()
+}
+
+/// muxterm patch P39: copy only what's on screen. Cloning the whole grid
+/// (history included) on every dirty frame is what used to cap the local
+/// scrollback at 200 lines; this costs the same at any depth. Row `i` of the
+/// result is screen row `i`, at display offset 0, and the cursor keeps its
+/// absolute position (`RenderableContent::absolute` maps the rows into the
+/// same space).
+fn viewport(src: &Grid<Cell>) -> Grid<Cell> {
+    let rows = src.screen_lines();
+    let cols = src.columns();
+    let off = src.display_offset() as i32;
+    let mut out: Grid<Cell> = Grid::new(rows, cols, 0);
+    for r in 0..rows as i32 {
+        out[Line(r)] = src[Line(r - off)].clone();
+    }
+    out.cursor = src.cursor.clone();
+    out
 }
 
 impl Drop for TerminalBackend {
@@ -1385,6 +1549,89 @@ impl EventListener for EventProxy {
 // muxterm patch P10: link detection tests over a mock terminal.
 #[cfg(test)]
 mod tests {
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    /// A 5-row, 20-column terminal with `n` numbered lines written to it, so
+    /// all but the last few live in scrollback.
+    fn term_with_lines(n: usize) -> Term<VoidListener> {
+        let size = TermSize::new(20, 5);
+        let config = term::Config { scrolling_history: 1000, ..term::Config::default() };
+        let mut t = Term::new(config, &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        for i in 1..=n {
+            p.advance(&mut t, format!("line {i}\r\n").as_bytes());
+        }
+        t
+    }
+
+    fn row_text(g: &Grid<Cell>, line: i32) -> String {
+        (0..g.columns()).map(|c| g[Line(line)][Column(c)].c).collect::<String>().trim_end().to_string()
+    }
+
+    #[test]
+    fn viewport_copies_only_the_screen() {
+        let mut t = term_with_lines(50);
+        let v = viewport(t.grid());
+        assert_eq!(v.screen_lines(), 5);
+        assert_eq!(v.history_size(), 0);
+        assert_eq!(row_text(&v, 3), "line 50");
+        t.scroll_display(Scroll::Delta(10));
+        let v = viewport(t.grid());
+        assert_eq!(row_text(&v, 3), "line 40");
+        assert_eq!(v.display_offset(), 0);
+    }
+
+    /// `cargo test -p egui_term --release -- --ignored --nocapture snapshot_cost`
+    #[test]
+    #[ignore]
+    fn snapshot_cost() {
+        let size = TermSize::new(200, 50);
+        let config = term::Config { scrolling_history: 10_000, ..term::Config::default() };
+        let mut t = Term::new(config, &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        for i in 0..12_000 {
+            p.advance(&mut t, format!("\x1b[32m{i:>6}\x1b[0m {}\r\n", "x".repeat(150)).as_bytes());
+        }
+        let n = 200;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(t.grid().clone());
+        }
+        let full = t0.elapsed() / n;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(viewport(t.grid()));
+        }
+        let view = t0.elapsed() / n;
+        println!("per dirty frame: full clone {full:?}, viewport {view:?}");
+    }
+
+    #[test]
+    fn absolute_maps_rows_into_terminal_space() {
+        let c = RenderableContent { display_offset: 10, ..Default::default() };
+        let p = c.absolute(Point::new(Line(3), Column(2)));
+        assert_eq!(p, Point::new(Line(-7), Column(2)));
+    }
+
+    #[test]
+    fn search_walks_up_from_the_bottom_and_counts_history() {
+        let mut t = term_with_lines(50);
+        let mut re = search_regex("LINE 4").unwrap(); // capitals: case-sensitive
+        assert_eq!(search_total(&t, &mut re), 0);
+        let mut re = search_regex("line 4").unwrap();
+        // "line 4" and "line 40".."line 49"
+        assert_eq!(search_total(&t, &mut re), 11);
+        let origin = Point::new(t.bottommost_line(), t.last_column());
+        let first = search_park(&mut t, &mut re, origin, Direction::Left, Side::Right, false).unwrap();
+        let text = t.bounds_to_string(*first.start(), *first.end());
+        assert_eq!(text, "line 4");
+        // the newest match is line 49, which is scrolled into view and selected
+        assert!(t.selection.is_some());
+        let next = search_park(&mut t, &mut re, *first.start(), Direction::Left, Side::Left, true).unwrap();
+        assert!(next.start().line < first.start().line, "older match is higher up");
+    }
+
     use super::*;
     use alacritty_terminal::term::test::mock_term;
 

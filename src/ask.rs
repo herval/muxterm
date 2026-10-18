@@ -175,11 +175,15 @@ fn pane_context(lines: u32) -> Option<String> {
         return None;
     }
     let session = std::env::var("MUXTERM_SESSION").ok()?;
+    if crate::zmx::Backend::of_session(&session) == crate::zmx::Backend::Zmx {
+        let z = crate::zmx::Zmx::discover().ok()?;
+        return z.history(&session, lines as usize, false).filter(|t| !t.is_empty());
+    }
     let bin = mesh::find_tmux().ok()?;
     // Pane-targeting commands reject the `=` exact-match prefix; the
     // session names are fixed-length uuids, so plain resolves exact.
     let out = Command::new(bin)
-        .args(["-L", mesh::SOCKET, "capture-pane", "-p", "-J"])
+        .args(["-L", mesh::socket(), "capture-pane", "-p", "-J"])
         .args(["-S", &format!("-{lines}"), "-t", &session])
         .output()
         .ok()?;

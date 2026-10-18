@@ -10,7 +10,14 @@ use egui_term::BackendSettings;
 // Dedicated tmux server socket: muxterm sessions never touch the user's
 // default tmux server, which also makes the startup GC safe. Constants and
 // binary discovery are shared with the `mux` agent-mesh CLI.
-use muxterm::mesh::{find_tmux, SESSION_PREFIX, SOCKET};
+use muxterm::mesh::{find_tmux, socket, SESSION_PREFIX};
+use muxterm::zmx::{self, Backend, Zmx};
+
+/// Local scrollback per backend (egui_term P36). tmux owns the history, so
+/// the widget only needs a little; under zmx the widget *is* the scrollback,
+/// and 10k lines is what zmx replays on reattach.
+const TMUX_LOCAL_SCROLLBACK: usize = 200;
+const ZMX_LOCAL_SCROLLBACK: usize = 10_000;
 
 /// The answer to `TmuxCtl::probe_server`.
 #[derive(Debug, PartialEq, Eq)]
@@ -275,18 +282,115 @@ impl Gesture {
 }
 
 /// Clone: pane link-openers each carry one onto their worker thread.
+///
+/// The session layer for *both* backends at once. Named for tmux, its
+/// original (and default) job; with zmx installed it also hosts zmx
+/// sessions, and every per-session call routes on the session's name
+/// (`Backend::of_session` - `mux-z…` is zmx). For zmx sessions the
+/// copy-mode family is a no-op: the app keeps their selection, search and
+/// scrollback in the local grid (see `is_zmx_session` call sites in app.rs).
 #[derive(Clone)]
 pub struct TmuxCtl {
+    /// tmux, or a bare "tmux" when it isn't installed - tmux calls then just
+    /// fail, which every caller already treats as "no such session".
     bin: PathBuf,
     conf: PathBuf,
+    zmx: Option<Zmx>,
+    /// Where new panes go (config `backend`, resolved against what's
+    /// installed). Live: a config change applies to the next pane.
+    default: Backend,
+    /// Why new panes aren't going where config.toml asked (zmx requested
+    /// but not installed), for Settings to explain.
+    notice: Option<String>,
+}
+
+/// Whether a session lives on zmx - from its name alone.
+pub fn is_zmx_session(session: &str) -> bool {
+    Backend::of_session(session) == Backend::Zmx
+}
+
+/// A completion flag that is already set: what the copy-mode calls hand back
+/// when there's no tmux round trip to wait for.
+fn done() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
 }
 
 impl TmuxCtl {
-    pub fn discover(config_dir: &Path) -> Result<Self> {
-        Ok(Self {
-            bin: find_tmux()?,
-            conf: config_dir.join("tmux.conf"),
-        })
+    /// Finds both backends; fails only when neither is installed.
+    pub fn discover(config_dir: &Path, want: Backend) -> Result<Self> {
+        let conf = config_dir.join("tmux.conf");
+        let zmx = Zmx::discover().ok();
+        let bin = match find_tmux() {
+            Ok(bin) => bin,
+            Err(_) if zmx.is_some() => PathBuf::from("tmux"),
+            Err(e) => return Err(e),
+        };
+        let mut ctl = Self {
+            bin,
+            conf,
+            zmx,
+            default: Backend::Tmux,
+            notice: None,
+        };
+        ctl.set_default(want);
+        Ok(ctl)
+    }
+
+    /// Point new panes at `want`, or at the other backend when `want`
+    /// isn't installed (with a notice saying so).
+    pub fn set_default(&mut self, want: Backend) {
+        let tmux_ok = self.bin.is_absolute();
+        self.default = zmx::pick_default(want, tmux_ok, self.zmx.is_some());
+        self.notice = (self.default != want).then(|| {
+            format!("{} not found - new panes use {}", want.as_str(), self.default.as_str())
+        });
+    }
+
+    /// Where new panes go.
+    pub fn default_backend(&self) -> Backend {
+        self.default
+    }
+
+    pub fn zmx_installed(&self) -> bool {
+        self.zmx.is_some()
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    /// Whether this launch can run `session`'s backend at all - a zmx pane
+    /// saved while zmx was installed can't come back once it isn't.
+    pub fn can_host(&self, session: &str) -> bool {
+        !is_zmx_session(session) || self.zmx.is_some()
+    }
+
+    /// The zmx session's foreground (command, pid), from its shell's pid.
+    fn zmx_foreground(&self, session: &str) -> Option<(String, u32)> {
+        let z = self.zmx.as_ref()?;
+        let pid = z.list().into_iter().find(|s| s.name == session)?.pid?;
+        zmx::proc_foreground(pid)
+    }
+
+    /// Foreground/cwd/pid of every zmx session, the zmx half of
+    /// `pane_snapshot`.
+    fn zmx_snapshot(&self) -> HashMap<String, PaneSnap> {
+        let Some(z) = &self.zmx else {
+            return HashMap::new();
+        };
+        z.list()
+            .into_iter()
+            .filter_map(|s| {
+                let pid = s.pid?;
+                let (cmd, fg) = zmx::proc_foreground(pid)?;
+                let cwd = zmx::proc_cwd(fg)
+                    .or_else(|| zmx::proc_cwd(pid))
+                    .or_else(|| s.cwd.map(PathBuf::from));
+                // zmx keeps no activity clock; the attention sweep just
+                // doesn't get its stale-badge hint for these panes.
+                Some((s.name, PaneSnap { cmd, cwd, pid: Some(pid), activity: None }))
+            })
+            .collect()
     }
 
     /// Returns whether the on-disk conf actually changed, so callers know
@@ -313,13 +417,14 @@ impl TmuxCtl {
     /// read at server start). Silently a no-op when no server is up.
     pub fn source_conf(&self) {
         let _ = Command::new(&self.bin)
-            .args(["-L", SOCKET, "source-file"])
+            .args(["-L", socket(), "source-file"])
             .arg(&self.conf)
             .output();
     }
 
-    pub fn new_session_name() -> String {
-        muxterm::mesh::new_session_name()
+    /// A fresh name on the default backend - the name *is* the choice.
+    pub fn new_session_name(&self) -> String {
+        muxterm::mesh::new_session_name(self.default)
     }
 
     /// The whole trick of muxterm: the pane's PTY runs a tmux client.
@@ -345,10 +450,37 @@ impl TmuxCtl {
         start_dir: Option<String>,
         dark: bool,
     ) -> BackendSettings {
+        let colorfgbg = if dark { "15;0" } else { "0;15" };
+        if is_zmx_session(session) {
+            // App::create_pane checks can_host first; this only guards a
+            // caller that didn't, so a zmx name never lands on tmux.
+            let Some(z) = &self.zmx else {
+                return BackendSettings {
+                    shell: "/bin/sh".into(),
+                    args: vec!["-c".into(), "echo 'muxterm: zmx is not installed'; sleep 86400".into()],
+                    working_directory: None,
+                    scrollback: TMUX_LOCAL_SCROLLBACK,
+                };
+            };
+            let env = [
+                ("MUXTERM".to_string(), "1".to_string()),
+                ("MUXTERM_SESSION".to_string(), session.to_string()),
+                ("COLORFGBG".to_string(), colorfgbg.to_string()),
+            ];
+            let (shell, args) = z.attach_argv(session, &env);
+            return BackendSettings {
+                shell,
+                args,
+                // zmx starts a new session's shell in the client's cwd (and
+                // ignores it on reattach, like tmux's -c).
+                working_directory: start_dir.map(PathBuf::from),
+                scrollback: ZMX_LOCAL_SCROLLBACK,
+            };
+        }
         let mut args = vec![
             "-u".into(),
             "-L".into(),
-            SOCKET.into(),
+            socket().into(),
             "-f".into(),
             self.conf.display().to_string(),
             "new-session".into(),
@@ -362,7 +494,7 @@ impl TmuxCtl {
             // Claude Code's `auto` theme reads only COLORFGBG's last field
             // (<=6 or ==8 => dark); the canonical fg;bg pair also steers
             // other background sniffers the same way.
-            format!("COLORFGBG={}", if dark { "15;0" } else { "0;15" }),
+            format!("COLORFGBG={colorfgbg}"),
             "-s".into(),
             session.into(),
         ];
@@ -374,16 +506,21 @@ impl TmuxCtl {
             shell: self.bin.display().to_string(),
             args,
             working_directory: None,
+            scrollback: TMUX_LOCAL_SCROLLBACK,
         }
     }
 
     /// Current working directory of a session's active pane, so splits and
     /// new tabs can start where the user is.
     pub fn pane_current_path(&self, session: &str) -> Option<String> {
+        if is_zmx_session(session) {
+            let (_, pid) = self.zmx_foreground(session)?;
+            return zmx::proc_cwd(pid).map(|p| p.display().to_string());
+        }
         let out = Command::new(&self.bin)
             .args([
                 "-L",
-                SOCKET,
+                socket(),
                 "list-panes",
                 "-t",
                 &format!("={session}"),
@@ -403,10 +540,13 @@ impl TmuxCtl {
     /// Foreground process of the session's active pane ("zsh", "vim", ...),
     /// so the "?" prompt only ever triggers at a shell.
     pub fn pane_current_command(&self, session: &str) -> Option<String> {
+        if is_zmx_session(session) {
+            return self.zmx_foreground(session).map(|(cmd, _)| cmd);
+        }
         let out = Command::new(&self.bin)
             .args([
                 "-L",
-                SOCKET,
+                socket(),
                 "list-panes",
                 "-t",
                 &format!("={session}"),
@@ -431,10 +571,15 @@ impl TmuxCtl {
     /// and through `list-panes`, since `display-message -t` resolves pane
     /// fields empty.
     pub fn cursor_and_size(&self, session: &str) -> Option<(u16, u16, u16)> {
+        // Under zmx the local grid is the authoritative copy - the app reads
+        // it there (App::inline_ask_geometry).
+        if is_zmx_session(session) {
+            return None;
+        }
         let out = Command::new(&self.bin)
             .args([
                 "-L",
-                SOCKET,
+                socket(),
                 "list-panes",
                 "-t",
                 &format!("={session}"),
@@ -459,10 +604,16 @@ impl TmuxCtl {
     /// background-job scan's walk roots (bg_jobs), so one subprocess
     /// covering all panes matters - the per-session getters would be N.
     pub fn pane_snapshot(&self) -> HashMap<String, PaneSnap> {
+        let mut snap = self.zmx_snapshot();
+        snap.extend(self.tmux_snapshot());
+        snap
+    }
+
+    fn tmux_snapshot(&self) -> HashMap<String, PaneSnap> {
         let out = Command::new(&self.bin)
             .args([
                 "-L",
-                SOCKET,
+                socket(),
                 "list-panes",
                 "-a",
                 "-F",
@@ -482,10 +633,17 @@ impl TmuxCtl {
     /// Pane-scoped commands need the `=name:` target form (tmux >= 3.7
     /// rejects a bare `=name` here, unlike list-panes).
     pub fn capture_pane(&self, session: &str, lines: u32) -> Option<String> {
+        if is_zmx_session(session) {
+            return self
+                .zmx
+                .as_ref()?
+                .history(session, lines as usize, false)
+                .filter(|t| !t.is_empty());
+        }
         let out = Command::new(&self.bin)
             .args([
                 "-L",
-                SOCKET,
+                socket(),
                 "capture-pane",
                 "-p",
                 "-J",
@@ -525,11 +683,16 @@ impl TmuxCtl {
     /// `_`. (`display-message` rejects the `=` target prefix; session names
     /// are fixed-length uuids, so prefix ambiguity can't bite.)
     pub fn take_selection(&self, session: &str) -> Option<Copied> {
+        // zmx panes keep their selection in the widget (egui_term P38's
+        // mouse_select stays on for them); there is no copy-mode to ask.
+        if is_zmx_session(session) {
+            return None;
+        }
         let target = format!("={session}:");
         let id = uuid::Uuid::new_v4().simple().to_string();
         let prefix = format!("muxterm-copy-{}-", &id[..8]);
         let out = Command::new(&self.bin)
-            .args(["-L", SOCKET, "display-message", "-p", "-t", session])
+            .args(["-L", socket(), "display-message", "-p", "-t", session])
             .args(["#{pane_width}", ";", "if-shell", "-F", "-t", &target])
             .arg("#{selection_present}")
             .arg(format!(
@@ -542,7 +705,7 @@ impl TmuxCtl {
         let listed = String::from_utf8_lossy(&out.stdout);
         let (width, buffer) = copied_buffer(&listed, &prefix)?;
         let out = Command::new(&self.bin)
-            .args(["-L", SOCKET, "show-buffer", "-b", buffer])
+            .args(["-L", socket(), "show-buffer", "-b", buffer])
             .output()
             .ok()?;
         out.status.success().then(|| Copied {
@@ -555,8 +718,11 @@ impl TmuxCtl {
     /// to following its program's live output. A no-op when the pane isn't in
     /// a mode, so it is always safe to send.
     pub fn cancel_copy_mode(&self, session: &str) -> Arc<AtomicBool> {
+        if is_zmx_session(session) {
+            return done();
+        }
         self.spawn_argv(
-            ["-L", SOCKET, "copy-mode", "-q", "-t", &format!("={session}:")]
+            ["-L", socket(), "copy-mode", "-q", "-t", &format!("={session}:")]
                 .map(String::from)
                 .to_vec(),
         )
@@ -565,11 +731,14 @@ impl TmuxCtl {
     /// Drop the selection but stay in copy-mode (the pane keeps its scroll
     /// position) - what cmd+f wants before it moves the copy-mode cursor.
     pub fn clear_copy_selection(&self, session: &str) {
+        if is_zmx_session(session) {
+            return;
+        }
         let bin = self.bin.clone();
         let t = format!("={session}:");
         std::thread::spawn(move || {
             let _ = Command::new(&bin)
-                .args(["-L", SOCKET, "send-keys", "-t", &t, "-X"])
+                .args(["-L", socket(), "send-keys", "-t", &t, "-X"])
                 .arg("clear-selection")
                 .output();
         });
@@ -595,15 +764,18 @@ impl TmuxCtl {
     /// leaves the pushed lines behind - so it runs on a detached thread rather
     /// than blocking the UI. Whatever the pane runs, C-l is just a redraw.
     pub fn clear(&self, session: &str) {
+        if is_zmx_session(session) {
+            return;
+        }
         let bin = self.bin.clone();
         let target = format!("={session}:");
         std::thread::spawn(move || {
             let run = |args: &[&str]| {
                 let _ = Command::new(&bin).args(args).output();
             };
-            run(&["-L", SOCKET, "send-keys", "-t", target.as_str(), "C-l"]);
+            run(&["-L", socket(), "send-keys", "-t", target.as_str(), "C-l"]);
             std::thread::sleep(std::time::Duration::from_millis(200));
-            run(&["-L", SOCKET, "clear-history", "-t", target.as_str()]);
+            run(&["-L", socket(), "clear-history", "-t", target.as_str()]);
         });
     }
 
@@ -617,6 +789,9 @@ impl TmuxCtl {
         session: &str,
         query: &str,
     ) -> Option<SearchStatus> {
+        if is_zmx_session(session) {
+            return None;
+        }
         let target = format!("={session}:");
         let query = escape_semi(query);
         self.search_op(session, &[
@@ -640,6 +815,9 @@ impl TmuxCtl {
     /// click or drag dropped the pane out of copy-mode - tmux keeps the
     /// pane's last search string across copy-mode instances.
     pub fn search_next(&self, session: &str) -> Option<SearchStatus> {
+        if is_zmx_session(session) {
+            return None;
+        }
         let target = format!("={session}:");
         self.search_op(session, &[
             "send-keys",
@@ -652,6 +830,9 @@ impl TmuxCtl {
 
     /// shift+Enter / cmd+shift+g: back toward newer matches.
     pub fn search_prev(&self, session: &str) -> Option<SearchStatus> {
+        if is_zmx_session(session) {
+            return None;
+        }
         let target = format!("={session}:");
         self.search_op(session, &[
             "send-keys",
@@ -666,10 +847,13 @@ impl TmuxCtl {
     /// highlights and unfreezes the pane. `-q` is a no-op outside a mode,
     /// so no `#{pane_in_mode}` guard is needed.
     pub fn search_clear(&self, session: &str) {
+        if is_zmx_session(session) {
+            return;
+        }
         let _ = Command::new(&self.bin)
             .args([
                 "-L",
-                SOCKET,
+                socket(),
                 "copy-mode",
                 "-q",
                 "-t",
@@ -687,7 +871,7 @@ impl TmuxCtl {
     fn search_op(&self, session: &str, steps: &[&str]) -> Option<SearchStatus> {
         let target = format!("={session}:");
         let out = Command::new(&self.bin)
-            .args(["-L", SOCKET, "copy-mode", "-t", &target, ";"])
+            .args(["-L", socket(), "copy-mode", "-t", &target, ";"])
             .args(steps)
             .args([
                 ";",
@@ -707,14 +891,27 @@ impl TmuxCtl {
 
     /// `=` forces an exact match; `-t name` alone prefix-matches.
     pub fn kill_session(&self, session: &str) {
+        if is_zmx_session(session) {
+            if let Some(z) = &self.zmx {
+                z.kill(session);
+            }
+            return;
+        }
         let _ = Command::new(&self.bin)
-            .args(["-L", SOCKET, "kill-session", "-t", &format!("={session}")])
+            .args(["-L", socket(), "kill-session", "-t", &format!("={session}")])
             .output();
     }
 
+    /// Every live session on both backends.
     pub fn list_sessions(&self) -> Vec<String> {
+        let mut all = self.zmx.as_ref().map(Zmx::names).unwrap_or_default();
+        all.extend(self.tmux_sessions());
+        all
+    }
+
+    fn tmux_sessions(&self) -> Vec<String> {
         match Command::new(&self.bin)
-            .args(["-L", SOCKET, "list-sessions", "-F", "#{session_name}"])
+            .args(["-L", socket(), "list-sessions", "-F", "#{session_name}"])
             .output()
         {
             // A non-zero exit just means no server is running on the socket.
@@ -738,7 +935,7 @@ impl TmuxCtl {
     /// commands into panes, and doing that to live ones would be a disaster.
     pub fn probe_server(&self) -> ServerProbe {
         match Command::new(&self.bin)
-            .args(["-L", SOCKET, "list-sessions", "-F", "#{session_name}"])
+            .args(["-L", socket(), "list-sessions", "-F", "#{session_name}"])
             .output()
         {
             Ok(out) => classify_probe(
@@ -1075,6 +1272,9 @@ mod tests {
         let ctl = TmuxCtl {
             bin: PathBuf::from("/usr/bin/tmux"),
             conf: PathBuf::from("/tmp/tmux.conf"),
+            zmx: None,
+            default: Backend::Tmux,
+            notice: None,
         };
         let settings = ctl.spawn_settings("mux-abcd1234", None, true);
         assert_eq!(settings.args.first().map(String::as_str), Some("-u"));
@@ -1091,6 +1291,9 @@ mod tests {
         let ctl = TmuxCtl {
             bin: PathBuf::from("/usr/bin/tmux"),
             conf: PathBuf::from("/tmp/tmux.conf"),
+            zmx: None,
+            default: Backend::Tmux,
+            notice: None,
         };
         let dark = ctl.spawn_settings("mux-abcd1234", None, true);
         assert!(dark.args.iter().any(|a| a == "COLORFGBG=15;0"));
