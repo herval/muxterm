@@ -507,3 +507,35 @@ tmux-backed design. Local patches:
   spacer belongs to the glyph, so a click on either half finds the same word.
   `TerminalSize::columns` joins `screen_lines` (P29) as an accessor that
   needs no alacritty trait in scope.
+- **P39** (`src/backend/mod.rs`, `viewport`, `RenderableContent::{display_offset, absolute}`,
+  `src/backend/settings.rs`, `src/view.rs`): a
+  viewport-only snapshot and caller-chosen scrollback. `sync()` used to
+  deep-clone the whole grid - history included - on every dirty frame, which
+  is why the local history was pinned at 200 lines (P9): 2.5 ms per frame at
+  10k lines × 200 columns, measured by the ignored `snapshot_cost` test.
+  `viewport` copies only the rows on screen (29 µs at any depth), into a grid
+  at display offset 0 whose row `i` is screen row `i`. Points that come from
+  the live terminal - the selection, hyperlink ranges, the cursor - stay in
+  absolute coordinates; `RenderableContent::absolute` maps a snapshot row
+  into that space and `display_offset` carries the real scroll position for
+  the mouse-to-grid mapping. Every grid reader (render loop, `row_stops_at`,
+  `row_chars`, `copy_selection_bounds`, `selectable_content`, the cursor)
+  was ported. `BackendSettings.scrollback` (default 200) sets the depth:
+  muxterm keeps 200 under tmux and uses 10k under the zmx backend, where the
+  widget *is* the scrollback.
+- **P40** (`src/view.rs`, `process_mouse_wheel`): xterm alternate-scroll. A
+  full-screen app that didn't enable mouse reporting (less, man, git's pager)
+  gets the wheel as Up/Down arrows (SS3 under DECCKM) while
+  `ALT_SCREEN | ALTERNATE_SCROLL` is set. tmux's `#{alternate_on}` wheel rule
+  used to do this; a pass-through backend leaves it to the widget. Never
+  reached under tmux, whose client is always in mouse mode.
+- **P41** (`src/backend/mod.rs`, `search_start`, `search_step`, `search_clear`,
+  `search_park`, `search_total`, `search_regex`): local scrollback search for
+  backends without copy-mode. Literal and smart-cased (case-insensitive unless
+  the query has a capital); starts at the bottom and walks up like tmux's
+  `search-backward` from `history-bottom`. The match becomes the selection
+  (same paint as a drag, cmd+c copies it) and is scrolled into view; the
+  total is counted over the whole buffer, capped at 10k.
+- **P42** (`src/backend/mod.rs`, `clear_history`): cmd+k when the widget owns
+  the scrollback - drop the local history and selection; the host sends the
+  ctrl+l for the shell's redraw.

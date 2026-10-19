@@ -2122,6 +2122,7 @@ dependencies = [
  "egui",
  "egui_term",
  "env_logger",
+ "libc",
  "log",
  "rfd",
  "serde",

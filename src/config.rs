@@ -9,6 +9,7 @@ use egui_term::TerminalTheme;
 use serde::Deserialize;
 
 use muxterm::state;
+use muxterm::zmx::Backend;
 
 use muxterm::agent::{self, Agent};
 
@@ -95,6 +96,11 @@ copy_on_select = false
 # `mux notify`. Tab badges are always on; this gates only the OS alerts.
 # notifications = true
 
+# Session backend for new panes: "tmux" (default) or the experimental "zmx"
+# (brew install neurosnap/tap/zmx), which keeps scrollback, selection and
+# search in muxterm itself. Both run side by side - open panes keep theirs.
+# backend = "tmux"
+
 # Recover context when relaunching after a machine reboot. A reboot kills
 # the tmux server (and every pane's live process, cwd, and scrollback);
 # these bring back what can be brought back - live processes can't.
@@ -143,6 +149,10 @@ copy_on_select = false
 #[serde(default)]
 pub struct ConfigFile {
     pub theme: String,
+    /// Session backend: "tmux" or the experimental "zmx". Read once at
+    /// launch (muxterm::zmx::configured_backend, shared with `mux`); the
+    /// GUI keeps it here so Settings can show what a restart would pick.
+    pub backend: String,
     /// Agent CLI behind the "?" prompt line: one of agent::AGENTS' ids.
     /// (`agent_model` also lives in the file but is read by `mux ask`,
     /// not the GUI.)
@@ -206,6 +216,7 @@ impl Default for ConfigFile {
     fn default() -> Self {
         Self {
             theme: "iterm-dark".into(),
+            backend: "tmux".into(),
             agent: agent::default_agent().id.into(),
             dim_inactive_panes: 0.12,
             min_contrast: 3.0,
@@ -242,6 +253,8 @@ pub struct FontConfig {
 
 pub struct Style {
     pub name: String,
+    /// The backend config.toml asks for - what the *next* launch runs on.
+    pub backend: Backend,
     pub term_theme: TerminalTheme,
     pub ui: UiTheme,
     pub font: FontId,
@@ -313,6 +326,13 @@ pub fn resolve(
             ("iterm-dark".to_string(), theme::preset("iterm-dark").unwrap())
         },
     };
+    let backend = Backend::parse(&cfg.backend).unwrap_or_else(|| {
+        log::warn!(
+            "config: backend must be \"tmux\" or \"zmx\", got {:?}; using tmux",
+            cfg.backend
+        );
+        Backend::Tmux
+    });
     let (term_theme, mut ui) =
         theme::build(preset, &cfg.colors, cfg.dim_inactive_panes);
     // Flat bar knobs override the theme's choice; bar colors ride
@@ -386,6 +406,7 @@ pub fn resolve(
     (
         Style {
             name,
+            backend,
             term_theme,
             ui,
             font: FontId::monospace(size),
@@ -566,6 +587,18 @@ pub fn set_pr_detector(on: bool) {
         replace_top_level_line(&text, "pr_detector", &line),
     ) {
         log::warn!("could not save pr_detector: {e:#}");
+    }
+}
+
+/// Same surgical rewrite for the settings window's session-backend choice.
+/// Takes effect at the next launch.
+pub fn set_backend(backend: Backend) {
+    let text = fs::read_to_string(path()).unwrap_or_default();
+    let line = format!("backend = \"{}\"", backend.as_str());
+    if let Err(e) =
+        fs::write(path(), replace_top_level_line(&text, "backend", &line))
+    {
+        log::warn!("could not save backend: {e:#}");
     }
 }
 
@@ -1043,6 +1076,30 @@ mod tests {
         assert!(!cfg.notifications);
         let (style, _, _) = resolve(&cfg);
         assert!(!style.notifications);
+    }
+
+    #[test]
+    fn backend_defaults_to_tmux_and_parses() {
+        let (style, _, _) = resolve(&ConfigFile::default());
+        assert_eq!(style.backend, Backend::Tmux);
+        // The seeded file only mentions it in a comment.
+        let seed: ConfigFile = toml::from_str(&default_config()).unwrap();
+        assert_eq!(resolve(&seed).0.backend, Backend::Tmux);
+        let cfg: ConfigFile = toml::from_str("backend = \"zmx\"").unwrap();
+        assert_eq!(resolve(&cfg).0.backend, Backend::Zmx);
+        // Unknown values fall back rather than failing the whole file.
+        let cfg: ConfigFile = toml::from_str("backend = \"screen\"").unwrap();
+        assert_eq!(resolve(&cfg).0.backend, Backend::Tmux);
+    }
+
+    #[test]
+    fn backend_line_is_rewritten_at_top_level() {
+        let text = "theme = \"bbs\"\n# backend = \"tmux\"\n[font]\nsize = 13\n";
+        let out = replace_top_level_line(text, "backend", "backend = \"zmx\"");
+        let cfg: ConfigFile = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.backend, "zmx");
+        assert_eq!(cfg.theme, "bbs");
+        assert_eq!(cfg.font.size, Some(13.0));
     }
 
     #[test]

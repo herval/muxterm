@@ -732,7 +732,17 @@ impl App {
         // Restored sessions may hold half-typed input from the previous
         // run, so the "?" prompt stays inert there until the first Enter.
         let restored = session.is_some();
-        let session = session.unwrap_or_else(TmuxCtl::new_session_name);
+        // A saved zmx pane can't come back on a machine without zmx: give it
+        // a fresh session on the default backend instead (a cold restore -
+        // same as after a reboot - in the pane's saved cwd).
+        let session = match session {
+            Some(s) if self.tmux.can_host(&s) => s,
+            Some(s) => {
+                log::warn!("{s}: its backend is not installed; reopening it on {}", self.tmux.default_backend().as_str());
+                self.tmux.new_session_name()
+            },
+            None => self.tmux.new_session_name(),
+        };
         let seed_cwd = start_dir.as_ref().map(PathBuf::from);
         let mut backend = TerminalBackend::new(
             id.0,
@@ -3052,6 +3062,19 @@ impl App {
             .filter(|(_, t)| now.duration_since(*t) >= EXIT_SETTLE)
             .map(|(id, _)| *id)
             .collect();
+        // A zmx pane's exit says nothing about the tmux server (which may
+        // not even be running): judge it against zmx's own session list.
+        let (zmx_due, due): (Vec<u64>, Vec<u64>) = due.into_iter().partition(|id| {
+            self.locate_pane(*id).is_some_and(|(_, s)| tmux::is_zmx_session(&s))
+        });
+        if !zmx_due.is_empty() {
+            self.exited.retain(|(id, _)| !zmx_due.contains(id));
+            let live: HashSet<String> = self.tmux.list_sessions().into_iter().collect();
+            self.settle_live(ctx, zmx_due, &live, now);
+        }
+        if due.is_empty() {
+            return;
+        }
         match self.tmux.probe_server() {
             ServerProbe::Dead => {
                 if !self.session_recovery {
@@ -3082,6 +3105,28 @@ impl App {
             },
             ServerProbe::Alive(live) => {
                 self.exited.retain(|(id, _)| !due.contains(id));
+                let live: HashSet<String> = live.into_iter().collect();
+                self.settle_live(ctx, due, &live, now);
+            },
+            ServerProbe::Unknown => {
+                log::warn!("tmux server probe inconclusive; holding pane exits");
+                ctx.request_repaint_after(EXIT_PROBE_EVERY);
+            },
+        }
+    }
+
+    /// Exits whose backend is known to be up: a pane whose session is gone
+    /// had its shell exit - close it; one whose session lives only lost its
+    /// client - reattach (bounded, so a client that keeps dying is left be).
+    fn settle_live(
+        &mut self,
+        ctx: &egui::Context,
+        due: Vec<u64>,
+        live: &HashSet<String>,
+        now: Instant,
+    ) {
+        {
+            {
                 for id in due {
                     let Some((tab_idx, session)) = self.locate_pane(id) else {
                         continue;
@@ -3108,16 +3153,12 @@ impl App {
                         );
                         continue;
                     }
-                    log::warn!("{session}: tmux client exited, session alive; reattaching");
+                    log::warn!("{session}: client exited, session alive; reattaching");
                     if let Err(e) = self.respawn_pane(ctx, tab_idx, PaneId(id), false) {
                         log::error!("{session}: reattach failed: {e:#}");
                     }
                 }
-            },
-            ServerProbe::Unknown => {
-                log::warn!("tmux server probe inconclusive; holding pane exits");
-                ctx.request_repaint_after(EXIT_PROBE_EVERY);
-            },
+            }
         }
     }
 
@@ -3159,6 +3200,10 @@ impl App {
                 else {
                     continue;
                 };
+                // zmx panes don't live on the tmux server - nothing to do.
+                if tmux::is_zmx_session(&session) {
+                    continue;
+                }
                 let cold = !live.contains(&session);
                 if let Err(e) = self.respawn_pane(ctx, tab_idx, pane_id, cold) {
                     log::error!("{session}: respawn failed: {e:#}");
@@ -3454,7 +3499,23 @@ impl App {
                     .and_then(|t| t.panes.get(&t.focused))
                     .map(|p| p.session.clone());
                 if let Some(session) = session {
-                    self.tmux.clear(&session);
+                    if tmux::is_zmx_session(&session) {
+                        // The widget owns the scrollback under zmx (P39):
+                        // ctrl+l for the shell's redraw, then drop the
+                        // local history. zmx's own copy (what a reattach
+                        // replays) isn't reachable from here.
+                        if let Some(pane) = self
+                            .tabs
+                            .get_mut(self.active)
+                            .and_then(|t| t.panes.get_mut(&t.focused))
+                        {
+                            pane.backend
+                                .process_command(BackendCommand::Write(vec![0x0c]));
+                            pane.backend.clear_history();
+                        }
+                    } else {
+                        self.tmux.clear(&session);
+                    }
                 }
             },
             Action::ClosePane => {
@@ -3676,6 +3737,7 @@ impl App {
         self.git_status = style.git_status;
         self.git_enabled.store(style.git_status, Ordering::Relaxed);
         self.notifications = style.notifications;
+        self.tmux.set_default(style.backend);
         // Reboot-recovery flags. session_recovery/restore_agents only act at
         // the next launch's restore, but track them so a live edit sticks;
         // restore_scrollback also gates the capture poller, toggled live.
@@ -3921,6 +3983,31 @@ impl App {
     }
 
     fn run_search_op(&mut self, session: &str, op: SearchOp) {
+        if tmux::is_zmx_session(session) {
+            // egui_term P38: the scrollback is local, so is the search.
+            let Some(pane) = self
+                .tabs
+                .get_mut(self.active)
+                .and_then(|t| t.panes.values_mut().find(|p| p.session == session))
+            else {
+                return;
+            };
+            let total = match op {
+                SearchOp::Search(q) => pane.backend.search_start(&q),
+                SearchOp::Next => pane.backend.search_step(true),
+                SearchOp::Prev => pane.backend.search_step(false),
+                SearchOp::Clear => {
+                    pane.backend.search_clear();
+                    self.search.set_count(None);
+                    return;
+                },
+            };
+            self.search.set_count(total.map(|t| search::MatchCount {
+                total: t as u32,
+                partial: t >= 10_000,
+            }));
+            return;
+        }
         let status = match op {
             SearchOp::Search(q) => self.tmux.search_text(session, &q),
             SearchOp::Next => self.tmux.search_next(session),
@@ -4016,8 +4103,24 @@ impl App {
         // asked at their own shell prompt. Geometry the erase can't be
         // trusted with just leaves the command visible above the prompt -
         // cosmetic, and the prompt still works.
+        let local_geometry = tmux::is_zmx_session(&session).then(|| {
+            self.tabs
+                .get(self.active)
+                .and_then(|tab| tab.panes.get(&focused))
+                .map(|pane| {
+                    let c = pane.backend.last_content();
+                    (
+                        c.grid.cursor.point.column.0 as u16,
+                        c.terminal_size.columns() as u16,
+                        c.terminal_size.screen_lines() as u16,
+                    )
+                })
+        });
         let write = enter.then(|| {
-            let geometry = self.tmux.cursor_and_size(&session);
+            let geometry = match local_geometry {
+                Some(g) => g,
+                None => self.tmux.cursor_and_size(&session),
+            };
             let mut cmd = inline_ask_command(geometry).into_bytes();
             cmd.push(b'\r');
             line = LineTracker::Known(0);
@@ -4176,6 +4279,11 @@ impl App {
         let Some(pane) = tab.panes.get(&id) else {
             return;
         };
+        // A zmx pane has no copy-mode to hand the drag to: the widget's own
+        // selection (P16/P8/P14) is the whole story, so don't arm one.
+        if tmux::is_zmx_session(&pane.session) {
+            return;
+        }
         self.drag = Some(DragSelect {
             pane: id,
             session: pane.session.clone(),
@@ -4417,6 +4525,11 @@ impl App {
         let Some(pane) = tab.panes.get(&tab.focused) else {
             return;
         };
+        // A zmx pane keeps its selection in the widget (mouse_select stays
+        // on for it), which copies it on this same event.
+        if tmux::is_zmx_session(&pane.session) {
+            return;
+        }
         let session = pane.session.clone();
         let pane_id = tab.focused;
         // Whoever made the selection - a relayed drag, or the user in a pane
@@ -4786,6 +4899,16 @@ impl App {
             self.notifications,
             self.monitor_prs,
             self.automations_on,
+            &settings::Sessions {
+                default: self.tmux.default_backend(),
+                zmx_installed: self.tmux.zmx_installed(),
+                notice: self.tmux.notice(),
+                open: {
+                    let all = self.tabs.iter().flat_map(|t| t.panes.values());
+                    let zmx = all.clone().filter(|p| tmux::is_zmx_session(&p.session)).count();
+                    (all.count() - zmx, zmx)
+                },
+            },
             &mut self.settings_tab,
             &self.projects,
             &mut self.project_draft,
@@ -4855,6 +4978,12 @@ impl App {
         }
         if let Some(name) = out.theme {
             config::set_theme(name);
+            self.reload_config(ctx);
+        }
+        if let Some(backend) = out.backend {
+            // New panes only - reload points the session layer at it; open
+            // panes stay on the backend their name says.
+            config::set_backend(backend);
             self.reload_config(ctx);
         }
         if let Some(id) = out.agent {
@@ -6435,6 +6564,7 @@ fn show_node(
             term_rects.insert(*id, term_rect);
             let mut child =
                 ui.new_child(egui::UiBuilder::new().max_rect(term_rect));
+            let zmx_pane = tmux::is_zmx_session(&pane.session);
             let view = TerminalView::new(&mut child, &mut pane.backend)
                 .set_size(term_rect.size())
                 .set_focus(*id == focused)
@@ -6443,8 +6573,10 @@ fn show_node(
                 }))
                 .set_theme(term_theme.clone())
                 .set_copy_on_select(copy_on_select)
-                // tmux draws and holds every selection (drag_intercept).
-                .set_mouse_select(false)
+                // tmux draws and holds a tmux pane's selection
+                // (drag_intercept); a zmx pane has no copy-mode, so the
+                // widget's own selection is the one there is.
+                .set_mouse_select(zmx_pane)
                 .set_min_contrast(min_contrast)
                 .set_interactive(interactive);
             let response = child.add(view);

@@ -458,6 +458,9 @@ impl<'a> TerminalView<'a> {
         // drawing it anyway makes it visibly dart across the pane.
         let cursor_visible =
             content.terminal_mode.contains(TermMode::SHOW_CURSOR);
+        // P36: the snapshot holds only the screen (row i = screen row i);
+        // `abs` below maps a cell into the live terminal's coordinates, which
+        // the selection, hyperlink ranges and cursor are expressed in.
         let display_offset = content.grid.display_offset() as i32;
         let fonts = painter.fonts(|f| f.clone());
         // Run batching assumes every ASCII glyph advances exactly one cell,
@@ -491,6 +494,7 @@ impl<'a> TerminalView<'a> {
         > = std::collections::HashMap::new();
 
         for indexed in content.grid.display_iter() {
+            let abs = content.absolute(indexed.point);
             let flags = indexed.cell.flags;
             let is_wide_char_spacer =
                 flags.contains(cell::Flags::WIDE_CHAR_SPACER);
@@ -504,10 +508,10 @@ impl<'a> TerminalView<'a> {
                 flags.intersects(cell::Flags::DIM | cell::Flags::DIM_BOLD);
             let is_selected = content
                 .selectable_range
-                .is_some_and(|r| r.contains(indexed.point));
+                .is_some_and(|r| r.contains(abs));
             let is_hovered_hyperling =
                 content.hovered_hyperlink.as_ref().is_some_and(|r| {
-                    r.contains(&indexed.point)
+                    r.contains(&abs)
                         && r.contains(&state.current_mouse_position_on_grid)
                 });
 
@@ -579,7 +583,7 @@ impl<'a> TerminalView<'a> {
             }
 
             // Handle cursor rendering (P11: only while DECTCEM-visible)
-            if cursor_visible && content.grid.cursor.point == indexed.point {
+            if cursor_visible && content.grid.cursor.point == abs {
                 let cursor_rect = Rect::from_min_size(
                     Pos2::new(x, y),
                     Vec2::new(draw_width, cell_height),
@@ -601,7 +605,7 @@ impl<'a> TerminalView<'a> {
                 }
             } else {
                 if cursor_visible
-                    && content.grid.cursor.point == indexed.point
+                    && content.grid.cursor.point == abs
                     && is_app_cursor_mode
                 {
                     std::mem::swap(&mut fg, &mut bg);
@@ -684,7 +688,7 @@ impl<'a> TerminalView<'a> {
             return;
         }
         let point = content.grid.cursor.point;
-        let line_num = point.line.0 + content.grid.display_offset() as i32;
+        let line_num = point.line.0 + content.display_offset as i32;
         if line_num < 0
             || line_num >= content.terminal_size.screen_lines() as i32
         {
@@ -1020,6 +1024,24 @@ fn process_mouse_wheel(
             ));
         }
         InputAction::Ignore
+    } else if terminal_mode
+        .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+    {
+        // muxterm patch P37: a full-screen app that didn't ask for the
+        // mouse (less, man, a pager in git) has no scrollback to scroll -
+        // send it arrow keys instead, xterm's alternate-scroll mode. tmux
+        // used to do this for us (its #{alternate_on} wheel rule); with a
+        // backend that passes the app's output straight through, the widget
+        // is the only one left to.
+        let key = match (lines > 0, terminal_mode.contains(TermMode::APP_CURSOR)) {
+            (true, true) => "\x1bOA",
+            (true, false) => "\x1b[A",
+            (false, true) => "\x1bOB",
+            (false, false) => "\x1b[B",
+        };
+        InputAction::BackendCall(BackendCommand::Write(
+            key.repeat(lines.unsigned_abs() as usize).into_bytes(),
+        ))
     } else {
         InputAction::BackendCall(BackendCommand::Scroll(lines))
     }
@@ -1248,7 +1270,7 @@ fn process_mouse_move(
         cursor_x,
         cursor_y,
         &terminal_content.terminal_size,
-        terminal_content.grid.display_offset(),
+        terminal_content.display_offset,
     );
 
     let mut actions = vec![];

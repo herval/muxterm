@@ -64,7 +64,10 @@ fn main() -> eframe::Result {
         std::env::set_var("PATH", path);
     }
 
-    let tmux = tmux::TmuxCtl::discover(&state::config_dir());
+    let tmux = tmux::TmuxCtl::discover(
+        &state::config_dir(),
+        muxterm::zmx::configured_backend(),
+    );
 
     let options = eframe::NativeOptions {
         // Metal via wgpu; the default glow renderer runs on Apple's

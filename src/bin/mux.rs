@@ -24,6 +24,7 @@ use muxterm::layout::SplitAxis;
 use muxterm::mesh::{self, AgentInfo};
 use muxterm::models;
 use muxterm::state;
+use muxterm::zmx::{self, Backend, Zmx};
 
 const EXIT_TMUX: i32 = 1;
 const EXIT_USAGE: i32 = 2;
@@ -278,8 +279,14 @@ fn fmt_ts(secs: u64) -> String {
 
 // ------------------------------------------------------------------ tmux
 
+/// The session layer, for both backends at once (named for tmux, its
+/// original job). Each call routes on the target session's name -
+/// `mux-z…` lives on zmx (muxterm::zmx::Backend::of_session) - so a pane on
+/// one backend can read, tell, or split next to a pane on the other.
 struct Tmux {
+    /// tmux, or a bare "tmux" when it isn't installed (calls just fail).
     bin: PathBuf,
+    zmx: Option<Zmx>,
 }
 
 struct PaneInfo {
@@ -291,14 +298,27 @@ struct PaneInfo {
 
 impl Tmux {
     fn new() -> Result<Self, Fail> {
-        mesh::find_tmux()
-            .map(|bin| Self { bin })
-            .map_err(|e| (EXIT_TMUX, format!("{e:#}")))
+        let zmx = Zmx::discover().ok();
+        match mesh::find_tmux() {
+            Ok(bin) => Ok(Self { bin, zmx }),
+            Err(_) if zmx.is_some() => Ok(Self { bin: PathBuf::from("tmux"), zmx }),
+            Err(e) => Err((EXIT_TMUX, format!("{e:#}"))),
+        }
+    }
+
+    /// The zmx handle when `session` lives on zmx; None for tmux sessions
+    /// (and for zmx ones when zmx isn't installed - they can't exist then).
+    fn zmx_for(&self, session: &str) -> Option<&Zmx> {
+        (Backend::of_session(session) == Backend::Zmx).then_some(self.zmx.as_ref()).flatten()
+    }
+
+    fn is_zmx(session: &str) -> bool {
+        Backend::of_session(session) == Backend::Zmx
     }
 
     fn output(&self, args: &[&str]) -> Result<String, Fail> {
         let out = Command::new(&self.bin)
-            .args(["-L", mesh::SOCKET])
+            .args(["-L", mesh::socket()])
             .args(args)
             .output()
             .map_err(|e| (EXIT_TMUX, format!("failed to run tmux: {e}")))?;
@@ -316,8 +336,11 @@ impl Tmux {
     }
 
     fn has_session(&self, session: &str) -> bool {
+        if Self::is_zmx(session) {
+            return self.zmx_for(session).is_some_and(|z| z.has(session));
+        }
         Command::new(&self.bin)
-            .args(["-L", mesh::SOCKET, "has-session", "-t"])
+            .args(["-L", mesh::socket(), "has-session", "-t"])
             .arg(format!("={session}"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -327,8 +350,15 @@ impl Tmux {
     }
 
     fn live_sessions(&self) -> HashSet<String> {
+        let mut all: HashSet<String> =
+            self.zmx.as_ref().map(Zmx::names).unwrap_or_default().into_iter().collect();
+        all.extend(self.tmux_sessions());
+        all
+    }
+
+    fn tmux_sessions(&self) -> HashSet<String> {
         match Command::new(&self.bin)
-            .args(["-L", mesh::SOCKET, "list-sessions", "-F", "#{session_name}"])
+            .args(["-L", mesh::socket(), "list-sessions", "-F", "#{session_name}"])
             .output()
         {
             Ok(out) if out.status.success() => {
@@ -344,6 +374,42 @@ impl Tmux {
     /// Live pane facts for every session, keyed by session name. The title
     /// goes last in the format string so tabs inside it survive the split.
     fn pane_info(&self) -> HashMap<String, PaneInfo> {
+        let mut map = self.zmx_pane_info();
+        map.extend(self.tmux_pane_info());
+        map
+    }
+
+    /// No pane titles or activity clock under zmx; command and cwd come
+    /// from the shell's foreground job (see zmx::proc_*).
+    fn zmx_pane_info(&self) -> HashMap<String, PaneInfo> {
+        let Some(z) = &self.zmx else {
+            return HashMap::new();
+        };
+        {
+            return z
+                .list()
+                .into_iter()
+                .map(|s| {
+                    let fg = s.pid.and_then(zmx::proc_foreground);
+                    let cwd = fg
+                        .as_ref()
+                        .and_then(|(_, pid)| zmx::proc_cwd(*pid))
+                        .map(|p| p.display().to_string())
+                        .or(s.cwd.clone())
+                        .unwrap_or_default();
+                    let info = PaneInfo {
+                        cmd: fg.map(|(c, _)| c).unwrap_or_default(),
+                        cwd,
+                        active: String::new(),
+                        title: String::new(),
+                    };
+                    (s.name, info)
+                })
+                .collect();
+        }
+    }
+
+    fn tmux_pane_info(&self) -> HashMap<String, PaneInfo> {
         let out = self
             .output(&[
                 "list-panes",
@@ -384,6 +450,14 @@ impl Tmux {
         lines: usize,
         ansi: bool,
     ) -> Result<String, Fail> {
+        if Self::is_zmx(session) {
+            let z = self
+                .zmx_for(session)
+                .ok_or_else(|| (EXIT_TMUX, "zmx is not installed".to_string()))?;
+            return z.history(session, lines, ansi).ok_or_else(|| {
+                (EXIT_TMUX, format!("zmx history {session} failed"))
+            });
+        }
         let target = session.to_string();
         let start = format!("-{lines}");
         let mut args =
@@ -395,6 +469,9 @@ impl Tmux {
     }
 
     fn in_copy_mode(&self, session: &str) -> Result<bool, Fail> {
+        if Self::is_zmx(session) {
+            return Ok(false);
+        }
         let target = session.to_string();
         let out = self.output(&[
             "display-message",
@@ -415,9 +492,23 @@ impl Tmux {
         text: &str,
         enter: bool,
     ) -> CmdResult {
+        if Self::is_zmx(session) {
+            let z = self
+                .zmx_for(session)
+                .ok_or_else(|| (EXIT_TMUX, "zmx is not installed".to_string()))?;
+            // Always bracketed: tmux's -p only brackets when the program
+            // asked for it, and zmx can't know - but every shell and agent
+            // CLI muxterm targets enables it, and a bracketed message is
+            // one input instead of one per line.
+            return if z.paste(session, text, enter) {
+                Ok(())
+            } else {
+                Err((EXIT_TMUX, format!("zmx send {session} failed")))
+            };
+        }
         let buffer = format!("mux-msg-{}", std::process::id());
         let mut child = Command::new(&self.bin)
-            .args(["-L", mesh::SOCKET, "load-buffer", "-b", &buffer, "-"])
+            .args(["-L", mesh::socket(), "load-buffer", "-b", &buffer, "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -460,6 +551,19 @@ fn resolve_identity(
         ));
     }
 
+    // zmx panes: ZMX_SESSION is the session itself, and muxterm seeds
+    // MUXTERM_SESSION alongside it - they must agree.
+    let ours = env::var("MUXTERM_SESSION").unwrap_or_default();
+    if Tmux::is_zmx(&ours) {
+        if env::var("ZMX_SESSION").is_ok_and(|z| z == ours) {
+            return Ok(ours);
+        }
+        return Err((
+            EXIT_NO_IDENTITY,
+            "not inside a muxterm pane (use --as <session>)".to_string(),
+        ));
+    }
+
     let tmux_env = env::var("TMUX").map_err(|_| {
         (
             EXIT_NO_IDENTITY,
@@ -471,7 +575,7 @@ fn resolve_identity(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    if socket_name != mesh::SOCKET {
+    if socket_name != mesh::socket() {
         return Err((
             EXIT_NO_IDENTITY,
             format!(
@@ -870,7 +974,7 @@ fn cmd_split(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
 
     let tmux = Tmux::new()?;
     let sc = scope(&tmux, as_session)?;
-    let session = mesh::new_session_name();
+    let session = mesh::new_session_name(zmx::default_backend());
     // The new shell starts where the caller is, like a user split.
     let cwd = cwd_flag
         .or_else(|| env::current_dir().ok().map(|p| p.display().to_string()));
@@ -936,7 +1040,7 @@ fn cmd_new_tab(as_session: Option<String>, mut args: Vec<String>) -> CmdResult {
     let tmux = Tmux::new()?;
     // Resolves (and authorizes) the caller as a real muxterm pane.
     let sc = scope(&tmux, as_session)?;
-    let session = mesh::new_session_name();
+    let session = mesh::new_session_name(zmx::default_backend());
     // The new shell starts where the caller is, unless told otherwise.
     let cwd = cwd_flag
         .or_else(|| env::current_dir().ok().map(|p| p.display().to_string()));

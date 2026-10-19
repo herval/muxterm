@@ -306,7 +306,14 @@ impl NodeState {
     }
 }
 
+/// `MUXTERM_DIR` overrides it - a second, fully separate muxterm (its own
+/// state, sessions, and config) next to the everyday one, e.g. to try the
+/// zmx backend without the two builds' startup GCs fighting over one
+/// state.json. Panes inherit the variable, so `mux` inside them follows.
 pub fn config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("MUXTERM_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .expect("no home directory on this platform")
         .join(".muxterm")
@@ -321,6 +328,11 @@ pub fn config_dir() -> PathBuf {
 /// unaffected: its socket is name-keyed (`-L muxterm`), and tmux.conf is
 /// regenerated at launch regardless.
 pub fn migrate_config_dir() {
+    // An explicit MUXTERM_DIR is a separate instance, never the migration
+    // target for the everyday one's old directory.
+    if std::env::var_os("MUXTERM_DIR").is_some() {
+        return;
+    }
     let new = config_dir();
     if new.exists() {
         return;
